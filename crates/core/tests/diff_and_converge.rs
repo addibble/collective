@@ -228,3 +228,25 @@ fn genesis_influence_halves_and_is_capped() {
     // Reputation and trust take it as input like any other earned standing.
     assert!(trust(reputation(&[], genesis_effective(100.0, 0))) > 0.99);
 }
+
+#[test]
+fn ledger_rep_halves_unless_renewed() {
+    use collective_core::score::{
+        ledger_balance, ledger_weight, LEDGER_EPOCH_MS, LEDGER_HALF_LIFE_DAYS,
+    };
+    let day = 86_400_000i64;
+    let half = (LEDGER_HALF_LIFE_DAYS as i64) * day;
+    let t0 = LEDGER_EPOCH_MS + 400 * day;
+    let w = ledger_weight(40.0, t0);
+    assert_eq!(ledger_balance(w, t0), 40.0);
+    assert_eq!(ledger_balance(w, t0 + half), 20.0);
+    // Weights add: a penalty decays like a credit, and new work tops up.
+    let w = w + ledger_weight(-10.0, t0) + ledger_weight(15.0, t0 + half);
+    assert_eq!(ledger_balance(w, t0 + half), 30.0);
+    // A dormant account's trust fades from near-certain back towards a newcomer's.
+    let earned = ledger_weight(100.0, t0);
+    assert!(trust(reputation(&[], ledger_balance(earned, t0))) > 0.99);
+    assert!(trust(reputation(&[], ledger_balance(earned, t0 + 6 * half))) < 0.9);
+    // Weights stay finite for centuries.
+    assert!(ledger_weight(1e6, LEDGER_EPOCH_MS + 300 * 365 * day).is_finite());
+}

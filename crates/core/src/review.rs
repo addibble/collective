@@ -29,11 +29,15 @@ pub struct ReviewParams {
     pub redundancy: usize,
     /// Changed lines per shard, so a review is a bounded unit of work.
     pub max_shard_lines: u32,
-    /// Reviews owed per patch submitted and per adoption reported.
-    pub per_submission: u32,
+    /// Share of review assignments that are canaries, in percent, whenever
+    /// canaries are available (see [`pick_task`]). Above about 6% a
+    /// reviewer who calls everything clean loses rep on average.
+    pub canary_percent: u32,
+    /// Reviews owed per adoption reported. A submission owes the reviews its
+    /// shards will take (see [`duty_required`]).
     pub per_adoption: u32,
-    /// Actions a new operator may take before any review is owed.
-    pub free_actions: u32,
+    /// Reviews a new operator may skip: enough for one single-shard patch.
+    pub free_reviews: u32,
     /// Distinct reviewers needed on overlapping lines to open a challenge.
     pub quorum: usize,
     /// Lines of slack when matching reported locations.
@@ -52,9 +56,9 @@ pub struct ReviewParams {
 pub const PARAMS: ReviewParams = ReviewParams {
     redundancy: 3,
     max_shard_lines: 200,
-    per_submission: 3,
+    canary_percent: 10,
     per_adoption: 1,
-    free_actions: 3,
+    free_reviews: 4,
     quorum: 2,
     slack: 2,
     lease_ms: 30 * 60_000,
@@ -70,16 +74,27 @@ pub const PARAMS: ReviewParams = ReviewParams {
 // Duty
 // ---------------------------------------------------------------------------
 
-/// Reviews required for this much activity.
-pub fn duty_required(submissions: u32, adoptions: u32) -> u32 {
-    (submissions * PARAMS.per_submission + adoptions * PARAMS.per_adoption)
-        .saturating_sub(PARAMS.free_actions * PARAMS.per_adoption)
+/// Reviews a submission of `shards` shards costs the network: each shard
+/// gets `redundancy` reviewers, and canaries take `canary_percent` of all
+/// assignments on top. Charging per shard keeps large patches from
+/// starving the queue.
+pub fn shard_cost(shards: u32) -> u32 {
+    let p = &PARAMS;
+    let real = shards as u64 * p.redundancy as u64 * 100;
+    let share = (100 - p.canary_percent) as u64;
+    real.div_ceil(share) as u32
+}
+
+/// Reviews required for this much activity: the shards an operator has
+/// submitted and the adoptions it has reported.
+pub fn duty_required(shards: u32, adoptions: u32) -> u32 {
+    (shard_cost(shards) + adoptions * PARAMS.per_adoption).saturating_sub(PARAMS.free_reviews)
 }
 
 /// Reviews still owed before the operator may submit or adopt again.
 /// `credited` counts completed reviews that were not graded as failures.
-pub fn duty_owed(submissions: u32, adoptions: u32, credited: u32) -> u32 {
-    duty_required(submissions, adoptions).saturating_sub(credited)
+pub fn duty_owed(shards: u32, adoptions: u32, credited: u32) -> u32 {
+    duty_required(shards, adoptions).saturating_sub(credited)
 }
 
 // ---------------------------------------------------------------------------
@@ -158,26 +173,36 @@ pub struct OpenShard {
     /// Operators currently holding or having completed this shard.
     pub assigned: Vec<String>,
     pub wanted: usize,
+    pub canary: bool,
 }
 
-/// Picks a task for `operator` uniformly among the shards it may review.
-/// The seed must be unpredictable to the reviewer (e.g. a server secret,
-/// the operator and the current minute) so nobody can steer itself onto a
-/// friend's or rival's patch. Canary shards are in `open` like any other.
+/// Picks a task for `operator` among the shards it may review. The seed
+/// must be unpredictable to the reviewer (e.g. a server secret, the
+/// operator and the current minute) so nobody can steer itself onto a
+/// friend's or rival's patch.
+///
+/// A canary comes up with probability at least `canary_percent` whenever
+/// one is eligible, however many real shards are waiting, so that calling
+/// everything clean never pays; otherwise the pick is uniform.
 pub fn pick_task<'a>(operator: &str, open: &'a [OpenShard], seed: &str) -> Option<&'a OpenShard> {
-    let eligible: Vec<&OpenShard> = open
+    let (canaries, real): (Vec<&OpenShard>, Vec<&OpenShard>) = open
         .iter()
         .filter(|s| {
             s.author_operator != operator
                 && !s.assigned.iter().any(|a| a == operator)
                 && s.assigned.len() < s.wanted
         })
-        .collect();
-    if eligible.is_empty() {
-        return None;
-    }
-    let i = SeededRng::new(seed).weighted_index(&vec![1.0; eligible.len()])?;
-    Some(eligible[i])
+        .partition(|s| s.canary);
+    let mut rng = SeededRng::new(seed);
+    let total = (canaries.len() + real.len()) as f64;
+    let p_canary = (canaries.len() as f64 / total).max(PARAMS.canary_percent as f64 / 100.0);
+    let pool = if real.is_empty() || (!canaries.is_empty() && rng.next_f64() < p_canary) {
+        canaries
+    } else {
+        real
+    };
+    let i = rng.weighted_index(&vec![1.0; pool.len()])?;
+    Some(pool[i])
 }
 
 // ---------------------------------------------------------------------------

@@ -9,7 +9,9 @@ use collective_core::diff::{
     format_diff, hunk_fingerprints, parse_diff, patch_id, stats, FileDiff,
 };
 use collective_core::hash::sha256_hex;
-use collective_core::score::{reputation, score_patch, trust, Adoption, Outcome, PARENT_SHARE};
+use collective_core::score::{
+    ledger_balance, ledger_weight, reputation, score_patch, trust, Adoption, Outcome, PARENT_SHARE,
+};
 use collective_core::sketch::{decode_signature, estimate_jaccard, sketch};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -26,6 +28,12 @@ pub const INTENT_REUSE_THRESHOLD: f64 = 0.75;
 pub const NEAR_DUPLICATE_THRESHOLD: f64 = 0.5;
 const MAX_DIFF_BYTES: usize = 1_000_000;
 pub const POOL: &str = collective_core::challenge::PLATFORM_POOL;
+
+/// Platform accounts (the bounty pool, the canary author) hold funds, not
+/// standing, so their balances do not decay.
+fn is_platform(operator_id: &str) -> bool {
+    operator_id == "platform" || operator_id.starts_with("platform:")
+}
 
 pub fn now() -> i64 {
     worker::Date::now().as_millis() as i64
@@ -273,20 +281,26 @@ impl Store {
             .await
     }
 
+    /// An operator's rep: its ledger, decayed (see `score::ledger_balance`).
+    /// Platform accounts such as the bounty pool do not decay.
     pub async fn balance(&self, operator_id: &str) -> ApiResult<f64> {
         #[derive(Deserialize)]
         struct B {
-            b: Option<f64>,
+            d: Option<f64>,
+            w: Option<f64>,
         }
-        Ok(self
+        let b = self
             .db
             .first::<B>(
-                "SELECT SUM(delta) AS b FROM ledger WHERE operator_id = ?",
+                "SELECT SUM(delta) AS d, SUM(weight) AS w FROM ledger WHERE operator_id = ?",
                 args![operator_id],
             )
-            .await?
-            .and_then(|b| b.b)
-            .unwrap_or(0.0))
+            .await?;
+        Ok(match b {
+            Some(b) if is_platform(operator_id) => b.d.unwrap_or(0.0),
+            Some(b) => ledger_balance(b.w.unwrap_or(0.0), now()),
+            None => 0.0,
+        })
     }
 
     pub async fn credit(
@@ -300,8 +314,8 @@ impl Store {
             .filter(|e| e.delta != 0.0)
             .map(|e| {
                 self.db.stmt(
-                    "INSERT INTO ledger (operator_id, delta, reason, ref, created_at) VALUES (?, ?, ?, ?, ?)",
-                    args![&e.operator_id, e.delta, &e.reason, reference, t],
+                    "INSERT INTO ledger (operator_id, delta, weight, reason, ref, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    args![&e.operator_id, e.delta, ledger_weight(e.delta, t), &e.reason, reference, t],
                 )
             })
             .collect::<ApiResult<Vec<_>>>()?;
@@ -842,7 +856,7 @@ impl Store {
                 id: String,
                 banned_at: Option<f64>,
                 scores: Option<String>,
-                balance: Option<f64>,
+                weight: Option<f64>,
             }
             let ph = placeholders(chunk.len());
             let rows: Vec<T> = self
@@ -851,7 +865,7 @@ impl Store {
                     &format!(
                         "SELECT o.id, o.banned_at,
                            (SELECT GROUP_CONCAT(score) FROM patches WHERE author_op = o.id) AS scores,
-                           (SELECT SUM(delta) FROM ledger WHERE operator_id = o.id) AS balance
+                           (SELECT SUM(weight) FROM ledger WHERE operator_id = o.id) AS weight
                          FROM operators o WHERE o.id IN ({ph})"
                     ),
                     chunk.iter().map(Into::into).collect(),
@@ -868,7 +882,8 @@ impl Store {
                         .filter_map(|s| s.parse().ok())
                         .collect();
                     let genesis = self.genesis_influence(&r.id).await?;
-                    trust(reputation(&scores, r.balance.unwrap_or(0.0) + genesis))
+                    let balance = ledger_balance(r.weight.unwrap_or(0.0), now());
+                    trust(reputation(&scores, balance + genesis))
                 };
                 out.insert(r.id, t);
             }

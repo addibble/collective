@@ -16,6 +16,11 @@ pub const MAX_APPEALS: u32 = 3;
 pub const PENALTY: f64 = 0.2;
 /// Stake a drawn juror locks per seat.
 pub const SEAT_STAKE: f64 = 20.0;
+/// Canaries a juror must have caught, and the detection rate it must hold.
+/// Rep alone is cheap to earn with low-effort reviews; a measured record
+/// of finding planted problems is not.
+pub const MIN_CANARIES_CAUGHT: u32 = 5;
+pub const MIN_DETECTION_RATE: f64 = 0.8;
 
 /// Kleros-style growth: each appeal draws twice the jurors plus one.
 pub fn jury_size(appeal: u32) -> usize {
@@ -26,9 +31,21 @@ pub fn jury_size(appeal: u32) -> usize {
 pub struct JuryCandidate {
     pub operator_id: String,
     pub stake: f64,
+    pub canaries_caught: u32,
+    pub canaries_missed: u32,
 }
 
-/// Draws `size` distinct jurors weighted by stake. `exclude` must hold
+impl JuryCandidate {
+    /// Enough stake for a seat and a proven canary record.
+    pub fn eligible(&self) -> bool {
+        let seen = self.canaries_caught + self.canaries_missed;
+        self.stake >= SEAT_STAKE
+            && self.canaries_caught >= MIN_CANARIES_CAUGHT
+            && self.canaries_caught as f64 >= MIN_DETECTION_RATE * seen as f64
+    }
+}
+
+/// Draws `size` distinct jurors weighted by stake, among eligible candidates. `exclude` must hold
 /// every operator with an interest in the outcome. `seed` should be
 /// committed before the candidate list closes so neither side can grind it.
 pub fn draw_jury(
@@ -39,7 +56,7 @@ pub fn draw_jury(
 ) -> Result<Vec<String>, String> {
     let mut pool: Vec<&JuryCandidate> = candidates
         .iter()
-        .filter(|c| c.stake >= SEAT_STAKE && !exclude.contains(&c.operator_id))
+        .filter(|c| c.eligible() && !exclude.contains(&c.operator_id))
         .collect();
     if pool.len() < size {
         return Err(format!("need {size} eligible jurors, have {}", pool.len()));

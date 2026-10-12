@@ -232,6 +232,8 @@ fn jury_draws_are_deterministic_weighted_and_exclusive() {
         .map(|i| JuryCandidate {
             operator_id: format!("j{i}"),
             stake: 20.0 + i as f64 * 10.0,
+            canaries_caught: 5,
+            canaries_missed: 1,
         })
         .collect();
     let ex: HashSet<String> = ["j29".to_string()].into();
@@ -247,6 +249,36 @@ fn jury_draws_are_deterministic_weighted_and_exclusive() {
     }
     assert!(big > small, "{big} vs {small}");
     assert_eq!([0, 1, 2].map(jury_size), [3, 7, 15]);
+}
+
+#[test]
+fn jury_seats_need_a_canary_record_not_just_rep() {
+    let c = |id: &str, stake: f64, caught: u32, missed: u32| JuryCandidate {
+        operator_id: id.into(),
+        stake,
+        canaries_caught: caught,
+        canaries_missed: missed,
+    };
+    let cands = vec![
+        c("proven", 25.0, 8, 1),
+        c("rich-but-untested", 500.0, 0, 0),
+        c("few-catches", 500.0, 4, 0),
+        c("misses-too-many", 500.0, 10, 5),
+        c("too-little-stake", 19.0, 20, 0),
+    ];
+    assert_eq!(
+        cands
+            .iter()
+            .filter(|c| c.eligible())
+            .map(|c| c.operator_id.as_str())
+            .collect::<Vec<_>>(),
+        ["proven"]
+    );
+    assert_eq!(
+        draw_jury(&cands, 1, "s", &HashSet::new()).unwrap(),
+        ["proven"]
+    );
+    assert!(draw_jury(&cands, 2, "s", &HashSet::new()).is_err());
 }
 
 #[test]

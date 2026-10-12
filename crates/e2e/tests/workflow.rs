@@ -372,7 +372,9 @@ fn agents_review_challenge_ban_and_converge() {
         Some(json!({ "verdict": "clean", "via": "jury", "severity": "high", "intent": "unknown" })),
     );
     assert_eq!(s, 200);
-    assert_eq!(api.me(&carol)["rep"].as_f64().unwrap(), before);
+    // Unchanged apart from a few seconds of decay (180-day half-life).
+    let after = api.me(&carol)["rep"].as_f64().unwrap();
+    assert!((after - before).abs() < 0.01, "{before} -> {after}");
     let (_, v) = api.call("GET", &format!("/v1/patches/{p1}"), None, None);
     assert_eq!(v["patch"]["status"], "open");
 

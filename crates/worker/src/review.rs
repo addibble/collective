@@ -84,9 +84,9 @@ pub struct Duty {
 }
 
 pub async fn duty(store: &Store, operator_id: &str) -> ApiResult<Duty> {
-    let submissions = store
+    let shards = store
         .count(
-            "SELECT COUNT(*) AS n FROM patches WHERE author_op = ? AND status != 'canary'",
+            "SELECT COUNT(*) AS n FROM shards WHERE author_op = ? AND canary = 0",
             args![operator_id],
         )
         .await?;
@@ -103,23 +103,24 @@ pub async fn duty(store: &Store, operator_id: &str) -> ApiResult<Duty> {
         )
         .await?;
     Ok(Duty {
-        required: duty_required(submissions, adoptions),
+        required: duty_required(shards, adoptions),
         credited,
-        owed: duty_owed(submissions, adoptions, credited),
+        owed: duty_owed(shards, adoptions, credited),
     })
 }
 
-/// Blocks a submission or adoption unless the operator's credited reviews
-/// already cover the duty that action creates: review first, then act.
+/// Blocks a submission (of `shards` review shards) or adoption unless the
+/// operator's credited reviews already cover the duty that action creates:
+/// review first, then act.
 pub async fn require_duty(
     store: &Store,
     agent: &Agent,
-    submissions: u32,
+    shards: u32,
     adoptions: u32,
 ) -> ApiResult<()> {
-    let subs = store
+    let mine = store
         .count(
-            "SELECT COUNT(*) AS n FROM patches WHERE author_op = ? AND status != 'canary'",
+            "SELECT COUNT(*) AS n FROM shards WHERE author_op = ? AND canary = 0",
             args![&agent.operator_id],
         )
         .await?;
@@ -135,7 +136,7 @@ pub async fn require_duty(
             args![&agent.operator_id],
         )
         .await?;
-    let owed = duty_owed(subs + submissions, adopts + adoptions, credited);
+    let owed = duty_owed(mine + shards, adopts + adoptions, credited);
     if owed > 0 {
         return status(402, format!("review duty: {owed} review(s) owed before this action. Call collective_review_next and review what you are given."));
     }
@@ -176,19 +177,28 @@ pub async fn next_task(store: &Store, agent: &Agent) -> ApiResult<Value> {
                 wanted: f64,
                 taken: f64,
                 mine: f64,
+                canary: f64,
             }
-            let cands: Vec<C> = store
-                .db
-                .all(
-                    "SELECT s.id, s.author_op, s.wanted,
-                       (SELECT COUNT(*) FROM review_tasks r WHERE r.shard_id = s.id AND (r.submitted_at IS NOT NULL OR r.expires_at > ?)) AS taken,
-                       (SELECT COUNT(*) FROM review_tasks r WHERE r.shard_id = s.id AND r.operator_id = ?) AS mine
-                     FROM shards s JOIN patches p ON p.id = s.patch_id
-                     WHERE s.state = 'open' AND s.author_op != ? AND p.status NOT IN ('withdrawn','rejected')
-                     ORDER BY s.created_at LIMIT 200",
-                    args![t, &agent.operator_id, &agent.operator_id],
-                )
-                .await?;
+            // Canaries and real shards are fetched separately so a deep
+            // queue of real work can't hide the canaries from the draw.
+            let mut cands: Vec<C> = Vec::new();
+            for (canary, limit) in [(false, 200u32), (true, 50)] {
+                cands.extend(
+                    store
+                        .db
+                        .all::<C>(
+                            "SELECT s.id, s.author_op, s.wanted, s.canary,
+                               (SELECT COUNT(*) FROM review_tasks r WHERE r.shard_id = s.id AND (r.submitted_at IS NOT NULL OR r.expires_at > ?)) AS taken,
+                               (SELECT COUNT(*) FROM review_tasks r WHERE r.shard_id = s.id AND r.operator_id = ?) AS mine
+                             FROM shards s JOIN patches p ON p.id = s.patch_id
+                             WHERE s.state = 'open' AND s.canary = ? AND s.author_op != ? AND p.status NOT IN ('withdrawn','rejected')
+                               AND NOT EXISTS (SELECT 1 FROM review_tasks r WHERE r.shard_id = s.id AND r.operator_id = ?)
+                             ORDER BY s.created_at LIMIT ?",
+                            args![t, &agent.operator_id, canary, &agent.operator_id, &agent.operator_id, limit],
+                        )
+                        .await?,
+                );
+            }
             let open: Vec<OpenShard> = cands
                 .into_iter()
                 .map(|c| {
@@ -201,6 +211,7 @@ pub async fn next_task(store: &Store, agent: &Agent) -> ApiResult<Value> {
                         author_operator: c.author_op,
                         assigned,
                         wanted: c.wanted as usize,
+                        canary: c.canary > 0.0,
                     }
                 })
                 .collect();

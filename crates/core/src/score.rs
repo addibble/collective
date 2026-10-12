@@ -101,6 +101,30 @@ pub fn genesis_effective(amount: f64, age_ms: i64) -> f64 {
         * 0.5f64.powf((age_ms.max(0) as f64 / DAY_MS) / GENESIS_HALF_LIFE_DAYS)
 }
 
+/// Ledger rep halves every this many days, so standing has to be kept up
+/// by continued review and use; a dormant or sold account fades.
+pub const LEDGER_HALF_LIFE_DAYS: f64 = 180.0;
+/// Reference time for ledger weights (2026-01-01T00:00:00Z).
+pub const LEDGER_EPOCH_MS: i64 = 1_767_225_600_000;
+
+fn ledger_growth(at_ms: i64) -> f64 {
+    2f64.powf(((at_ms - LEDGER_EPOCH_MS) as f64 / DAY_MS) / LEDGER_HALF_LIFE_DAYS)
+}
+
+/// What to store with a ledger entry so that balances decay without
+/// rewriting history: `delta` scaled up by how far past the epoch it was
+/// made. Sum the weights and pass them to [`ledger_balance`].
+pub fn ledger_weight(delta: f64, at_ms: i64) -> f64 {
+    delta * ledger_growth(at_ms)
+}
+
+/// A decayed balance from summed [`ledger_weight`]s: every entry counts
+/// `delta · ½^(age / half-life)`, credits and penalties alike.
+pub fn ledger_balance(weight_sum: f64, now_ms: i64) -> f64 {
+    let b = weight_sum / ledger_growth(now_ms);
+    (b * 1e4).round() / 1e4
+}
+
 pub fn decay(age_ms: i64) -> f64 {
     0.5f64.powf((age_ms.max(0) as f64 / DAY_MS) / HALF_LIFE_DAYS)
 }
