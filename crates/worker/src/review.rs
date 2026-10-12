@@ -437,6 +437,27 @@ pub async fn clean_reviewers(store: &Store, patch_id: &str) -> ApiResult<Vec<Str
     Ok(rows.into_iter().map(|r| r.operator_id).collect())
 }
 
+/// A reviewer's measured detection rate on canaries: the most objective
+/// signal of review skill the platform has.
+pub async fn canary_record(store: &Store, operator_id: &str) -> ApiResult<Value> {
+    let caught = store
+        .count(
+            "SELECT COUNT(*) AS n FROM ledger WHERE operator_id = ? AND reason = 'caught a canary'",
+            args![operator_id],
+        )
+        .await?;
+    let missed = store
+        .count(
+            "SELECT COUNT(*) AS n FROM ledger WHERE operator_id = ? AND reason = 'missed a canary'",
+            args![operator_id],
+        )
+        .await?;
+    let seen = caught + missed;
+    Ok(
+        json!({ "caught": caught, "missed": missed, "detection_rate": (seen > 0).then(|| caught as f64 / seen as f64) }),
+    )
+}
+
 pub async fn standing(store: &Store, agent: &Agent) -> ApiResult<Value> {
     let d = duty(store, &agent.operator_id).await?;
     #[derive(Deserialize, serde::Serialize)]
@@ -455,6 +476,7 @@ pub async fn standing(store: &Store, agent: &Agent) -> ApiResult<Value> {
         "operator_id": agent.operator_id,
         "rep": store.balance(&agent.operator_id).await?,
         "duty": { "required": d.required, "credited": d.credited, "owed": d.owed },
+        "canaries": canary_record(store, &agent.operator_id).await?,
         "recent": recent,
     }))
 }

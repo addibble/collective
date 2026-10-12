@@ -32,6 +32,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use collective_core::proof::{
     Ecosystem, ProofKind, ProofReport, ProofSpec, RunResult, RunStatus, SetupResult, Tree,
+    BUILD_TIMEOUT_SECS,
 };
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -48,6 +49,9 @@ pub struct Options {
     pub allow_unisolated: bool,
     /// Wall-clock budget for the whole proof.
     pub budget: Duration,
+    /// Extra environment for the networked dependency fetch only (e.g. an
+    /// egress proxy and its CA). Never passed to builds or runs.
+    pub setup_env: Vec<(String, String)>,
 }
 
 impl Options {
@@ -62,6 +66,14 @@ impl Options {
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(900),
             ),
+            // PROVER_SETUP_PASSTHROUGH=HTTPS_PROXY,CARGO_HTTP_CAINFO names variables
+            // copied from the prover's environment into the fetch step.
+            setup_env: std::env::var("PROVER_SETUP_PASSTHROUGH")
+                .unwrap_or_default()
+                .split(',')
+                .filter(|k| !k.is_empty())
+                .filter_map(|k| std::env::var(k).ok().map(|v| (k.to_string(), v)))
+                .collect(),
         }
     }
 }
@@ -463,6 +475,8 @@ pub fn prove(spec: &ProofSpec, source_tgz: &[u8], patch: &str, opts: &Options) -
         for tree in [&base, &patched] {
             let mut env = base_env(&home);
             env.extend(tree_env(tree));
+            let mut env: Vec<(&str, String)> = env;
+            env.extend(opts.setup_env.iter().map(|(k, v)| (k.as_str(), v.clone())));
             match run_command(&["sh", "-c", setup], tree, &env, SETUP_TIMEOUT, &log) {
                 Ok((RunStatus::Passed, ..)) => {}
                 Ok((st, _, out)) => {
@@ -476,7 +490,44 @@ pub fn prove(spec: &ProofSpec, source_tgz: &[u8], patch: &str, opts: &Options) -
         }
     }
 
-    // 5. Runs, interleaved so a slow or flaky moment hits both trees.
+    // 5. Build once per tree: offline, isolated and unprivileged, because
+    //    build scripts and macros are project code too. A base that does
+    //    not build makes the proof inconclusive; a patched tree that does
+    //    not build simply fails its runs.
+    if let Some(build) = spec.ecosystem.build_argv() {
+        for (tree, dir) in [(Tree::Base, &base), (Tree::Patched, &patched)] {
+            let build_home = work.0.join(format!("home-build-{tree:?}"));
+            let _ = fs::create_dir_all(&build_home);
+            if let Err(e) = chown_run(dir).and_then(|_| chown_run(&build_home)) {
+                return setup_error(e, isolation);
+            }
+            let mut env = base_env(&build_home);
+            env.extend(tree_env(dir));
+            env.extend(
+                spec.ecosystem
+                    .offline_env()
+                    .iter()
+                    .map(|(k, v)| (*k, v.to_string())),
+            );
+            let mut argv = run_prefix(isolation);
+            argv.extend(build.iter().map(|s| s.to_string()));
+            let build_log = work.0.join(format!("build-{tree:?}.log"));
+            let timeout = Duration::from_secs(BUILD_TIMEOUT_SECS as u64);
+            match run_command(&argv, dir, &env, timeout, &build_log) {
+                Ok((RunStatus::Passed, ..)) => {}
+                Ok((st, _, out)) if tree == Tree::Base => {
+                    return setup_error(
+                        format!("the base commit does not build ({st:?}): {}", out.trim()),
+                        isolation,
+                    )
+                }
+                Ok(_) => {}
+                Err(e) => return setup_error(format!("build: {e}"), isolation),
+            }
+        }
+    }
+
+    // 6. Runs, interleaved so a slow or flaky moment hits both trees.
     let timeout = Duration::from_secs(spec.timeout_secs as u64);
     let mut runs = Vec::new();
     for attempt in 0..spec.repeats {

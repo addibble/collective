@@ -257,6 +257,12 @@ struct CanaryInput {
     intent: String,
     diff: String,
     planted: Vec<Location>,
+    /// Where the canary came from (e.g. the upstream fix it reverts) and
+    /// how it was verified. Stored server-side only, never shown to reviewers.
+    #[serde(default)]
+    provenance: Option<Value>,
+    #[serde(default)]
+    verified: Option<Value>,
 }
 
 /// Plants an inert, known-bad patch in the review queue. It never appears
@@ -293,6 +299,12 @@ async fn create_canary(store: &Store, v: Value) -> ApiResult<Value> {
         })
         .await?;
     let shards = review::create_shards(store, &row, &files, Some(&input.planted)).await?;
+    let meta = json!({ "provenance": input.provenance, "verified": input.verified, "planted": input.planted });
+    store
+        .blobs
+        .put(format!("canaries/{id}.json"), serde_json::to_string(&meta)?)
+        .execute()
+        .await?;
     Ok(json!({ "canary_patch": id, "shards": shards, "reviewers_per_shard": REVIEW.redundancy }))
 }
 

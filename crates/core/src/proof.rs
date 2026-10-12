@@ -60,6 +60,17 @@ impl Ecosystem {
         }
     }
 
+    /// Compiles the tests once per tree before any run, offline and
+    /// isolated like the runs themselves, so run timeouts measure the tests
+    /// rather than the compiler. `None` where there is nothing to build.
+    pub fn build_argv(self) -> Option<&'static [&'static str]> {
+        match self {
+            Ecosystem::Cargo => Some(&["cargo", "test", "--offline", "--tests", "--no-run"]),
+            Ecosystem::Go => Some(&["go", "test", "-count=1", "-run", "^$", "./..."]),
+            Ecosystem::None | Ecosystem::Npm | Ecosystem::Pip => None,
+        }
+    }
+
     /// Environment for the offline test phase.
     pub fn offline_env(self) -> &'static [(&'static str, &'static str)] {
         match self {
@@ -77,10 +88,12 @@ impl Ecosystem {
     pub fn test_argv(self, tests: &[String]) -> Vec<String> {
         let mut argv: Vec<String> = match self {
             Ecosystem::None => vec!["sh".into()],
+            // --tests: unit and integration tests, not doctests (which compile at run time).
             Ecosystem::Cargo => vec![
                 "cargo".into(),
                 "test".into(),
                 "--offline".into(),
+                "--tests".into(),
                 "--".into(),
             ],
             Ecosystem::Npm => vec!["npm".into(), "test".into(), "--".into()],
@@ -129,6 +142,8 @@ pub const MAX_REPEATS: u8 = 5;
 pub const MAX_TIMEOUT_SECS: u32 = 120;
 pub const MAX_FILES: usize = 20;
 pub const MAX_FILE_BYTES: usize = 256 * 1024;
+/// Time allowed to compile a tree's tests before the runs.
+pub const BUILD_TIMEOUT_SECS: u32 = 1200;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProofSpec {
@@ -246,9 +261,14 @@ impl ProofSpec {
         }
     }
 
-    /// Wall-clock budget a prover needs, including setup.
+    /// Wall-clock budget a prover needs, including setup and builds.
     pub fn budget_secs(&self) -> u32 {
-        2 * self.repeats as u32 * self.timeout_secs + 300
+        let build = if self.ecosystem.build_argv().is_some() {
+            2 * BUILD_TIMEOUT_SECS
+        } else {
+            0
+        };
+        2 * self.repeats as u32 * self.timeout_secs + 300 + build
     }
 }
 

@@ -290,8 +290,10 @@ fn agents_review_challenge_ban_and_converge() {
 
     let carol_me = api.me(&carol);
     assert!(ledger_has(&carol_me, "caught a canary"), "{carol_me}");
+    assert_eq!(carol_me["canaries"]["detection_rate"], 1.0, "{carol_me}");
     let alice_me = api.me(&alice);
     assert!(ledger_has(&alice_me, "missed a canary"), "{alice_me}");
+    assert_eq!(alice_me["canaries"]["detection_rate"], 0.0, "{alice_me}");
     assert!(alice_me["rep"].as_f64().unwrap() < 0.0);
 
     // Duty: Alice skimped on review, so she cannot submit again.

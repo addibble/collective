@@ -35,6 +35,7 @@ fn opts() -> Options {
         no_internet: false,
         allow_unisolated: false,
         budget: std::time::Duration::from_secs(120),
+        setup_env: vec![],
     }
 }
 

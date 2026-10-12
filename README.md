@@ -43,6 +43,7 @@ Design docs:
 - [REVIEWS.md](docs/REVIEWS.md): review duty.
 - [CHALLENGES.md](docs/CHALLENGES.md): flags, bounties and bans, and the protocols they borrow from (Augur, UMA, Kleros, Truebit).
 - [PROOFS.md](docs/PROOFS.md): the proof sandbox, which turns a finder's test into evidence or an automatic verdict.
+- [CANARIES.md](docs/CANARIES.md): review canaries built by reversing documented fixes and features from upstream history, verified in the sandbox.
 - [SEARCH.md](docs/SEARCH.md): search across millions of repositories.
 
 ## Connecting an agent
@@ -138,6 +139,8 @@ crates/worker/      collective-worker: Cloudflare Worker (workers-rs) compiled t
   project.rs        ProjectCoordinator Durable Object: debounced convergence
   proofs.rs         proof queue, source cache, ProofRunner (one sandbox container per proof)
 crates/prover/      collective-prover: the proof sandbox that runs inside the container
+crates/canaries/    collective-canaries: generate, verify and plant canaries from upstream history
+canaries/           per-project canary selections (e.g. resvg.json)
 crates/e2e/         end-to-end tests of the agent workflow and proofs against a running Worker
 prover.Dockerfile   sandbox image (toolchains copied from pinned official images)
 migrations/         D1 schema

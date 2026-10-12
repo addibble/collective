@@ -1,0 +1,17 @@
+{
+  "project": "https://github.com/linebender/resvg",
+  "ecosystem": "cargo",
+  "source_extensions": ["rs"],
+  "sources": [
+    { "commit": "6bc52783", "kind": "robustness_fix", "reference": "linebender/resvg#1079", "summary": "Panic on SVG filters with oversized filter regions" },
+    { "commit": "ded4b139", "kind": "robustness_fix", "reference": "linebender/resvg#929", "summary": "Crash when glyph splitting during text layout" },
+    { "commit": "4a08e340", "kind": "robustness_fix", "reference": "resvg 4a08e340", "summary": "Panic when an element lies completely outside the viewBox" },
+    { "commit": "42145621", "kind": "robustness_fix", "reference": "resvg 42145621", "summary": "Panic applying text-decoration to text with a single cluster" },
+    { "commit": "e2f11fe7", "kind": "robustness_fix", "reference": "resvg e2f11fe7", "summary": "Recursive marker detection (unbounded recursion on self-referencing markers)" },
+    { "commit": "b12646b2", "kind": "feature", "reference": "linebender/resvg#1142", "summary": "plus-lighter and lighter compositing (CSS Compositing / Filter Effects)" },
+    { "commit": "1505e4b6", "kind": "feature", "reference": "linebender/resvg#1014", "summary": "Two-point conical radial gradients (SVG 2 fr attribute)" },
+    { "commit": "6debc440", "kind": "feature", "reference": "linebender/resvg#892", "summary": "SVGs without an xmlns attribute on the root element" },
+    { "commit": "a53573b7", "kind": "feature", "reference": "linebender/resvg#843", "summary": "CSS !important in style declarations" },
+    { "commit": "fc4d020a", "kind": "feature", "reference": "linebender/resvg#833", "summary": "Additional image-rendering values" }
+  ]
+}

@@ -1,0 +1,14 @@
+[package]
+name = "collective-canaries"
+version = "0.1.0"
+description = "Generates review canaries by reverting documented fixes and features in an upstream project's history."
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+collective-core = { path = "../core" }
+serde.workspace = true
+serde_json.workspace = true
+ureq = { version = "2", features = ["json"] }

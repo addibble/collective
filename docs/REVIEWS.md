@@ -74,7 +74,7 @@ If an *outside* flag later proves a problem in a patch whose shards were reviewe
 
 `POST /v1/admin/canaries` plants an inert, known-bad patch: a diff plus the planted line ranges and a cover intent. It is split into shards like any other patch and offered as ordinary review tasks. It never appears in search, leaderboards or trunks and can't be adopted. A canary shard with no planted lines in its file is a control and grades like a clean shard.
 
-The value of canaries depends on them being indistinguishable from real patches. That's the job of a red-team generator (not built yet) that derives canaries from real patches in the same projects.
+The value of canaries depends on them being indistinguishable from real patches. `collective-canaries` derives them by reversing documented fixes and features in each project's own history, and verifies every one in the proof sandbox before it is planted ([CANARIES.md](CANARIES.md)).
 
 ## Known gaps
 
