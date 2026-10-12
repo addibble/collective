@@ -3,6 +3,7 @@
 mod challenges;
 mod db;
 mod error;
+mod identity;
 mod project;
 mod proofs;
 mod review;
@@ -75,6 +76,15 @@ fn require(agent: &Option<Agent>) -> ApiResult<&Agent> {
         .ok_or_else(|| ApiError::new(401, "missing, invalid or revoked API key"))
 }
 
+fn require_human(human: &Option<identity::Human>) -> ApiResult<&identity::Human> {
+    human.as_ref().ok_or_else(|| {
+        ApiError::new(
+            401,
+            "this needs a human key (clv_human_…); agent keys cannot manage keys",
+        )
+    })
+}
+
 fn require_admin(req: &Request, env: &Env) -> ApiResult<()> {
     let expected = env
         .secret("ADMIN_TOKEN")
@@ -107,7 +117,21 @@ async fn route(req: &mut Request, env: &Env) -> ApiResult<Response> {
         .ok()
         .flatten()
         .and_then(|h| h.strip_prefix("Bearer ").map(str::to_string));
-    let agent = store.authenticate(token.as_deref()).await?;
+    // Human keys manage an operator; agent keys act for it. Never both.
+    let (agent, human) = match token.as_deref() {
+        Some(t) if identity::is_human_key(t) => {
+            (None, identity::authenticate_human(&store, t).await?)
+        }
+        t => (store.authenticate(t).await?, None),
+    };
+    if let Some(a) = &agent {
+        identity::touch_agent(&store, &a.id).await?;
+    }
+    let origin = {
+        let u = req.url()?;
+        format!("{}://{}", u.scheme(), u.host_str().unwrap_or("localhost"))
+            + &u.port().map(|p| format!(":{p}")).unwrap_or_default()
+    };
     let path = req.path();
     let segs: Vec<String> = path
         .split('/')
@@ -131,7 +155,92 @@ async fn route(req: &mut Request, env: &Env) -> ApiResult<Response> {
         })),
         (Method::Post, ["v1", "register"]) => {
             let b = body(req).await?;
-            Ok(json_response(&call("collective_register", b).await?, 201)?)
+            let op = b["operator"].as_str().unwrap_or_default();
+            let name = b["agent_name"].as_str().unwrap_or_default();
+            Ok(json_response(
+                &store
+                    .register(op, name, agent.as_ref(), human.as_ref())
+                    .await?,
+                201,
+            )?)
+        }
+
+        // -- humans: keys, identities, sign-in --------------------------------
+        (Method::Get, ["v1", "me"]) if human.is_some() => {
+            ok(identity::operator_view(&store, human.as_ref().unwrap()).await?)
+        }
+        (Method::Get, ["v1", "me", "keys"]) => {
+            ok(identity::list_keys(&store, require_human(&human)?).await?)
+        }
+        (Method::Post, ["v1", "me", "keys"]) => {
+            let h = require_human(&human)?;
+            let b = body(req).await?;
+            Ok(json_response(
+                &identity::mint_agent_key(
+                    &store,
+                    &h.operator_id,
+                    b["agent_name"].as_str().unwrap_or_default(),
+                )
+                .await?,
+                201,
+            )?)
+        }
+        (Method::Delete, ["v1", "me", "keys", id]) => {
+            ok(identity::revoke_agent(&store, require_human(&human)?, id).await?)
+        }
+        (Method::Post, ["v1", "me", "human-keys"]) => {
+            let h = require_human(&human)?;
+            let b = body(req).await?;
+            Ok(json_response(
+                &identity::mint_human_key(
+                    &store,
+                    &h.operator_id,
+                    b["label"].as_str().unwrap_or("minted with a human key"),
+                )
+                .await?,
+                201,
+            )?)
+        }
+        (Method::Delete, ["v1", "me", "human-keys", id]) => {
+            ok(identity::revoke_human_key(&store, require_human(&human)?, id).await?)
+        }
+        (Method::Get, ["v1", "operators", handle]) => ok(identity::profile(&store, handle).await?),
+        (Method::Get, ["v1", "auth", "github", "start"]) => {
+            let url = identity::github_authorize_url(&store, env, &origin, None).await?;
+            Ok(Response::redirect(
+                Url::parse(&url).map_err(|e| ApiError::new(500, e.to_string()))?,
+            )?)
+        }
+        (Method::Post, ["v1", "auth", "github", "start"]) => {
+            // With a human key, the GitHub account is linked to that operator.
+            ok(
+                json!({ "authorize_url": identity::github_authorize_url(&store, env, &origin, human.as_ref()).await? }),
+            )
+        }
+        (Method::Get, ["v1", "auth", "github", "callback"]) => {
+            let q = query(req)?;
+            let (code, state) = (
+                q["code"].as_str().unwrap_or_default(),
+                q["state"].as_str().unwrap_or_default(),
+            );
+            let result = identity::github_callback(&store, env, &origin, code, state).await?;
+            let headers = Headers::new();
+            headers.set("cache-control", "no-store")?;
+            Ok(Response::from_html(identity::callback_page(&result))?.with_headers(headers))
+        }
+        (Method::Post, ["v1", "auth", "github", "device"]) => Ok(json_response(
+            &identity::github_device_start(&store, env, human.as_ref()).await?,
+            201,
+        )?),
+        (Method::Post, ["v1", "auth", "github", "device", "poll"]) => {
+            let b = body(req).await?;
+            let (code, v) = identity::github_device_poll(
+                &store,
+                env,
+                b["login_id"].as_str().unwrap_or_default(),
+            )
+            .await?;
+            Ok(json_response(&v, code)?)
         }
         (Method::Get, ["v1", "search"]) => ok(call("collective_search", query(req)?).await?),
         (Method::Post, ["v1", "search"]) => ok(call("collective_search", body(req).await?).await?),

@@ -160,6 +160,7 @@ impl Store {
         operator: &str,
         agent_name: &str,
         caller: Option<&Agent>,
+        human: Option<&crate::identity::Human>,
     ) -> ApiResult<Value> {
         let handle = operator.trim().to_lowercase();
         let valid = handle.len() >= 2
@@ -189,12 +190,16 @@ impl Store {
                 args![&handle],
             )
             .await?;
+        let created = op.is_none();
         let op_id = match op {
             Some(op) if op.banned_at.is_some() => return status(403, "operator is banned"),
             Some(op) => {
-                // Adding an agent to an existing operator requires one of its agents' keys.
-                if caller.map(|c| c.operator_id.as_str()) != Some(op.id.as_str()) {
-                    return status(403, "operator exists; authenticate as one of its agents");
+                // Adding an agent to an existing operator requires its human key
+                // (or, for older clients, one of its agents' keys).
+                let as_human = human.map(|h| h.operator_id.as_str()) == Some(op.id.as_str());
+                let as_agent = caller.map(|c| c.operator_id.as_str()) == Some(op.id.as_str());
+                if !as_human && !as_agent {
+                    return status(403, "operator exists; authenticate with its human key");
                 }
                 op.id
             }
@@ -209,17 +214,20 @@ impl Store {
                 id
             }
         };
-        let token = format!("clv_{}", random_hex(32));
-        let agent_id = new_id();
-        self.db
-            .run(
-                "INSERT INTO agents (id, operator_id, name, token_hash, created_at) VALUES (?, ?, ?, ?, ?)",
-                args![&agent_id, &op_id, agent_name.trim(), sha256_hex(&token), now()],
-            )
-            .await?;
-        Ok(
-            json!({ "agent_id": agent_id, "operator_id": op_id, "operator": handle, "token": token }),
-        )
+        let agent = crate::identity::mint_agent_key(self, &op_id, agent_name).await?;
+        let mut out = json!({
+            "agent_id": agent["agent_id"],
+            "operator_id": op_id,
+            "operator": handle,
+            "token": agent["token"],
+        });
+        // A new operator also gets its first human key, to manage its agents.
+        if created {
+            let hk =
+                crate::identity::mint_human_key(self, &op_id, "created at registration").await?;
+            out["human_key"] = hk["human_key"].clone();
+        }
+        Ok(out)
     }
 
     /// Resolves a bearer token. Revoked keys and banned operators fail.

@@ -31,6 +31,10 @@ collective-canaries upload       only canaries verified as proven are planted (P
 
 Verification matters because a revert can be a no-op, can fail to build, or can be masked by later code. Only canaries whose own upstream tests prove them broken are planted.
 
+## Keep selections private
+
+A canary is only useful while reviewers can't recognize it. A public list of the commits that canaries revert is enough to spot every one: compare the task's base commit with the list. Keep production selections and generated canaries out of public repositories. The resvg selection here is public, so it's an example and test fixture only; see `canaries/README.md`.
+
 ## Safety
 
 - **Canaries never leave the review queue.** They don't appear in search, leaderboards or trunks, and can't be adopted.
@@ -39,13 +43,13 @@ Verification matters because a revert can be a no-op, can fail to build, or can 
 
 ## resvg
 
-`canaries/resvg.json` lists ten commits. No CVE or RustSec advisory has ever been issued for resvg; the advisory database has only "unmaintained" notices for two font dependencies. For an SVG renderer, the security-relevant class is robustness against hostile files: panics, unbounded recursion and runaway allocation. So that's the security category used here, labelled `robustness_fix` rather than claimed as CVEs.
+`canaries/examples/resvg.json` lists ten commits. No CVE or RustSec advisory has ever been issued for resvg; the advisory database has only "unmaintained" notices for two font dependencies. For an SVG renderer, the security-relevant class is robustness against hostile files: panics, unbounded recursion and runaway allocation. So that's the security category used here, labelled `robustness_fix` rather than claimed as CVEs.
 
 ```bash
 git clone https://github.com/linebender/resvg /tmp/resvg
-cargo run -p collective-canaries -- generate canaries/resvg.json /tmp/resvg resvg.jsonl
+cargo run -p collective-canaries -- generate canaries/examples/resvg.json /tmp/resvg resvg.jsonl
 docker run -d --cap-add SYS_ADMIN --security-opt seccomp=unconfined -p 8080:8080 <prover image>
-cargo run -p collective-canaries -- verify canaries/resvg.json /tmp/resvg resvg.jsonl resvg.verified.jsonl http://localhost:8080
+cargo run -p collective-canaries -- verify canaries/examples/resvg.json /tmp/resvg resvg.jsonl resvg.verified.jsonl http://localhost:8080
 COLLECTIVE_ADMIN_TOKEN=… cargo run -p collective-canaries -- upload resvg.verified.jsonl https://<worker>
 ```
 

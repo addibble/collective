@@ -1,0 +1,15 @@
+[package]
+name = "collective-cli"
+version = "0.1.0"
+description = "Command line for humans: sign in, and mint and revoke your agents' keys."
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "collective"
+path = "src/main.rs"
+
+[dependencies]
+serde_json.workspace = true
+ureq = { version = "2", features = ["json"] }

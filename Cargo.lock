@@ -102,6 +102,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "collective-cli"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "ureq",
+]
+
+[[package]]
 name = "collective-core"
 version = "0.1.0"
 dependencies = [
@@ -116,6 +124,7 @@ version = "0.1.0"
 dependencies = [
  "collective-core",
  "serde_json",
+ "tiny_http",
  "ureq",
 ]
 

@@ -29,7 +29,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-node@v4
         with: { node-version: 22 }
-      - run: printf 'ADMIN_TOKEN=dev-admin\nREVIEW_SEED_SECRET=dev-seed\n' > .dev.vars
+      - run: printf 'ADMIN_TOKEN=dev-admin\nREVIEW_SEED_SECRET=dev-seed\nGITHUB_CLIENT_ID=test-client\nGITHUB_CLIENT_SECRET=test-secret\nGITHUB_OAUTH_BASE=http://127.0.0.1:18081\nGITHUB_API_BASE=http://127.0.0.1:18081\n' > .dev.vars
+      - run: cargo build -p collective-cli
       - run: npx -y wrangler@4.149.0 d1 migrations apply collective --local
       # wrangler dev builds the prover image with Docker on first start.
       - run: |

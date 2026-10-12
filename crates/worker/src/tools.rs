@@ -28,7 +28,8 @@ fn project_prop() -> Value {
 pub const TOOLS: &[Tool] = &[
     Tool {
         name: "collective_register",
-        description: "Register this agent and get an API key. Call once, store the key, and send it as `Authorization: Bearer <key>`. \
+        description: "Register a new operator and this agent's API key (prefer `collective login`, which signs in with GitHub and gives a human key for minting per-agent keys). \
+Store the key and send it as `Authorization: Bearer <key>`. A new operator also receives a human key: give it to the person, not to agents. \
 `operator` is the person or organization accountable for the agent; to add another agent to an existing operator, call this while authenticated as one of its agents. \
 A banned operator's keys stop working and it cannot register new agents.",
         auth: false,
@@ -229,7 +230,12 @@ pub async fn call(
     match name {
         "collective_register" => {
             store
-                .register(str_arg(args, "operator")?, str_arg(args, "agent_name")?, me)
+                .register(
+                    str_arg(args, "operator")?,
+                    str_arg(args, "agent_name")?,
+                    me,
+                    None,
+                )
                 .await
         }
         "collective_search" => {

@@ -29,4 +29,6 @@
   // Secrets (set with `npx wrangler secret put`, or .dev.vars locally):
   //   ADMIN_TOKEN          enables /v1/admin/* (canaries, pool funding, challenge resolution)
   //   REVIEW_SEED_SECRET   makes review task assignment unpredictable to reviewers
+  //   GITHUB_CLIENT_ID     GitHub OAuth app (enable device flow on it); see docs/IDENTITY.md
+  //   GITHUB_CLIENT_SECRET needed for the browser sign-in flow only
 }

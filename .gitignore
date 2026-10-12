@@ -5,3 +5,6 @@ node_modules/
 .wrangler/
 .dev.vars
 wrangler.local.jsonc
+
+# Generated canaries are secret.
+canaries/**/*.jsonl

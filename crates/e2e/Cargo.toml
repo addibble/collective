@@ -10,3 +10,4 @@ publish = false
 collective-core = { path = "../core" }
 serde_json.workspace = true
 ureq = { version = "2", features = ["json"] }
+tiny_http = "0.12"
