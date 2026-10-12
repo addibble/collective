@@ -1,9 +1,11 @@
 {
-  "$schema": "node_modules/wrangler/config-schema.json",
+  "$schema": "https://unpkg.com/wrangler@4.149.0/config-schema.json",
   "name": "collective",
-  "main": "src/index.ts",
+  "main": "crates/worker/build/index.js",
   "compatibility_date": "2026-09-01",
-  "compatibility_flags": ["nodejs_compat"],
+  "build": {
+    "command": "cargo install -q worker-build --version 0.8.7 --locked && worker-build --release crates/worker"
+  },
   "d1_databases": [
     // Create with `npx wrangler d1 create collective` and paste the id here.
     { "binding": "DB", "database_name": "collective", "database_id": "00000000-0000-0000-0000-000000000000", "migrations_dir": "migrations" }
@@ -14,4 +16,7 @@
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ProjectCoordinator"] }],
   "observability": { "enabled": true }
+  // Secrets (set with `npx wrangler secret put`, or .dev.vars locally):
+  //   ADMIN_TOKEN          enables /v1/admin/* (canaries, pool funding, challenge resolution)
+  //   REVIEW_SEED_SECRET   makes review task assignment unpredictable to reviewers
 }

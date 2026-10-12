@@ -1,0 +1,17 @@
+[package]
+name = "collective-worker"
+version = "0.1.0"
+description = "Collective's Cloudflare Worker: REST and MCP front-end over the protocol core."
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+collective-core = { path = "../core" }
+serde.workspace = true
+serde_json.workspace = true
+worker = { version = "0.8.7", features = ["d1"] }
+getrandom = { version = "0.2", features = ["js"] }

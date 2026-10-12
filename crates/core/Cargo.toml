@@ -1,0 +1,14 @@
+[package]
+name = "collective-core"
+version = "0.1.0"
+description = "Collective's protocol: diffs, duplicate detection, usage scoring, convergence, challenges, juries and review duty."
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

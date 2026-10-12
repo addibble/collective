@@ -19,7 +19,7 @@ A new branch whose change already exists costs one content-addressed lookup and 
 
 ## 2. Every query is partitioned and lookup-shaped
 
-The `SearchIndex` interface (`src/search/types.ts`) allows only operations that scale horizontally:
+The `SearchIndex` interface (`crates/worker/src/search.rs`) allows only operations that scale horizontally:
 
 | Query | What it answers | Shape | Partition |
 |---|---|---|---|
@@ -29,7 +29,7 @@ The `SearchIndex` interface (`src/search/types.ts`) allows only operations that 
 
 There are no scans, no cross-partition joins and no global sorts. An agent almost always knows which project it is changing, so the project (fork-network root) is the natural partition. Project sizes follow a power law: millions of tiny partitions and a few huge ones (kernels, browsers, compilers). The engines below are chosen for that distribution: cheap cold namespaces and sub-sharding for the giants.
 
-Near-duplicate detection (`src/core/sketch.ts`) uses 32 MinHash permutations in 8 bands of 4. The chance that two patches become candidates is about `1 − (1 − s⁴)⁸`, where `s` is their similarity: 89% at s = 0.7, 40% at s = 0.5, under 7% at s = 0.3. Candidates are then checked against their full signatures. Each patch writes 8 keys and each query reads 8, whatever the corpus size.
+Near-duplicate detection (`crates/core/src/sketch.rs`) uses 32 MinHash permutations in 8 bands of 4. The chance that two patches become candidates is about `1 − (1 − s⁴)⁸`, where `s` is their similarity: 89% at s = 0.7, 40% at s = 0.5, under 7% at s = 0.3. Candidates are then checked against their full signatures. Each patch writes 8 keys and each query reads 8, whatever the corpus size.
 
 ## 3. Sizing
 
@@ -49,7 +49,7 @@ All of this is well within reach of commodity sharded storage. Indexing per bran
 
 ## 4. Engines
 
-The interface keeps these choices reversible. The D1 backend (`src/search/d1.ts`) is for development and small deployments only.
+The interface keeps these choices reversible. The D1 backend (`D1Search` in `crates/worker/src/search.rs`) is for development and small deployments only.
 
 **Exact and LSH postings (key → small posting list).** These are point reads and writes, write-heavy, at 10¹¹ keys.
 - *Cloudflare-native:* Durable Objects with SQLite storage, sharded by `hash(project, key)`. The per-project `ProjectCoordinator` already exists, and it can own the postings for the long tail of small projects. Large projects get dedicated shard objects. There is no separate service to operate.
@@ -68,7 +68,7 @@ The interface keeps these choices reversible. The D1 backend (`src/search/d1.ts`
 
 ```
 rank = relevance(text, hunk overlap, sketch similarity)
-     × usage(score, adopters)          -- core/score.ts
+     × usage(score, adopters)          -- crates/core/src/score.rs
      × proximity(patch base, agent HEAD)
      × freshness
 ```
@@ -111,7 +111,7 @@ Before choosing engines, we need a benchmark of real duplicate changes. Candidat
 - cherry-picks between forks (equal `git patch-id`s);
 - the same fix landing in several forks of one fork network (GH Archive, Software Heritage).
 
-Measure recall@k and latency at each stage. The LSH bands and thresholds in `core/sketch.ts` should be tuned against that set rather than by intuition.
+Measure recall@k and latency at each stage. The LSH bands and thresholds in `crates/core/src/sketch.rs` should be tuned against that set rather than by intuition.
 
 ## Open questions
 

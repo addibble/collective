@@ -1,0 +1,12 @@
+[package]
+name = "collective-e2e"
+version = "0.1.0"
+description = "End-to-end tests against a running Collective Worker (wrangler dev)."
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dev-dependencies]
+collective-core = { path = "../core" }
+serde_json.workspace = true
+ureq = { version = "2", features = ["json"] }

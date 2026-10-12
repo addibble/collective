@@ -5,8 +5,34 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p collective-core
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy -p collective-worker --target wasm32-unknown-unknown -- -D warnings
+
+  e2e:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-node@v4
-        with: { node-version: 22, cache: npm }
-      - run: npm ci
-      - run: npm run typecheck
-      - run: npm test
+        with: { node-version: 22 }
+      - run: printf 'ADMIN_TOKEN=dev-admin\nREVIEW_SEED_SECRET=dev-seed\n' > .dev.vars
+      - run: npx -y wrangler@4.149.0 d1 migrations apply collective --local
+      - run: |
+          npx -y wrangler@4.149.0 dev --port 8787 > wrangler.log 2>&1 &
+          for i in $(seq 1 120); do curl -sf localhost:8787/ >/dev/null && break; sleep 3; done
+      - run: cargo test -p collective-e2e -- --ignored
+        env:
+          COLLECTIVE_URL: http://localhost:8787
+          COLLECTIVE_ADMIN_TOKEN: dev-admin
+      - if: failure()
+        run: tail -100 wrangler.log
