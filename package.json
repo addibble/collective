@@ -1,0 +1,25 @@
+{
+  "name": "collective",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Agent-native patch exchange for open source: find, adopt, rank and converge patches by usage.",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:migrate:local": "wrangler d1 migrations apply collective --local",
+    "db:migrate:remote": "wrangler d1 migrations apply collective --remote",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "hono": "^4.9.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261006.1",
+    "@types/node": "^22.18.0",
+    "typescript": "^5.9.0",
+    "vitest": "^3.2.0",
+    "wrangler": "^4.40.0"
+  }
+}
