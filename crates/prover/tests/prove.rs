@@ -110,11 +110,31 @@ fn runs_have_no_network_and_no_inherited_environment() {
     let r = project();
     let patch = r.diff(&[("add.sh", Some(format!("{ADD}# comment\n")))]);
     std::env::set_var("PROVER_TEST_SECRET", "hunter2");
-    // Only loopback is visible, and the prover's environment is not.
-    // Nor can a run write outside its own tree.
-    let check = "test \"$(grep -c : /proc/net/dev)\" = 1 && grep -q '^ *lo:' /proc/net/dev && test -z \"$PROVER_TEST_SECRET\" \
-                 && ! touch /usr/local/bin/collective-pwned 2>/dev/null && touch inside-ok";
-    let s = spec(ProofKind::Property, check, &[("proof/x", "")]);
+    // A root-owned directory outside the tree, made by the test itself so
+    // the check doesn't depend on how the host's system directories are set up.
+    let outside = std::env::temp_dir().join(format!("prover-outside-{}", std::process::id()));
+    std::fs::create_dir_all(&outside).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&outside, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let as_root = std::fs::metadata("/proc/self")
+        .map(|m| std::os::unix::fs::MetadataExt::uid(&m) == 0)
+        .unwrap_or(false);
+    // Each condition says which one failed, so CI logs are useful.
+    let mut check = String::from(
+        "fail() { echo \"FAIL: $1\"; exit 1; }; \
+         test \"$(grep -c : /proc/net/dev)\" = 1 || fail 'more than one network interface'; \
+         grep -q '^ *lo:' /proc/net/dev || fail 'no loopback'; \
+         test -z \"$PROVER_TEST_SECRET\" || fail 'prover environment leaked'; \
+         touch inside-ok || fail 'cannot write inside the tree'",
+    );
+    // Dropping to an unprivileged user only happens when the prover is root.
+    if as_root {
+        check += &format!(
+            "; touch {}/pwned 2>/dev/null && fail 'wrote outside the tree'; true",
+            outside.display()
+        );
+    }
+    let s = spec(ProofKind::Property, &check, &[("proof/x", "")]);
     let report = prove(&s, &tarball(&r), &patch, &opts());
     assert!(
         report
@@ -123,6 +143,8 @@ fn runs_have_no_network_and_no_inherited_environment() {
             .all(|run| run.status == RunStatus::Passed),
         "{report:#?}"
     );
+    assert!(!outside.join("pwned").exists());
+    let _ = std::fs::remove_dir_all(outside);
 }
 
 #[test]
