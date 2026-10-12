@@ -32,6 +32,7 @@ fn report(base: &[RunStatus], patched: &[RunStatus]) -> ProofReport {
         exit_code: None,
         duration_ms: 1,
         output_tail: String::new(),
+        tests_run: Some(1),
     };
     ProofReport {
         prover_version: "test".into(),
@@ -202,4 +203,53 @@ fn specs_are_validated() {
     assert!(s.validate().is_ok());
     s.repeats = 0;
     assert!(s.validate().is_err());
+}
+
+#[test]
+fn counts_tests_from_runner_output() {
+    let cargo = "running 0 tests\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n\
+                 running 2 tests\ntest result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 1702 filtered out\n";
+    assert_eq!(count_tests(Ecosystem::Cargo, cargo), Some(2));
+    assert_eq!(
+        count_tests(
+            Ecosystem::Cargo,
+            "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1704 filtered out"
+        ),
+        Some(0)
+    );
+    assert_eq!(
+        count_tests(Ecosystem::Cargo, "error: could not compile `resvg`"),
+        None
+    );
+    assert_eq!(
+        count_tests(Ecosystem::Pip, "==== 3 passed, 1 failed in 0.2s ===="),
+        Some(4)
+    );
+    assert_eq!(
+        count_tests(Ecosystem::Pip, "==== no tests ran in 0.01s ===="),
+        Some(0)
+    );
+}
+
+#[test]
+fn regressions_must_actually_run_the_named_tests() {
+    let mut s = spec(ProofKind::Regression);
+    s.ecosystem = Ecosystem::Cargo;
+    s.tests = vec!["svg_without_xmlns".into()];
+    let with = |base: Option<u32>, patched: Option<u32>| {
+        let mut r = report(&[Passed, Passed], &[Failed, Failed]);
+        for run in &mut r.runs {
+            run.tests_run = if run.tree == Tree::Base {
+                base
+            } else {
+                patched
+            };
+        }
+        assess(&s, &r)
+    };
+    // Matched nothing: both trees "pass" vacuously, or the patch looks guilty for free.
+    assert_eq!(with(Some(0), Some(0)).verdict, Verdict::Inconclusive);
+    // The patched tree never got as far as running tests: a build break, for a person to confirm.
+    assert_eq!(with(Some(1), None).verdict, Verdict::Demonstrated);
+    assert_eq!(with(Some(1), Some(1)).verdict, Verdict::Proven);
 }

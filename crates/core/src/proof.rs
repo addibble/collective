@@ -65,7 +65,14 @@ impl Ecosystem {
     /// rather than the compiler. `None` where there is nothing to build.
     pub fn build_argv(self) -> Option<&'static [&'static str]> {
         match self {
-            Ecosystem::Cargo => Some(&["cargo", "test", "--offline", "--tests", "--no-run"]),
+            Ecosystem::Cargo => Some(&[
+                "cargo",
+                "test",
+                "--offline",
+                "--workspace",
+                "--tests",
+                "--no-run",
+            ]),
             Ecosystem::Go => Some(&["go", "test", "-count=1", "-run", "^$", "./..."]),
             Ecosystem::None | Ecosystem::Npm | Ecosystem::Pip => None,
         }
@@ -93,6 +100,7 @@ impl Ecosystem {
                 "cargo".into(),
                 "test".into(),
                 "--offline".into(),
+                "--workspace".into(),
                 "--tests".into(),
                 "--".into(),
             ],
@@ -314,6 +322,56 @@ pub struct RunResult {
     pub duration_ms: u64,
     /// Last few KB of combined stdout and stderr.
     pub output_tail: String,
+    /// How many tests actually executed, where the runner's output says so
+    /// (see [`count_tests`]). `Some(0)` means the selectors matched nothing.
+    #[serde(default)]
+    pub tests_run: Option<u32>,
+}
+
+fn number_before(text: &str, word: &str) -> Option<u32> {
+    let i = text.find(word)?;
+    text[..i].split_whitespace().last()?.parse().ok()
+}
+
+/// Counts executed tests from a runner's full output, for runners whose
+/// summary format is known. `None` means no summary was printed at all
+/// (typically: the build failed before any test ran).
+pub fn count_tests(ecosystem: Ecosystem, output: &str) -> Option<u32> {
+    match ecosystem {
+        Ecosystem::Cargo => {
+            // One "test result: ok. N passed; M failed; ..." line per test binary.
+            let mut total = None;
+            for line in output
+                .lines()
+                .filter(|l| l.trim_start().starts_with("test result:"))
+            {
+                let n = number_before(line, " passed").unwrap_or(0)
+                    + number_before(line, " failed").unwrap_or(0);
+                total = Some(total.unwrap_or(0) + n);
+            }
+            total
+        }
+        Ecosystem::Pip => {
+            let summary = output.lines().rev().find(|l| {
+                l.contains(" passed") || l.contains(" failed") || l.contains("no tests ran")
+            })?;
+            if summary.contains("no tests ran") {
+                return Some(0);
+            }
+            Some(
+                number_before(summary, " passed").unwrap_or(0)
+                    + number_before(summary, " failed").unwrap_or(0),
+            )
+        }
+        Ecosystem::None | Ecosystem::Npm | Ecosystem::Go => None,
+    }
+}
+
+impl Ecosystem {
+    /// Whether [`count_tests`] understands this runner's output.
+    pub fn counts_tests(self) -> bool {
+        matches!(self, Ecosystem::Cargo | Ecosystem::Pip)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -415,6 +473,23 @@ pub fn assess(spec: &ProofSpec, report: &ProofReport) -> Assessment {
                 Verdict::Demonstrated,
                 "the patched tree only timed out; a hang may be a bug or a slow runner",
             );
+        }
+        if spec.kind == ProofKind::Regression && spec.ecosystem.counts_tests() {
+            // A runner that ran nothing exits 0: a vacuous pass is not a pass.
+            if of(Tree::Base).any(|r| r.tests_run.unwrap_or(0) == 0) {
+                return assessment(
+                    Verdict::Inconclusive,
+                    "the named tests did not run on the base commit (no test matched)",
+                );
+            }
+            if of(Tree::Patched)
+                .any(|r| r.status == RunStatus::Failed && r.tests_run.unwrap_or(0) == 0)
+            {
+                return assessment(
+                    Verdict::Demonstrated,
+                    "the patched tree fails before running the named tests (it likely does not build); a person should confirm",
+                );
+            }
         }
         return match spec.kind {
             ProofKind::Regression => assessment(

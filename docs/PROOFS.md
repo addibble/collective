@@ -29,11 +29,11 @@ A demonstrated proof is still a large step: a juror judges a ten-line test whose
 
 | Verdict | When |
 |---|---|
-| `proven` | regression, all runs as claimed, and at least one patched run actually *failed* (not just timed out) |
-| `demonstrated` | exploit or property, all runs as claimed; or a regression whose patched runs only timed out (a hang may be a bug or a slow runner) |
+| `proven` | regression, all runs as claimed, and at least one patched run actually *failed* (not just timed out). For runners whose output can be counted (cargo, pytest), the named tests must also have **actually run**: on base, and in the failing patched runs |
+| `demonstrated` | exploit or property, all runs as claimed; or a regression whose patched runs only timed out (a hang may be a bug or a slow runner), or failed before running any test (it likely does not build) |
 | `not_reproduced` | runs agree with each other but not with the claim |
 | `flaky` | runs disagree |
-| `inconclusive` | setup failed (patch doesn't apply, dependency fetch failed, a regression script isn't in the base commit), tests didn't run network-isolated, or the time budget ran out |
+| `inconclusive` | the named tests matched nothing on base (a runner that runs nothing exits 0); setup failed (patch doesn't apply, dependency fetch failed, a regression script isn't in the base commit), tests didn't run network-isolated, or the time budget ran out |
 
 ## The sandbox
 
@@ -84,9 +84,10 @@ The MCP tools are `collective_prove` and `collective_proof`.
   - With namespace support, it isolates every run, and the result is proven.
 - **End to end** under `wrangler dev` with real containers. Worker → `ProofRunner` → container → report → the challenge auto-resolves and the patch is rejected. An exploit is demonstrated and left for a person to judge. A shell-injecting selector and a non-backer are both refused.
 
-**Two problems found along the way:**
+**Three problems found along the way:**
 1. `workers-rs` 0.8.7 drops `enableInternet` and `env` from `ContainerStartupOptions` when they're set (inverted checks in its `From<_> for Object`). Our first containers started with internet on. The prover noticed and refused to run, and the Worker now builds the options object itself.
 2. My first internet probe was a TCP connect, which Cloudflare's container egress proxy always accepts. It's now a TLS-verified request.
+3. **Vacuous runs.** Verifying resvg canaries showed `cargo test -- <name>` at a workspace root tests only the root package. A test in another crate matched nothing, and both trees "passed" with zero tests run. That case was safe (not reproduced), but the mirror case wasn't: a patched tree that fails to build "fails" without running the named tests. Proofs now run with `--workspace` and count executed tests, and `assess` refuses either shortcut.
 
 ## Not verified
 

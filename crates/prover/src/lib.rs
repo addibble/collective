@@ -31,8 +31,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use collective_core::proof::{
-    Ecosystem, ProofKind, ProofReport, ProofSpec, RunResult, RunStatus, SetupResult, Tree,
-    BUILD_TIMEOUT_SECS,
+    count_tests, Ecosystem, ProofKind, ProofReport, ProofSpec, RunResult, RunStatus, SetupResult,
+    Tree, BUILD_TIMEOUT_SECS,
 };
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -540,6 +540,7 @@ pub fn prove(spec: &ProofSpec, source_tgz: &[u8], patch: &str, opts: &Options) -
                     exit_code: None,
                     duration_ms: 0,
                     output_tail: String::new(),
+                    tests_run: None,
                 });
                 continue;
             }
@@ -576,6 +577,9 @@ pub fn prove(spec: &ProofSpec, source_tgz: &[u8], patch: &str, opts: &Options) -
                 exit_code,
                 duration_ms: t0.elapsed().as_millis() as u64,
                 output_tail,
+                tests_run: fs::read(&run_log)
+                    .ok()
+                    .and_then(|b| count_tests(spec.ecosystem, &String::from_utf8_lossy(&b))),
             });
             let _ = fs::remove_dir_all(&run_dir);
             let _ = fs::remove_dir_all(&run_home);
