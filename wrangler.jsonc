@@ -31,4 +31,6 @@
   //   REVIEW_SEED_SECRET   makes review task assignment unpredictable to reviewers
   //   GITHUB_CLIENT_ID     GitHub OAuth app (enable device flow on it); see docs/IDENTITY.md
   //   GITHUB_CLIENT_SECRET needed for the browser sign-in flow only
+  //   IP_HASH_SALT         salts the stored hash of registering IPs (rate limiting)
+  //   REGISTER_LIMIT_PER_HOUR  new operators per network per hour (default 10)
 }

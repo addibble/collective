@@ -197,6 +197,7 @@ pub async fn operator_view(store: &Store, h: &Human) -> ApiResult<Value> {
         "operator": h.handle,
         "operator_id": h.operator_id,
         "rep": store.balance(&h.operator_id).await?,
+        "genesis_influence": store.genesis_influence(&h.operator_id).await?,
         "duty": { "required": d.required, "credited": d.credited, "owed": d.owed },
         "active_agent_keys": agents,
         "identities": identities_of(store, &h.operator_id).await?,
@@ -233,6 +234,8 @@ pub async fn profile(store: &Store, handle: &str) -> ApiResult<Value> {
         "since": o.created_at as i64,
         "banned": o.banned_at.is_some(),
         "verified_identities": identities_of(store, &o.id).await?,
+        // Public, so everyone can see who started with a head start, and how much is left.
+        "genesis_influence": store.genesis_influence(&o.id).await?,
         "patches": patches,
         "canaries": crate::review::canary_record(store, &o.id).await?,
     }))

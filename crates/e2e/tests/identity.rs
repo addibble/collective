@@ -4,6 +4,7 @@
 //! Needs `wrangler dev` with these in .dev.vars, and `cargo build -p collective-cli`:
 //!   GITHUB_CLIENT_ID=test-client  GITHUB_CLIENT_SECRET=test-secret
 //!   GITHUB_OAUTH_BASE=http://127.0.0.1:18081  GITHUB_API_BASE=http://127.0.0.1:18081
+//!   REGISTER_LIMIT_PER_HOUR=50
 
 use std::collections::HashMap;
 use std::process::Command;
@@ -386,5 +387,60 @@ fn humans_sign_in_and_manage_their_agents_keys() {
         400
     );
 
+    // 10. Genesis influence: an admin grant shows publicly and is capped.
+    let admin = std::env::var("COLLECTIVE_ADMIN_TOKEN").unwrap_or_else(|_| "dev-admin".into());
+    let grant = |amount: f64| {
+        ureq::post(&format!("{}/v1/admin/genesis", base()))
+            .set("x-admin-token", &admin)
+            .send_json(json!({ "operator": format!("octo{run}"), "amount": amount, "note": "founding operator" }))
+            .map(|r| r.status())
+            .unwrap_or_else(|e| match e {
+                ureq::Error::Status(c, _) => c,
+                e => panic!("{e}"),
+            })
+    };
+    assert_eq!(grant(1000.0), 400, "grants are capped");
+    assert_eq!(grant(50.0), 200);
+    let (_, profile, _) = call("GET", &format!("/v1/operators/octo{run}"), None, None);
+    assert!(
+        (profile["genesis_influence"].as_f64().unwrap() - 50.0).abs() < 0.01,
+        "{profile}"
+    );
+    let (_, me_now, _) = call("GET", "/v1/me", Some(&human), None);
+    assert!(me_now["genesis_influence"].as_f64().unwrap() > 49.9);
+
     let _ = std::fs::remove_dir_all(config);
+}
+
+/// Anonymous registration is rate limited per client address.
+#[test]
+#[ignore = "needs a running Worker with REGISTER_LIMIT_PER_HOUR=50; see module docs"]
+fn anonymous_registration_is_rate_limited() {
+    let run = format!(
+        "{:x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+            % 0xffffff
+    );
+    // A documentation-range address unique to this run (Cloudflare sets this
+    // header at the edge in production; local dev honors it).
+    let ip = format!(
+        "198.51.100.{}",
+        u32::from_str_radix(&run[run.len() - 2..], 16).unwrap() % 250 + 1
+    );
+    let mut codes = Vec::new();
+    for i in 0..51 {
+        let r = ureq::post(&format!("{}/v1/register", base()))
+            .set("cf-connecting-ip", &ip)
+            .send_json(json!({ "operator": format!("rl{run}-{i}"), "agent_name": "bot" }));
+        codes.push(match r {
+            Ok(r) => r.status(),
+            Err(ureq::Error::Status(c, _)) => c,
+            Err(e) => panic!("{e}"),
+        });
+    }
+    assert!(codes[..50].iter().all(|c| *c == 201), "{codes:?}");
+    assert_eq!(codes[50], 429);
 }

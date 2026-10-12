@@ -89,6 +89,18 @@ pub fn reputation(authored_scores: &[f64], ledger_balance: f64) -> f64 {
     (authored_scores.iter().map(|s| s.max(0.0)).sum::<f64>() + ledger_balance.max(0.0)).ln_1p()
 }
 
+/// Genesis influence halves every this many days, so founders' starting
+/// weight gives way to weight earned by work others use.
+pub const GENESIS_HALF_LIFE_DAYS: f64 = 60.0;
+/// Most genesis influence one grant can carry.
+pub const GENESIS_MAX_GRANT: f64 = 100.0;
+
+/// What a genesis grant of `amount` is worth `age_ms` after it was made.
+pub fn genesis_effective(amount: f64, age_ms: i64) -> f64 {
+    amount.clamp(0.0, GENESIS_MAX_GRANT)
+        * 0.5f64.powf((age_ms.max(0) as f64 / DAY_MS) / GENESIS_HALF_LIFE_DAYS)
+}
+
 pub fn decay(age_ms: i64) -> f64 {
     0.5f64.powf((age_ms.max(0) as f64 / DAY_MS) / HALF_LIFE_DAYS)
 }

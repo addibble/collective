@@ -161,6 +161,7 @@ impl Store {
         agent_name: &str,
         caller: Option<&Agent>,
         human: Option<&crate::identity::Human>,
+        ip: Option<&str>,
     ) -> ApiResult<Value> {
         let handle = operator.trim().to_lowercase();
         let valid = handle.len() >= 2
@@ -204,11 +205,12 @@ impl Store {
                 op.id
             }
             None => {
+                let ip_hash = self.check_registration_rate(ip).await?;
                 let id = new_id();
                 self.db
                     .run(
-                        "INSERT INTO operators (id, handle, created_at) VALUES (?, ?, ?)",
-                        args![&id, &handle, now()],
+                        "INSERT INTO operators (id, handle, created_at, created_ip_hash) VALUES (?, ?, ?, ?)",
+                        args![&id, &handle, now(), ip_hash],
                     )
                     .await?;
                 id
@@ -228,6 +230,35 @@ impl Store {
             out["human_key"] = hk["human_key"].clone();
         }
         Ok(out)
+    }
+
+    /// Anonymous registration is limited per IP (stored only as a salted
+    /// hash): fresh operators each get a free review-duty allowance, so
+    /// unlimited ones would undercut both duty and the anti-sybil weighting.
+    async fn check_registration_rate(&self, ip: Option<&str>) -> ApiResult<Option<String>> {
+        let Some(ip) = ip else { return Ok(None) };
+        let setting = |k: &str| {
+            self.env
+                .secret(k)
+                .map(|s| s.to_string())
+                .or_else(|_| self.env.var(k).map(|v| v.to_string()))
+                .ok()
+        };
+        let salt = setting("IP_HASH_SALT").unwrap_or_else(|| "collective".into());
+        let limit: u32 = setting("REGISTER_LIMIT_PER_HOUR")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10);
+        let hash = sha256_hex(format!("{salt}:{ip}"))[..32].to_string();
+        let recent = self
+            .count(
+                "SELECT COUNT(*) AS n FROM operators WHERE created_ip_hash = ? AND created_at > ?",
+                args![&hash, now() - 3_600_000],
+            )
+            .await?;
+        if recent >= limit {
+            return status(429, "too many new operators from this network; try again later, or sign in with GitHub (collective login)");
+        }
+        Ok(Some(hash))
     }
 
     /// Resolves a bearer token. Revoked keys and banned operators fail.
@@ -747,6 +778,62 @@ impl Store {
 
     /// Trust for each operator: 0 if banned, otherwise from authored-patch
     /// scores plus ledger balance.
+    /// Current genesis influence: founding grants, halving every 60 days.
+    pub async fn genesis_influence(&self, operator_id: &str) -> ApiResult<f64> {
+        #[derive(Deserialize)]
+        struct G {
+            amount: f64,
+            granted_at: f64,
+        }
+        let rows: Vec<G> = self
+            .db
+            .all(
+                "SELECT amount, granted_at FROM genesis WHERE operator_id = ?",
+                args![operator_id],
+            )
+            .await?;
+        let t = now();
+        Ok(rows
+            .iter()
+            .map(|g| collective_core::score::genesis_effective(g.amount, t - g.granted_at as i64))
+            .sum())
+    }
+
+    pub async fn grant_genesis(
+        &self,
+        handle: &str,
+        amount: f64,
+        note: Option<&str>,
+    ) -> ApiResult<Value> {
+        if !(amount > 0.0 && amount <= collective_core::score::GENESIS_MAX_GRANT) {
+            return bad(format!(
+                "amount must be in (0, {}]",
+                collective_core::score::GENESIS_MAX_GRANT
+            ));
+        }
+        #[derive(Deserialize)]
+        struct O {
+            id: String,
+        }
+        let Some(o) = self
+            .db
+            .first::<O>(
+                "SELECT id FROM operators WHERE handle = ?",
+                args![handle.to_lowercase()],
+            )
+            .await?
+        else {
+            return status(404, "unknown operator");
+        };
+        self.db
+            .run(
+                "INSERT INTO genesis (id, operator_id, amount, note, granted_at) VALUES (?, ?, ?, ?, ?)",
+                args![new_id(), &o.id, amount, note, now()],
+            )
+            .await?;
+        Ok(json!({ "operator": handle, "genesis_influence": self.genesis_influence(&o.id).await? }))
+    }
+
     pub async fn trust_map(&self, ops: &[String]) -> ApiResult<HashMap<String, f64>> {
         let mut out = HashMap::new();
         for chunk in ops.chunks(MAX_PARAMS / 3) {
@@ -780,7 +867,8 @@ impl Store {
                         .split(',')
                         .filter_map(|s| s.parse().ok())
                         .collect();
-                    trust(reputation(&scores, r.balance.unwrap_or(0.0)))
+                    let genesis = self.genesis_influence(&r.id).await?;
+                    trust(reputation(&scores, r.balance.unwrap_or(0.0) + genesis))
                 };
                 out.insert(r.id, t);
             }

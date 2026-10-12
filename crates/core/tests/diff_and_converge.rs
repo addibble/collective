@@ -2,7 +2,7 @@ mod common;
 
 use collective_core::converge::{converge, Candidate, ConvergeOptions};
 use collective_core::diff::*;
-use collective_core::score::{score_patch, trust, Adoption, Outcome};
+use collective_core::score::{reputation, score_patch, trust, Adoption, Outcome};
 use collective_core::text::{similarity, terms};
 use common::{lines, Repo};
 
@@ -214,4 +214,17 @@ fn converge_stacks_compatible_winners_and_explains_skips() {
     assert!(reason("p-child").contains("lineage"));
     assert!(reason("p-weak").contains("threshold"));
     assert!(r.applies(&trunk.diff));
+}
+
+#[test]
+fn genesis_influence_halves_and_is_capped() {
+    use collective_core::score::{genesis_effective, GENESIS_HALF_LIFE_DAYS, GENESIS_MAX_GRANT};
+    let day = 86_400_000i64;
+    assert_eq!(genesis_effective(50.0, 0), 50.0);
+    assert!((genesis_effective(50.0, (GENESIS_HALF_LIFE_DAYS as i64) * day) - 25.0).abs() < 1e-9);
+    assert_eq!(genesis_effective(1e9, 0), GENESIS_MAX_GRANT);
+    // A founder's head start fades: after a year, a 100-point grant is worth under 2.
+    assert!(genesis_effective(100.0, 365 * day) < 2.0);
+    // Reputation and trust take it as input like any other earned standing.
+    assert!(trust(reputation(&[], genesis_effective(100.0, 0))) > 0.99);
 }

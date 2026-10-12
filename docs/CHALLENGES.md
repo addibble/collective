@@ -85,6 +85,10 @@ If real backdoors are rare, the expected value of looking for one is near zero, 
 | Grinding the jury seed | Seed committed before the candidate list closes | Requires trusting the platform's commitment; public randomness (e.g. a drand beacon) removes that |
 | Lazy rubber-stamp attesting | Canaries | — |
 
+## Bootstrapping
+
+Founding operators can be granted **genesis influence** (`POST /v1/admin/genesis`, at most 100 per grant). It adds to trust, and later to jury eligibility, but it **halves every 60 days and can't be spent** on bonds or stakes. The founders' head start gives way to weight earned by work others use. Grants are public on each operator's profile (`GET /v1/operators/:handle`).
+
 ## Open questions
 
 - **Rep versus money.** Rep only motivates people if it buys influence that matters: adoption weight, jury seats, convergence. Early on it won't be worth much. Paying real money for critical findings (sponsor-funded, through existing bug-bounty rails) is the strongest incentive, but it brings KYC, sanctions and tax obligations that a points system avoids. Recommendation: rep for staking, plus optional fiat bounties for verified critical findings.

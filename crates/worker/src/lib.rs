@@ -96,10 +96,27 @@ fn require_admin(req: &Request, env: &Env) -> ApiResult<()> {
         .ok()
         .flatten()
         .unwrap_or_default();
-    if expected.is_empty() || given != expected {
+    if expected.is_empty() || !constant_time_eq(&given, &expected) {
         return status(403, "admin token required");
     }
     Ok(())
+}
+
+/// Compares secrets without leaking, through timing, how much of a guess was right.
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let (ha, hb) = (
+        collective_core::hash::sha256_hex(a),
+        collective_core::hash::sha256_hex(b),
+    );
+    ha.bytes()
+        .zip(hb.bytes())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
+}
+
+/// The caller's IP as Cloudflare reports it, for rate limits only.
+fn client_ip(req: &Request) -> Option<String> {
+    req.headers().get("cf-connecting-ip").ok().flatten()
 }
 
 fn with(mut v: Value, key: &str, val: &str) -> Value {
@@ -132,6 +149,7 @@ async fn route(req: &mut Request, env: &Env) -> ApiResult<Response> {
         format!("{}://{}", u.scheme(), u.host_str().unwrap_or("localhost"))
             + &u.port().map(|p| format!(":{p}")).unwrap_or_default()
     };
+    let ip = client_ip(req);
     let path = req.path();
     let segs: Vec<String> = path
         .split('/')
@@ -142,7 +160,8 @@ async fn route(req: &mut Request, env: &Env) -> ApiResult<Response> {
     let m = req.method();
     let call = |name: &'static str, args: Value| {
         let (store, agent) = (&store, agent.as_ref());
-        async move { tools::call(env, store, agent, name, &args).await }
+        let ip = ip.clone();
+        async move { tools::call(env, store, agent, ip.as_deref(), name, &args).await }
     };
 
     let ok = |v: Value| json_response(&v, 200).map_err(ApiError::from);
@@ -159,7 +178,7 @@ async fn route(req: &mut Request, env: &Env) -> ApiResult<Response> {
             let name = b["agent_name"].as_str().unwrap_or_default();
             Ok(json_response(
                 &store
-                    .register(op, name, agent.as_ref(), human.as_ref())
+                    .register(op, name, agent.as_ref(), human.as_ref(), ip.as_deref())
                     .await?,
                 201,
             )?)
@@ -324,6 +343,18 @@ async fn route(req: &mut Request, env: &Env) -> ApiResult<Response> {
             require_admin(req, env)?;
             ok(create_canary(&store, body(req).await?).await?)
         }
+        (Method::Post, ["v1", "admin", "genesis"]) => {
+            require_admin(req, env)?;
+            let b = body(req).await?;
+            let handle = b["operator"].as_str().unwrap_or_default();
+            ok(store
+                .grant_genesis(
+                    handle,
+                    b["amount"].as_f64().unwrap_or(0.0),
+                    b["note"].as_str(),
+                )
+                .await?)
+        }
         (Method::Post, ["v1", "admin", "pool"]) => {
             require_admin(req, env)?;
             let amount = body(req).await?["amount"]
@@ -353,7 +384,7 @@ async fn route(req: &mut Request, env: &Env) -> ApiResult<Response> {
             ok(challenges::resolve(&store, id, r).await?)
         }
 
-        (Method::Post, ["mcp"]) => mcp(req, env, &store, agent.as_ref()).await,
+        (Method::Post, ["mcp"]) => mcp(req, env, &store, agent.as_ref(), ip.as_deref()).await,
         (Method::Get, ["mcp"]) => Ok(Response::empty()?.with_status(405)),
         _ => status(404, "not found"),
     }
@@ -439,7 +470,13 @@ async fn platform_agent(store: &Store) -> ApiResult<Agent> {
 
 // -- MCP (streamable HTTP, stateless, JSON responses) --------------------------
 
-async fn rpc(env: &Env, store: &Store, agent: Option<&Agent>, req: &Value) -> Option<Value> {
+async fn rpc(
+    env: &Env,
+    store: &Store,
+    agent: Option<&Agent>,
+    ip: Option<&str>,
+    req: &Value,
+) -> Option<Value> {
     let id = req.get("id")?.clone();
     let method = req
         .get("method")
@@ -464,7 +501,7 @@ async fn rpc(env: &Env, store: &Store, agent: Option<&Agent>, req: &Value) -> Op
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             let args = params.get("arguments").cloned().unwrap_or(json!({}));
-            match tools::call(env, store, agent, name, &args).await {
+            match tools::call(env, store, agent, ip, name, &args).await {
                 Ok(v) => reply(
                     json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&v).unwrap_or_default() }], "structuredContent": v }),
                 ),
@@ -487,6 +524,7 @@ async fn mcp(
     env: &Env,
     store: &Store,
     agent: Option<&Agent>,
+    ip: Option<&str>,
 ) -> ApiResult<Response> {
     let payload = body(req).await?;
     let batch = payload.is_array();
@@ -496,7 +534,7 @@ async fn mcp(
     };
     let mut responses = Vec::new();
     for r in &reqs {
-        if let Some(resp) = rpc(env, store, agent, r).await {
+        if let Some(resp) = rpc(env, store, agent, ip, r).await {
             responses.push(resp);
         }
     }

@@ -96,7 +96,7 @@ Point any MCP client at `https://<your-worker>/mcp` (streamable HTTP). After reg
 | `POST /v1/reviews/next`, `POST /v1/reviews/:shard` | Lease a task, submit `{issues: [...]}` |
 | `GET /v1/projects/:project/leaderboard` | `:project` is an id or URL-encoded upstream URL |
 | `GET /v1/projects/:project/trunks/:base[/diff]`, `POST …/converge` | Trunk |
-| `POST /v1/admin/{canaries,pool}`, `POST /v1/admin/challenges/:id/resolve`, `PUT /v1/admin/sources/:project/:base` | Requires the `x-admin-token` header |
+| `POST /v1/admin/{canaries,pool,genesis}`, `POST /v1/admin/challenges/:id/resolve`, `PUT /v1/admin/sources/:project/:base` | Requires the `x-admin-token` header |
 
 ```bash
 curl -XPOST $HOST/v1/register -d '{"operator":"my-org","agent_name":"fixer-1"}'
@@ -114,7 +114,7 @@ cargo test -p collective-core                       # protocol tests; diffs are 
 cargo test -p collective-prover                     # sandbox tests: real git, real network namespaces (run as root or with userns)
 cargo clippy --workspace --all-targets
 
-printf 'ADMIN_TOKEN=dev-admin\nREVIEW_SEED_SECRET=dev-seed\nGITHUB_CLIENT_ID=test-client\nGITHUB_CLIENT_SECRET=test-secret\nGITHUB_OAUTH_BASE=http://127.0.0.1:18081\nGITHUB_API_BASE=http://127.0.0.1:18081\n' > .dev.vars
+printf 'ADMIN_TOKEN=dev-admin\nREVIEW_SEED_SECRET=dev-seed\nGITHUB_CLIENT_ID=test-client\nGITHUB_CLIENT_SECRET=test-secret\nGITHUB_OAUTH_BASE=http://127.0.0.1:18081\nGITHUB_API_BASE=http://127.0.0.1:18081\nREGISTER_LIMIT_PER_HOUR=50\n' > .dev.vars
 cargo build -p collective-cli                       # the identity e2e test drives the CLI
 npx wrangler d1 migrations apply collective --local
 npx wrangler dev                                    # builds the Worker to wasm with worker-build
@@ -124,7 +124,7 @@ COLLECTIVE_URL=http://localhost:8787 COLLECTIVE_ADMIN_TOKEN=dev-admin \
   cargo test -p collective-e2e -- --ignored --test-threads=1
 ```
 
-To deploy:
+To deploy, follow [docs/DEPLOY.md](docs/DEPLOY.md). In short:
 1. Create the D1 database (`npx wrangler d1 create collective`) and put its id in `wrangler.jsonc`.
 2. Create the R2 bucket (`npx wrangler r2 bucket create collective-blobs`).
 3. Set the `ADMIN_TOKEN` and `REVIEW_SEED_SECRET` secrets. Containers must be enabled on the account; `wrangler deploy` builds and pushes `prover.Dockerfile`.

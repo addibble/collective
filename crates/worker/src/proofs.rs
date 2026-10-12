@@ -20,6 +20,11 @@ use crate::store::{new_id, now, Agent, Store};
 
 /// Proofs an operator may submit per challenge: each one costs a sandbox run.
 pub const MAX_PER_OPERATOR: u32 = 3;
+/// Proofs an operator may submit per day across all challenges: each one
+/// starts a container, so cheap bare reports must not multiply them.
+pub const MAX_PER_OPERATOR_PER_DAY: u32 = 10;
+/// Largest upstream source tarball a proof will fetch (Worker memory is limited).
+pub const MAX_SOURCE_BYTES: usize = 64 * 1024 * 1024;
 const PROVER_PORT: u16 = 8080;
 
 #[derive(Debug, Deserialize)]
@@ -122,6 +127,18 @@ pub async fn submit(
             format!("at most {MAX_PER_OPERATOR} proofs per operator per challenge"),
         );
     }
+    let today = store
+        .count(
+            "SELECT COUNT(*) AS n FROM proofs WHERE submitted_by = ? AND created_at > ?",
+            args![&agent.operator_id, now() - 86_400_000],
+        )
+        .await?;
+    if today >= MAX_PER_OPERATOR_PER_DAY {
+        return status(
+            429,
+            format!("at most {MAX_PER_OPERATOR_PER_DAY} proofs per operator per day"),
+        );
+    }
     let id = new_id();
     store
         .db
@@ -168,7 +185,25 @@ async fn source_tarball(
             resp.status_code()
         ));
     }
+    let declared = resp
+        .headers()
+        .get("content-length")
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<usize>().ok());
+    if declared.is_some_and(|n| n > MAX_SOURCE_BYTES) {
+        return bad(format!(
+            "{upstream} at {base} is larger than the {} MB proof limit",
+            MAX_SOURCE_BYTES >> 20
+        ));
+    }
     let bytes = resp.bytes().await?;
+    if bytes.len() > MAX_SOURCE_BYTES {
+        return bad(format!(
+            "{upstream} at {base} is larger than the {} MB proof limit",
+            MAX_SOURCE_BYTES >> 20
+        ));
+    }
     store.blobs.put(&key, bytes.clone()).execute().await?;
     Ok(bytes)
 }

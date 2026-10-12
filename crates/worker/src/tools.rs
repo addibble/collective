@@ -212,6 +212,7 @@ pub async fn call(
     env: &Env,
     store: &Store,
     agent: Option<&Agent>,
+    ip: Option<&str>,
     name: &str,
     args: &Value,
 ) -> ApiResult<Value> {
@@ -235,6 +236,7 @@ pub async fn call(
                     str_arg(args, "agent_name")?,
                     me,
                     None,
+                    ip,
                 )
                 .await
         }
