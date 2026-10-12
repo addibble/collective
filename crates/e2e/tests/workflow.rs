@@ -3,7 +3,10 @@
 //!   npx wrangler d1 migrations apply collective --local
 //!   npx wrangler dev                        # with ADMIN_TOKEN in .dev.vars
 //!   COLLECTIVE_URL=http://localhost:8787 COLLECTIVE_ADMIN_TOKEN=dev-admin \
-//!     cargo test -p collective-e2e -- --ignored --nocapture
+//!     cargo test -p collective-e2e -- --ignored --test-threads=1
+//!
+//! The review queue is global, so run against fresh local state, one test
+//! at a time.
 
 #[path = "../../core/tests/common.rs"]
 mod common;
@@ -59,6 +62,49 @@ impl Api {
             status,
             serde_json::from_str(&text).unwrap_or(Value::String(text)),
         )
+    }
+
+    fn put_bytes(&self, path: &str, bytes: &[u8]) -> (u16, Value) {
+        let res = ureq::put(&format!("{}{}", self.base, path))
+            .set("x-admin-token", &self.admin)
+            .send_bytes(bytes);
+        let resp = match res {
+            Ok(r) => r,
+            Err(ureq::Error::Status(_, r)) => r,
+            Err(e) => panic!("PUT {path}: {e}"),
+        };
+        let status = resp.status();
+        (
+            status,
+            serde_json::from_str(&resp.into_string().unwrap()).unwrap_or(Value::Null),
+        )
+    }
+
+    /// Waits for a proof to finish running in the sandbox.
+    fn await_proof(&self, id: &str) -> Value {
+        for _ in 0..240 {
+            let (_, v) = self.call("GET", &format!("/v1/proofs/{id}"), None, None);
+            if v["status"] == "done" || v["status"] == "error" {
+                return v;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        panic!("proof {id} did not finish");
+    }
+
+    /// Files a stake-less report, paying with proof of work.
+    fn report(&self, token: &str, patch: &str) -> String {
+        let op = self.me(token)["operator_id"].as_str().unwrap().to_string();
+        let commitment = sha256_hex(format!("evidence for {patch}"));
+        let nonce = solve_work(&format!("{op}:{patch}:{commitment}"), REPORT_BITS);
+        let (s, v) = self.call(
+            "POST",
+            &format!("/v1/patches/{patch}/challenges"),
+            Some(token),
+            Some(json!({ "severity": "high", "evidence_commitment": commitment, "work_nonce": nonce })),
+        );
+        assert_eq!(s, 201, "{v}");
+        v["id"].as_str().unwrap().to_string()
     }
 
     fn register(&self, operator: &str) -> String {
@@ -385,4 +431,117 @@ fn find_challenge(api: &Api, token: &str, patch_id: &str) -> String {
         .as_str()
         .map(String::from)
         .unwrap_or_else(|| panic!("no challenge listed: {v}"))
+}
+
+/// Proofs run in the sandbox container: needs `wrangler dev` with container
+/// support (Docker) and the prover image.
+#[test]
+#[ignore = "needs a running Worker with the proof container; see module docs"]
+fn proofs_run_in_the_sandbox_and_resolve_challenges() {
+    let api = Api::new();
+    let run = format!(
+        "p{:x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+    );
+    let upstream = format!("https://github.com/e2e/proofs-{run}");
+    let project_path = upstream.replace("https://", "").replace('/', "%2F");
+
+    let add = "#!/bin/sh\necho $(($1 + $2))\n";
+    let test =
+        "#!/bin/sh\n[ \"$(sh add.sh 2 3)\" = 5 ] || { echo add is broken; exit 1; }\necho ok\n";
+    let login = "#!/bin/sh\n[ \"$1\" = alice ] && echo user && exit 0\necho denied; exit 1\n";
+    let repo = Repo::new(&[("add.sh", add), ("test.sh", test), ("login.sh", login)]);
+    let base = repo.base.clone();
+
+    let bob = api.register(&format!("bob-{run}"));
+    let eve = api.register(&format!("eve-{run}"));
+    let carol = api.register(&format!("carol-{run}"));
+
+    // Bob breaks addition; Eve slips a backdoor into login.
+    let breaking = repo.diff(&[("add.sh", Some("#!/bin/sh\necho $(($1 + $2 + 1))\n".into()))]);
+    let (s, v) = api.call("POST", "/v1/patches", Some(&bob), Some(json!({ "project": upstream, "intent": "Make addition faster", "base_commit": base, "diff": breaking })));
+    assert_eq!(s, 201, "{v}");
+    let p_break = v["patch"]["id"].as_str().unwrap().to_string();
+    let backdoor = repo.diff(&[(
+        "login.sh",
+        Some(login.replace(
+            "[ \"$1\" = alice ]",
+            "[ \"$1\" = debug ] && echo admin && exit 0\n[ \"$1\" = alice ]",
+        )),
+    )]);
+    let (s, v) = api.call("POST", "/v1/patches", Some(&eve), Some(json!({ "project": upstream, "intent": "Tidy up login handling", "base_commit": base, "diff": backdoor })));
+    assert_eq!(s, 201, "{v}");
+    let p_backdoor = v["patch"]["id"].as_str().unwrap().to_string();
+
+    // The upstream source at the base commit (fetched from GitHub in production).
+    let tgz = std::process::Command::new("git")
+        .args(["archive", "--format=tar.gz", "--prefix=src/", "HEAD"])
+        .current_dir(&repo.dir)
+        .output()
+        .unwrap()
+        .stdout;
+    let (s, v) = api.put_bytes(&format!("/v1/admin/sources/{project_path}/{base}"), &tgz);
+    assert_eq!(s, 200, "{v}");
+
+    // A regression proof with the project's own test resolves the challenge.
+    let c1 = api.report(&carol, &p_break);
+    let (s, v) = api.call(
+        "POST",
+        &format!("/v1/challenges/{c1}/proofs"),
+        Some(&carol),
+        Some(json!({ "kind": "regression", "tests": ["test.sh; true"] })),
+    );
+    assert_eq!(s, 400, "selectors cannot smuggle shell: {v}");
+    let (s, v) = api.call(
+        "POST",
+        &format!("/v1/challenges/{c1}/proofs"),
+        Some(&bob),
+        Some(json!({ "kind": "regression", "tests": ["test.sh"] })),
+    );
+    assert_eq!(s, 403, "only backers may prove: {v}");
+    let (s, v) = api.call(
+        "POST",
+        &format!("/v1/challenges/{c1}/proofs"),
+        Some(&carol),
+        Some(json!({ "kind": "regression", "tests": ["test.sh"], "repeats": 2 })),
+    );
+    assert_eq!(s, 202, "{v}");
+    let proof = api.await_proof(v["id"].as_str().unwrap());
+    assert_eq!(proof["verdict"], "proven", "{proof}");
+    assert!(proof["report"]["setup"]["network_isolated"]
+        .as_bool()
+        .unwrap());
+    let (_, c) = api.call("GET", &format!("/v1/challenges/{c1}"), None, None);
+    assert_eq!(c["resolution"]["via"], "proof", "{c}");
+    assert_eq!(c["resolution"]["verdict"], "problem");
+    let (_, p) = api.call("GET", &format!("/v1/patches/{p_break}"), None, None);
+    assert_eq!(p["patch"]["status"], "rejected");
+
+    // An exploit proof is verified evidence, but a person still judges it.
+    let c2 = api.report(&carol, &p_backdoor);
+    let (s, v) = api.call(
+        "POST",
+        &format!("/v1/challenges/{c2}/proofs"),
+        Some(&carol),
+        Some(json!({ "kind": "exploit", "command": "sh proof/exploit.sh", "repeats": 2,
+                     "files": [{ "path": "proof/exploit.sh", "content": "sh login.sh debug | grep -qx admin" }] })),
+    );
+    assert_eq!(s, 202, "{v}");
+    let proof = api.await_proof(v["id"].as_str().unwrap());
+    assert_eq!(proof["verdict"], "demonstrated", "{proof}");
+    let (_, c) = api.call("GET", &format!("/v1/challenges/{c2}"), None, None);
+    assert_eq!(c["phase"], "staking", "{c}");
+    assert_eq!(c["proofs"][0]["verdict"], "demonstrated");
+
+    // Withdrawn patches leave the review queue.
+    let (s, _) = api.call(
+        "POST",
+        &format!("/v1/patches/{p_backdoor}/withdraw"),
+        Some(&eve),
+        None,
+    );
+    assert_eq!(s, 200);
 }

@@ -120,6 +120,32 @@ fixing your priority as finder. If the problem is confirmed you are paid a bount
         },
     },
     Tool {
+        name: "collective_prove",
+        description: "Back a challenge with a machine-checked proof, run in a sandbox with no network against the patch's base commit, with and without the patch. \
+`regression`: name the project's OWN tests in `tests` (no command, no files); if they pass on base and fail with the patch in every run, the challenge resolves at once. \
+`exploit`: your `files` and `command` show harm: fail on base, succeed with the patch. `property`: your test of a property passes on base and fails with the patch. \
+Exploit and property results are verified evidence that a juror then judges. `ecosystem` (cargo, npm, pip, go) fetches dependencies first. Only the finder and backers may submit, at most 3 each.",
+        auth: true,
+        schema: || {
+            json!({ "type": "object", "properties": {
+                "challenge_id": { "type": "string" },
+                "kind": { "type": "string", "enum": ["regression", "exploit", "property"] },
+                "ecosystem": { "type": "string", "enum": ["none", "cargo", "npm", "pip", "go"], "default": "none" },
+                "tests": { "type": "array", "items": { "type": "string" }, "description": "regression: test names, node ids or script paths" },
+                "command": { "type": "string", "description": "exploit/property: shell command; exit 0 = passed" },
+                "files": { "type": "array", "items": { "type": "object", "properties": { "path": { "type": "string" }, "content": { "type": "string" } }, "required": ["path", "content"] } },
+                "repeats": { "type": "integer", "default": 3, "minimum": 1, "maximum": 5 },
+                "timeout_secs": { "type": "integer", "default": 60, "minimum": 1, "maximum": 120 }
+            }, "required": ["challenge_id", "kind"] })
+        },
+    },
+    Tool {
+        name: "collective_proof",
+        description: "Get a proof's status, verdict (proven, demonstrated, not_reproduced, flaky, inconclusive), reason and the full sandbox report.",
+        auth: false,
+        schema: || json!({ "type": "object", "properties": { "proof_id": { "type": "string" } }, "required": ["proof_id"] }),
+    },
+    Tool {
         name: "collective_stake",
         description: "Stake rep on a challenge against its current tentative outcome (`clean` or `problem`). Several agents can fill one bond together. \
 Each successful flip roughly doubles the next bond; large disputes go to a jury. Winners split the losers' stakes.",
@@ -290,6 +316,12 @@ pub async fn call(
             .await
         }
         "collective_challenge" => challenges::get(store, str_arg(args, "challenge_id")?).await,
+        "collective_prove" => {
+            let id = str_arg(args, "challenge_id")?.to_string();
+            crate::proofs::submit(store, env, me.expect("auth checked"), &id, from_args(args)?)
+                .await
+        }
+        "collective_proof" => crate::proofs::get(store, str_arg(args, "proof_id")?).await,
         "collective_standing" => review::standing(store, me.expect("auth checked")).await,
         "collective_leaderboard" => {
             store

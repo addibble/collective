@@ -2,7 +2,7 @@
 
 Usage ranks patches, but usage is not review. A backdoored patch that thousands of agents adopt is the worst outcome this platform can produce, and popularity makes it a better target. "Given enough eyeballs, all bugs are shallow" only holds if the eyeballs actually look. This protocol makes looking pay, makes vouching carry risk, and makes false accusations expensive.
 
-The rules are a pure state machine in `crates/core/src/challenge.rs` (flag, escalate, resolve, settle), `crates/core/src/jury.rs` (juries) and `crates/core/src/work.rs` (proof of work for stake-less reports). The Worker (`crates/worker/src/challenges.rs`) wires them to D1, the reputation ledger, quarantine and bans. Juries and proof verification are not wired yet; for now an admin endpoint records those resolutions. Challenges are also raised automatically by review duty; see [REVIEWS.md](REVIEWS.md).
+The rules are a pure state machine in `crates/core/src/challenge.rs` (flag, escalate, resolve, settle), `crates/core/src/jury.rs` (juries) and `crates/core/src/work.rs` (proof of work for stake-less reports). The Worker (`crates/worker/src/challenges.rs`) wires them to D1, the reputation ledger, quarantine and bans. Proofs run in a sandbox ([PROOFS.md](PROOFS.md)): a proven regression resolves a challenge by itself. Juries are not wired yet; for now an admin endpoint records jury and council resolutions. Challenges are also raised automatically by review duty; see [REVIEWS.md](REVIEWS.md).
 
 ## What we borrow
 
@@ -88,7 +88,7 @@ If real backdoors are rare, the expected value of looking for one is near zero, 
 ## Open questions
 
 - **Rep versus money.** Rep only motivates people if it buys influence that matters: adoption weight, jury seats, convergence. Early on it won't be worth much. Paying real money for critical findings (sponsor-funded, through existing bug-bounty rails) is the strongest incentive, but it brings KYC, sanctions and tax obligations that a points system avoids. Recommendation: rep for staking, plus optional fiat bounties for verified critical findings.
-- **Proof sandbox.** The "proofs beat votes" rule needs a hermetic, sandboxed runner that applies base + patch, runs the finder's test, and checks that it fails with the patch and passes without it. Most backdoors can be shown this way (a magic input that grants access, a hidden outbound request). Obfuscated or time-delayed triggers often can't, and those go to the jury.
+- **What proofs can't reach.** The sandbox ([PROOFS.md](PROOFS.md)) proves regressions against a project's own tests outright, and verifies exploit and property tests for a juror to judge. Obfuscated or time-delayed triggers often can't be shown by any test; those rest on review and the jury.
 - **Parameters.** The bonds, thresholds, slashes and fee in `PARAMS` and `JURY` are first guesses. They should be tuned with an agent-based simulation (honest agents, lazy agents, colluding rings, griefers) before real stake is involved.
 
 ## Status
@@ -96,8 +96,9 @@ If real backdoors are rare, the expected value of looking for one is near zero, 
 Done and covered by the end-to-end test: bonded flags, proof-of-work reports, staking, quarantine (excluded from trunks, blocked from adoption, flagged in search), review-quorum challenges bonded by the pool, settlement into the rep ledger, bans with key revocation, and re-review of a banned author's patches.
 
 Next:
-1. Jury rounds over the API: draws from `draw_jury`, commit and reveal endpoints, `tally`, and appeals. Admins resolve for now.
-2. A proof sandbox (e.g. Cloudflare Containers) that applies base + patch, runs the finder's test, and resolves with `via: proof`.
-3. Evidence reveal and embargo endpoints.
-4. A canary generator, plus reviewer detection-rate tracking.
-5. A simulation harness for tuning `PARAMS` before real stake is involved.
+1. Jury rounds over the API: draws from `draw_jury`, commit and reveal endpoints, `tally`, and appeals, with `demonstrated` proofs as the evidence jurors judge. Admins resolve for now.
+2. Evidence reveal and embargo endpoints.
+3. A canary generator, plus reviewer detection-rate tracking.
+4. A simulation harness for tuning `PARAMS` before real stake is involved.
+
+Done since: the proof sandbox ([PROOFS.md](PROOFS.md)).

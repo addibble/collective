@@ -1,0 +1,13 @@
+[package]
+name = "collective-prover"
+version = "0.1.0"
+description = "Proof sandbox: runs a finder's test against a base commit with and without a patch, isolated from the network."
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+collective-core = { path = "../core" }
+serde.workspace = true
+serde_json.workspace = true
+tiny_http = "0.12"

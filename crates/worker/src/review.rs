@@ -183,7 +183,8 @@ pub async fn next_task(store: &Store, agent: &Agent) -> ApiResult<Value> {
                     "SELECT s.id, s.author_op, s.wanted,
                        (SELECT COUNT(*) FROM review_tasks r WHERE r.shard_id = s.id AND (r.submitted_at IS NOT NULL OR r.expires_at > ?)) AS taken,
                        (SELECT COUNT(*) FROM review_tasks r WHERE r.shard_id = s.id AND r.operator_id = ?) AS mine
-                     FROM shards s WHERE s.state = 'open' AND s.author_op != ?
+                     FROM shards s JOIN patches p ON p.id = s.patch_id
+                     WHERE s.state = 'open' AND s.author_op != ? AND p.status NOT IN ('withdrawn','rejected')
                      ORDER BY s.created_at LIMIT 200",
                     args![t, &agent.operator_id, &agent.operator_id],
                 )

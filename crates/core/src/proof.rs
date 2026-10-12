@@ -1,0 +1,454 @@
+//! Proofs: machine-checked evidence for a challenge.
+//!
+//! A test that behaves differently with and without a patch only proves the
+//! patch changes behavior, which every patch does. So a proof is judged
+//! against an oracle the finder does not control:
+//!
+//! - `Regression`: the project's *own* tests pass on the base commit and fail
+//!   with the patch. The finder adds no files and writes no command: it names
+//!   tests, which run through the ecosystem's standard runner as plain
+//!   arguments, so the finder cannot smuggle in a check of its own (like
+//!   "fail if the patch's text is present"). Objective: resolves the
+//!   challenge by itself.
+//! - `Exploit`: a finder-supplied test fails on base and passes with the
+//!   patch, i.e. "with this patch, user `debug` gets admin". The sandbox
+//!   verifies the behavior; a juror only has to judge a short test, not the
+//!   whole patch.
+//! - `Property`: a finder-supplied test of a property (e.g. "logins reject
+//!   unknown users") passes on base and fails with the patch. Verified the
+//!   same way, judged the same way.
+//!
+//! The sandbox (crates/prover) runs every attempt on a fresh copy of the
+//! tree with no network; this module only decides what the runs mean.
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProofKind {
+    Regression,
+    Exploit,
+    Property,
+}
+
+/// Dependency fetch before the tests run. Each is a fixed command that
+/// downloads without executing project code; it is the only step with
+/// network access. `None` runs the container with no internet at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Ecosystem {
+    #[default]
+    None,
+    Cargo,
+    Npm,
+    Pip,
+    Go,
+}
+
+impl Ecosystem {
+    /// The fetch command, run in the project root with network.
+    pub fn setup_command(self) -> Option<&'static str> {
+        match self {
+            Ecosystem::None => None,
+            Ecosystem::Cargo => Some("cargo fetch"),
+            Ecosystem::Npm => Some("npm ci --ignore-scripts --no-audit --no-fund"),
+            // Wheels only: installing an sdist would run its setup.py with network.
+            Ecosystem::Pip => Some(
+                "python3 -m venv .venv && .venv/bin/pip install --only-binary=:all: -r requirements.txt",
+            ),
+            Ecosystem::Go => Some("go mod download"),
+        }
+    }
+
+    /// Environment for the offline test phase.
+    pub fn offline_env(self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            Ecosystem::Cargo => &[("CARGO_NET_OFFLINE", "true")],
+            Ecosystem::Npm => &[("npm_config_offline", "true")],
+            Ecosystem::Pip => &[("PIP_NO_INDEX", "1"), ("VIRTUAL_ENV", ".venv")],
+            Ecosystem::Go => &[("GOPROXY", "off"), ("GOFLAGS", "-mod=mod")],
+            Ecosystem::None => &[],
+        }
+    }
+
+    /// The standard test runner, as argv (never through a shell), with the
+    /// finder's validated selectors. `None` runs one of the project's own
+    /// scripts with `sh`.
+    pub fn test_argv(self, tests: &[String]) -> Vec<String> {
+        let mut argv: Vec<String> = match self {
+            Ecosystem::None => vec!["sh".into()],
+            Ecosystem::Cargo => vec![
+                "cargo".into(),
+                "test".into(),
+                "--offline".into(),
+                "--".into(),
+            ],
+            Ecosystem::Npm => vec!["npm".into(), "test".into(), "--".into()],
+            Ecosystem::Pip => vec![
+                ".venv/bin/python".into(),
+                "-m".into(),
+                "pytest".into(),
+                "-q".into(),
+                "-p".into(),
+                "no:cacheprovider".into(),
+            ],
+            Ecosystem::Go => vec![
+                "go".into(),
+                "test".into(),
+                "./...".into(),
+                "-count=1".into(),
+                "-run".into(),
+            ],
+        };
+        match self {
+            Ecosystem::Go => argv.push(format!("^({})$", tests.join("|"))),
+            _ => argv.extend(tests.iter().cloned()),
+        }
+        argv
+    }
+}
+
+/// A test selector: a test name, node id or script path. No shell
+/// metacharacters, no options, no escaping the tree.
+pub fn valid_selector(t: &str) -> bool {
+    !t.is_empty()
+        && t.len() <= 200
+        && !t.starts_with('-')
+        && !t.contains("..")
+        && t.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_./:[]=,@+".contains(c))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProofFile {
+    pub path: String,
+    pub content: String,
+}
+
+pub const MAX_REPEATS: u8 = 5;
+pub const MAX_TIMEOUT_SECS: u32 = 120;
+pub const MAX_FILES: usize = 20;
+pub const MAX_FILE_BYTES: usize = 256 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProofSpec {
+    pub kind: ProofKind,
+    #[serde(default)]
+    pub ecosystem: Ecosystem,
+    /// Regression proofs: the project's tests to run, by name or path.
+    #[serde(default)]
+    pub tests: Vec<String>,
+    /// Exploit and property proofs: shell command run in the project root
+    /// over the finder's files. Exit 0 means "passed".
+    #[serde(default)]
+    pub command: Option<String>,
+    /// Files added to both trees (exploit and property proofs only).
+    #[serde(default)]
+    pub files: Vec<ProofFile>,
+    /// Runs per tree; every run must agree.
+    #[serde(default = "default_repeats")]
+    pub repeats: u8,
+    #[serde(default = "default_timeout")]
+    pub timeout_secs: u32,
+}
+
+fn default_repeats() -> u8 {
+    3
+}
+
+fn default_timeout() -> u32 {
+    60
+}
+
+/// A relative path that stays inside the tree.
+pub fn safe_relative_path(p: &str) -> bool {
+    !p.is_empty()
+        && !p.starts_with('/')
+        && !p.contains('\\')
+        && !p.contains('\0')
+        && p.split('/')
+            .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
+        && !p.split('/').next().is_some_and(|s| s == ".git")
+}
+
+impl ProofSpec {
+    pub fn validate(&self) -> Result<(), String> {
+        match self.kind {
+            ProofKind::Regression => {
+                if self.command.is_some() {
+                    return Err("a regression proof names the project's tests in `tests`; it takes no command".into());
+                }
+                if self.tests.is_empty() || self.tests.len() > 20 {
+                    return Err("name 1-20 of the project's tests in `tests`".into());
+                }
+                if let Some(bad) = self.tests.iter().find(|t| !valid_selector(t)) {
+                    return Err(format!("invalid test selector: {bad}"));
+                }
+                if self.ecosystem == Ecosystem::None
+                    && (self.tests.len() != 1 || !safe_relative_path(&self.tests[0]))
+                {
+                    return Err("without an ecosystem, `tests` is the path of one of the project's own test scripts".into());
+                }
+            }
+            ProofKind::Exploit | ProofKind::Property => {
+                let cmd = self.command.as_deref().unwrap_or_default();
+                if cmd.trim().is_empty() || cmd.len() > 2000 {
+                    return Err("command must be 1-2000 characters".into());
+                }
+                if !self.tests.is_empty() {
+                    return Err("`tests` is only for regression proofs".into());
+                }
+            }
+        }
+        if !(1..=MAX_REPEATS).contains(&self.repeats) {
+            return Err(format!("repeats must be 1-{MAX_REPEATS}"));
+        }
+        if !(1..=MAX_TIMEOUT_SECS).contains(&self.timeout_secs) {
+            return Err(format!("timeout_secs must be 1-{MAX_TIMEOUT_SECS}"));
+        }
+        if self.kind == ProofKind::Regression && !self.files.is_empty() {
+            return Err("a regression proof uses the project's own tests: add no files (use exploit or property instead)".into());
+        }
+        if self.kind != ProofKind::Regression && self.files.is_empty() {
+            return Err("exploit and property proofs need the test file(s) they run".into());
+        }
+        if self.files.len() > MAX_FILES {
+            return Err(format!("at most {MAX_FILES} files"));
+        }
+        for f in &self.files {
+            if !safe_relative_path(&f.path) {
+                return Err(format!("unsafe file path: {}", f.path));
+            }
+            if f.content.len() > MAX_FILE_BYTES {
+                return Err(format!("{} is larger than {MAX_FILE_BYTES} bytes", f.path));
+            }
+        }
+        Ok(())
+    }
+
+    /// The argv each run executes.
+    pub fn argv(&self) -> Vec<String> {
+        match self.kind {
+            ProofKind::Regression => self.ecosystem.test_argv(&self.tests),
+            _ => vec![
+                "sh".into(),
+                "-c".into(),
+                self.command.clone().unwrap_or_default(),
+            ],
+        }
+    }
+
+    /// What each tree must do for the proof to hold.
+    pub fn expected(&self) -> (Expect, Expect) {
+        match self.kind {
+            ProofKind::Regression | ProofKind::Property => (Expect::Pass, Expect::Fail),
+            ProofKind::Exploit => (Expect::Fail, Expect::Pass),
+        }
+    }
+
+    /// Wall-clock budget a prover needs, including setup.
+    pub fn budget_secs(&self) -> u32 {
+        2 * self.repeats as u32 * self.timeout_secs + 300
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Expect {
+    Pass,
+    Fail,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Tree {
+    Base,
+    Patched,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunStatus {
+    Passed,
+    Failed,
+    TimedOut,
+    /// Not run: the prover's time budget ran out.
+    Skipped,
+}
+
+impl RunStatus {
+    fn meets(self, e: Expect) -> bool {
+        match e {
+            Expect::Pass => self == RunStatus::Passed,
+            Expect::Fail => matches!(self, RunStatus::Failed | RunStatus::TimedOut),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunResult {
+    pub tree: Tree,
+    pub attempt: u8,
+    pub status: RunStatus,
+    pub exit_code: Option<i32>,
+    pub duration_ms: u64,
+    /// Last few KB of combined stdout and stderr.
+    pub output_tail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SetupResult {
+    pub ok: bool,
+    pub error: Option<String>,
+    /// Whether test commands provably had no network.
+    pub network_isolated: bool,
+    /// How: "no-internet container" or "network namespace".
+    pub isolation: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProofReport {
+    pub prover_version: String,
+    pub setup: SetupResult,
+    pub runs: Vec<RunResult>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Verdict {
+    /// Objective: the project's own tests break. Resolves the challenge.
+    Proven,
+    /// The claimed behavior is verified; whether it is harmful needs a judgement.
+    Demonstrated,
+    /// The runs are consistent but do not show the claimed difference.
+    NotReproduced,
+    /// The runs disagree with each other.
+    Flaky,
+    /// The proof could not be run properly.
+    Inconclusive,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Assessment {
+    pub verdict: Verdict,
+    pub reason: String,
+}
+
+fn assessment(verdict: Verdict, reason: impl Into<String>) -> Assessment {
+    Assessment {
+        verdict,
+        reason: reason.into(),
+    }
+}
+
+/// Decides what a prover's runs establish. Fails closed: anything short of
+/// complete, isolated, unanimous runs is not a proof.
+pub fn assess(spec: &ProofSpec, report: &ProofReport) -> Assessment {
+    if let Err(e) = spec.validate() {
+        return assessment(Verdict::Inconclusive, format!("invalid spec: {e}"));
+    }
+    if !report.setup.ok {
+        return assessment(
+            Verdict::Inconclusive,
+            report
+                .setup
+                .error
+                .clone()
+                .unwrap_or_else(|| "setup failed".into()),
+        );
+    }
+    if !report.setup.network_isolated {
+        return assessment(
+            Verdict::Inconclusive,
+            "tests did not run without network, so their results cannot count",
+        );
+    }
+    let (want_base, want_patched) = spec.expected();
+    let of = |t: Tree| report.runs.iter().filter(move |r| r.tree == t);
+    for t in [Tree::Base, Tree::Patched] {
+        if of(t).count() != spec.repeats as usize {
+            return assessment(
+                Verdict::Inconclusive,
+                format!("expected {} runs per tree", spec.repeats),
+            );
+        }
+    }
+    if report.runs.iter().any(|r| r.status == RunStatus::Skipped) {
+        return assessment(
+            Verdict::Inconclusive,
+            "time budget ran out before every run finished",
+        );
+    }
+
+    let meets = |t: Tree, e: Expect| of(t).filter(|r| r.status.meets(e)).count();
+    let n = spec.repeats as usize;
+    let (base_ok, patched_ok) = (
+        meets(Tree::Base, want_base),
+        meets(Tree::Patched, want_patched),
+    );
+
+    if base_ok == n && patched_ok == n {
+        let only_timeouts = want_patched == Expect::Fail
+            && of(Tree::Patched).all(|r| r.status == RunStatus::TimedOut);
+        if only_timeouts {
+            return assessment(
+                Verdict::Demonstrated,
+                "the patched tree only timed out; a hang may be a bug or a slow runner",
+            );
+        }
+        return match spec.kind {
+            ProofKind::Regression => assessment(
+                Verdict::Proven,
+                "the project's own tests pass on base and fail with the patch, in every run",
+            ),
+            ProofKind::Exploit => assessment(
+                Verdict::Demonstrated,
+                "the exploit fails on base and succeeds with the patch, in every run",
+            ),
+            ProofKind::Property => assessment(
+                Verdict::Demonstrated,
+                "the property holds on base and is broken by the patch, in every run",
+            ),
+        };
+    }
+    let consistent = |k: usize| k == 0 || k == n;
+    if consistent(base_ok) && consistent(patched_ok) {
+        let mut why = Vec::new();
+        if base_ok == 0 {
+            why.push(format!("base did not {:?} as claimed", want_base).to_lowercase());
+        }
+        if patched_ok == 0 {
+            why.push(format!("patched tree did not {:?} as claimed", want_patched).to_lowercase());
+        }
+        return assessment(Verdict::NotReproduced, why.join("; "));
+    }
+    assessment(
+        Verdict::Flaky,
+        format!("runs disagree: base {base_ok}/{n}, patched {patched_ok}/{n} as claimed"),
+    )
+}
+
+/// What the Worker sends the prover: one line of JSON, then the raw
+/// `.tar.gz` source bytes (no base64 inflation of large trees).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProveRequest {
+    pub spec: ProofSpec,
+    pub patch: String,
+}
+
+pub fn encode_prove_request(req: &ProveRequest, source_tgz: &[u8]) -> Vec<u8> {
+    let mut body = serde_json::to_vec(req).expect("serializable");
+    body.push(b'\n');
+    body.extend_from_slice(source_tgz);
+    body
+}
+
+pub fn decode_prove_request(body: &[u8]) -> Result<(ProveRequest, &[u8]), String> {
+    let nl = body
+        .iter()
+        .position(|b| *b == b'\n')
+        .ok_or("missing header line")?;
+    let req: ProveRequest =
+        serde_json::from_slice(&body[..nl]).map_err(|e| format!("bad header: {e}"))?;
+    Ok((req, &body[nl + 1..]))
+}

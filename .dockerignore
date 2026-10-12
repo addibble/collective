@@ -1,0 +1,7 @@
+target
+build
+crates/worker/build
+node_modules
+.wrangler
+.dev.vars
+.git

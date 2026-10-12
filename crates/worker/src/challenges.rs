@@ -262,7 +262,13 @@ pub async fn stake(store: &Store, agent: &Agent, id: &str, s: Stake) -> ApiResul
 pub async fn get(store: &Store, id: &str) -> ApiResult<Value> {
     let (mut c, row) = load(store, id).await?;
     advance_and_settle(store, &mut c, &row).await?;
-    Ok(view(&c))
+    let mut v = view(&c);
+    v["proofs"] = json!(crate::proofs::list_for_challenge(store, id).await?);
+    Ok(v)
+}
+
+pub async fn load_state(store: &Store, id: &str) -> ApiResult<Challenge> {
+    Ok(load(store, id).await?.0)
 }
 
 #[derive(Debug, Deserialize)]

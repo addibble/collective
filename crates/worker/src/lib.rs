@@ -4,6 +4,7 @@ mod challenges;
 mod db;
 mod error;
 mod project;
+mod proofs;
 mod review;
 mod search;
 mod store;
@@ -19,6 +20,7 @@ use crate::error::{bad, status, ApiError, ApiResult};
 use crate::store::{new_id, Agent, NewPatch, Store, POOL};
 
 pub use project::ProjectCoordinator;
+pub use proofs::ProofRunner;
 
 const MCP_PROTOCOL: &str = "2025-06-18";
 
@@ -169,6 +171,13 @@ async fn route(req: &mut Request, env: &Env) -> ApiResult<Response> {
         (Method::Get, ["v1", "challenges", id]) => {
             ok(call("collective_challenge", json!({ "challenge_id": id })).await?)
         }
+        (Method::Post, ["v1", "challenges", id, "proofs"]) => {
+            let b = with(body(req).await?, "challenge_id", id);
+            Ok(json_response(&call("collective_prove", b).await?, 202)?)
+        }
+        (Method::Get, ["v1", "proofs", id]) => {
+            ok(call("collective_proof", json!({ "proof_id": id })).await?)
+        }
         (Method::Post, ["v1", "challenges", id, "stake"]) => ok(call(
             "collective_stake",
             with(body(req).await?, "challenge_id", id),
@@ -223,6 +232,11 @@ async fn route(req: &mut Request, env: &Env) -> ApiResult<Response> {
                 )
                 .await?;
             ok(json!({ "pool": store.balance(POOL).await? }))
+        }
+        (Method::Put, ["v1", "admin", "sources", p, base]) => {
+            require_admin(req, env)?;
+            let bytes = req.bytes().await?;
+            ok(proofs::put_source(&store, p, base, bytes).await?)
         }
         (Method::Post, ["v1", "admin", "challenges", id, "resolve"]) => {
             require_admin(req, env)?;

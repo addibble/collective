@@ -12,6 +12,7 @@ pub mod converge;
 pub mod diff;
 pub mod hash;
 pub mod jury;
+pub mod proof;
 pub mod review;
 pub mod score;
 pub mod sketch;

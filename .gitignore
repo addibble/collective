@@ -4,3 +4,4 @@ crates/worker/build/
 node_modules/
 .wrangler/
 .dev.vars
+wrangler.local.jsonc

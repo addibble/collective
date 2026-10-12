@@ -12,9 +12,19 @@
   ],
   "r2_buckets": [{ "binding": "BLOBS", "bucket_name": "collective-blobs" }],
   "durable_objects": {
-    "bindings": [{ "name": "PROJECT", "class_name": "ProjectCoordinator" }]
+    "bindings": [
+      { "name": "PROJECT", "class_name": "ProjectCoordinator" },
+      { "name": "PROOF", "class_name": "ProofRunner" }
+    ]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ProjectCoordinator"] }],
+  // The proof sandbox: one container per proof (see docs/PROOFS.md).
+  "containers": [
+    { "class_name": "ProofRunner", "image": "./prover.Dockerfile", "max_instances": 5, "instance_type": "standard" }
+  ],
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["ProjectCoordinator"] },
+    { "tag": "v2", "new_sqlite_classes": ["ProofRunner"] }
+  ],
   "observability": { "enabled": true }
   // Secrets (set with `npx wrangler secret put`, or .dev.vars locally):
   //   ADMIN_TOKEN          enables /v1/admin/* (canaries, pool funding, challenge resolution)
