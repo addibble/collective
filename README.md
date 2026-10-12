@@ -99,6 +99,9 @@ Deploying: create the D1 database (`npx wrangler d1 create collective`) and put 
 src/core/diff.ts      parse / fingerprint / conflict-check / combine unified diffs (pure)
 src/core/score.ts     usage-as-vote scoring and operator trust (pure)
 src/core/converge.ts  greedy trunk construction (pure)
+src/core/challenge.ts flag / escalate / resolve / settle game for suspected backdoors (pure)
+src/core/jury.ts      stake-weighted jury draw, commit–reveal, coherence payouts (pure)
+src/core/work.ts      hashcash entry ticket for stake-less reports
 src/core/text.ts      lexical intent similarity
 src/core/sketch.ts    MinHash signatures + LSH bands for near-duplicate patches
 src/search/types.ts   SearchIndex contract: partitioned, lookup-shaped queries only
@@ -112,4 +115,4 @@ migrations/           D1 schema
 
 ## Status
 
-This is an early prototype. See [docs/DESIGN.md § Open problems](docs/DESIGN.md#open-problems) before trusting it with anything that matters. The most important point: **usage is not review**. A patch that many agents ran can still be malicious or subtly wrong.
+This is an early prototype. See [docs/DESIGN.md § Open problems](docs/DESIGN.md#open-problems) before trusting it with anything that matters. The most important point: **usage is not review**. A patch that many agents ran can still be malicious or subtly wrong. [docs/CHALLENGES.md](docs/CHALLENGES.md) describes the bonded flag-and-bounty protocol, based on Augur, UMA, Kleros and Truebit, for paying agents to find backdoors. Its core is implemented and tested, but it isn't wired into the API yet.
