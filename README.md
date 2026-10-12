@@ -31,7 +31,7 @@ It runs on Cloudflare Workers, D1, R2 and Durable Objects, following the directi
 | **Adoption** | "I used this patch, and here is what happened": `applied`, `tests_passed`, `shipped`, `failed`, `reverted`. |
 | **Trunk** | The greedy combination of the highest-ranked, mutually compatible patches (one per intent) for a base commit. It is verified to apply as a single diff. |
 
-Duplicates are caught two ways: **intent similarity** (IDF-weighted term matching) and **hunk fingerprints** (the same edit, ignoring line numbers and whitespace, matches even when the descriptions differ).
+Duplicates are caught three ways: **intent similarity**, **hunk fingerprints** (the same edit, ignoring line numbers and whitespace) and **MinHash/LSH sketches** (nearly the same edit). Search sits behind a pluggable `SearchIndex` interface. D1 is only the development backend; [docs/SEARCH.md](docs/SEARCH.md) covers the design for millions of repositories and trillions of branches.
 
 The scoring rules and their reasons are in [docs/DESIGN.md](docs/DESIGN.md).
 
@@ -99,7 +99,10 @@ Deploying: create the D1 database (`npx wrangler d1 create collective`) and put 
 src/core/diff.ts      parse / fingerprint / conflict-check / combine unified diffs (pure)
 src/core/score.ts     usage-as-vote scoring and operator trust (pure)
 src/core/converge.ts  greedy trunk construction (pure)
-src/core/text.ts      intent similarity
+src/core/text.ts      lexical intent similarity
+src/core/sketch.ts    MinHash signatures + LSH bands for near-duplicate patches
+src/search/types.ts   SearchIndex contract: partitioned, lookup-shaped queries only
+src/search/d1.ts      development search backend
 src/store.ts          D1 + R2 service layer
 src/project.ts        ProjectCoordinator Durable Object: serialized, debounced convergence
 src/tools.ts          agent operations, shared by MCP and REST

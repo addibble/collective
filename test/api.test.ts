@@ -108,6 +108,33 @@ describe("agent workflow", () => {
     expect(applies(dir, base, diff.json)).toBe(true);
   });
 
+  it("flags near-duplicates that share no identical hunk", async () => {
+    const c = client();
+    const src = Array.from({ length: 30 }, (_, i) => `x${i} = ${i}`).join("\n") + "\n";
+    const { dir, base } = repo({ "report.py": src });
+    const fn = (name: string, tweak: string) =>
+      [
+        `def ${name}(rows):`,
+        "    out = []",
+        "    for row in rows:",
+        "        if row is None:",
+        "            continue",
+        `        out.append(format_row(row, sep="${tweak}"))`,
+        "    header = make_header(rows)",
+        "    footer = make_footer(rows)",
+        "    return header + out + footer",
+      ].join("\n") + "\n";
+    const first = makeDiff(dir, base, (w) => w("report.py", src + fn("render_table", ",")));
+    const second = makeDiff(dir, base, (w) => w("report.py", src + fn("render_table", "\\t")));
+    const alice = await agentFor(c, "alice");
+    const bob = await agentFor(c, "bob");
+    const p1 = await c.call("POST", "/v1/patches", { project: UPSTREAM, intent: "Render report rows as a table", base_commit: base, diff: first }, alice);
+    const p2 = await c.call("POST", "/v1/patches", { project: UPSTREAM, intent: "tabular output for reports", base_commit: base, diff: second }, bob);
+    expect(p2.status).toBe(201);
+    expect(p2.json.similar[0]).toMatchObject({ patch: { id: p1.json.patch.id }, overlap: 0 });
+    expect(p2.json.similar[0].similarity).toBeGreaterThanOrEqual(0.5);
+  });
+
   it("rejects writes without a token and protects operator handles", async () => {
     const c = client();
     expect((await c.call("POST", "/v1/patches", { project: UPSTREAM })).status).toBe(401);

@@ -2,7 +2,9 @@
 // Metadata lives in D1, diff bodies in R2.
 
 import { DiffError, hunkFingerprints, parseDiff, patchId, formatDiff, sha256Hex, stats, type FileDiff } from "./core/diff";
-import { similarity, terms } from "./core/text";
+import { decodeSignature, estimateJaccard, sketch } from "./core/sketch";
+import { D1SearchIndex } from "./search/d1";
+import type { SearchIndex } from "./search/types";
 import { OUTCOMES, PARENT_SHARE, reputation, scorePatch, trust, type AdoptionInput, type Outcome } from "./core/score";
 import { converge as runConverge, DEFAULT_CONVERGE, type Candidate, type ConvergeOptions } from "./core/converge";
 
@@ -47,6 +49,8 @@ export interface PatchRow {
 
 /** Intents scoring at least this similar to a new one are reused instead of duplicated. */
 export const INTENT_REUSE_THRESHOLD = 0.75;
+/** Estimated Jaccard similarity above which a patch is reported as a near-duplicate. */
+export const NEAR_DUPLICATE_THRESHOLD = 0.5;
 const MAX_DIFF_BYTES = 1_000_000;
 
 const now = () => Date.now();
@@ -83,7 +87,14 @@ function publicPatch(p: PatchRow) {
 export type PublicPatch = ReturnType<typeof publicPatch>;
 
 export class Store {
-  constructor(private env: Env) {}
+  private search: SearchIndex;
+
+  constructor(
+    private env: Env,
+    search?: SearchIndex,
+  ) {
+    this.search = search ?? new D1SearchIndex(env.DB);
+  }
 
   private get db() {
     return this.env.DB;
@@ -143,40 +154,24 @@ export class Store {
 
   // -- search ---------------------------------------------------------------
 
-  private async idf(projectId: string, ts: string[]): Promise<(t: string) => number> {
-    if (ts.length === 0) return () => 1;
-    const total =
-      (await this.db.prepare("SELECT COUNT(*) AS n FROM intents WHERE project_id = ?").bind(projectId).first<{ n: number }>())?.n ?? 0;
-    const placeholders = ts.map(() => "?").join(",");
-    const { results } = await this.db
-      .prepare(`SELECT term, COUNT(*) AS df FROM intent_terms WHERE project_id = ? AND term IN (${placeholders}) GROUP BY term`)
-      .bind(projectId, ...ts)
-      .all<{ term: string; df: number }>();
-    const df = new Map(results.map((r) => [r.term, r.df]));
-    return (t) => Math.log(1 + (total + 1) / ((df.get(t) ?? 0) + 1));
-  }
-
   /** Intents similar to `query`, best first, each with its top patches. */
   async searchIntents(projectId: string, query: string, limit = 5) {
-    const qTerms = terms(query);
-    if (qTerms.length === 0) return [];
-    const placeholders = qTerms.map(() => "?").join(",");
-    const { results: cands } = await this.db
-      .prepare(
-        `SELECT i.id, i.text, i.canonical_id FROM intents i
-         JOIN (SELECT intent_id, COUNT(*) AS hits FROM intent_terms
-               WHERE project_id = ? AND term IN (${placeholders}) GROUP BY intent_id
-               ORDER BY hits DESC LIMIT 200) t ON t.intent_id = i.id`,
-      )
-      .bind(projectId, ...qTerms)
+    const hits = await this.search.searchIntents(projectId, query, limit * 4);
+    if (hits.length === 0) return [];
+    const { results: rows } = await this.db
+      .prepare(`SELECT id, text, canonical_id FROM intents WHERE id IN (${hits.map(() => "?").join(",")})`)
+      .bind(...hits.map((h) => h.id))
       .all<{ id: string; text: string; canonical_id: string | null }>();
-    const idf = await this.idf(projectId, [...new Set([...qTerms, ...cands.flatMap((c) => terms(c.text))])]);
+    const byId = new Map(rows.map((r) => [r.id, r]));
 
+    // Several worded variants may resolve to one canonical intent; keep the best match.
     const best = new Map<string, { id: string; text: string; similarity: number }>();
-    for (const c of cands) {
-      const sim = similarity(qTerms, terms(c.text), idf);
-      const id = c.canonical_id ?? c.id;
-      if ((best.get(id)?.similarity ?? -1) < sim) best.set(id, { id, text: c.text, similarity: Math.round(sim * 1000) / 1000 });
+    for (const h of hits) {
+      const row = byId.get(h.id);
+      if (!row) continue;
+      const id = row.canonical_id ?? row.id;
+      const sim = Math.round(h.relevance * 1000) / 1000;
+      if ((best.get(id)?.similarity ?? -1) < sim) best.set(id, { id, text: row.text, similarity: sim });
     }
     const ranked = [...best.values()].sort((a, b) => b.similarity - a.similarity).slice(0, limit);
     return Promise.all(ranked.map(async (r) => ({ intent: r, patches: await this.patchesForIntent(r.id, 3) })));
@@ -194,26 +189,44 @@ export class Store {
     return results.map(publicPatch);
   }
 
-  /** Existing patches that share hunks with `files`, by fraction of shared hunks. */
+  /**
+   * Existing patches making the same or nearly the same edits. `overlap` is
+   * the share of identical hunks; `similarity` is the estimated Jaccard
+   * similarity of changed lines, which also catches lightly reworded edits
+   * (null when the patch matched on hunks only).
+   */
   async similarPatches(projectId: string, files: FileDiff[], exclude?: string) {
     const fps = await hunkFingerprints(files);
-    if (fps.length === 0) return [];
-    const placeholders = fps.map(() => "?").join(",");
-    const { results } = await this.db
-      .prepare(
-        `SELECT patch_id, COUNT(*) AS shared FROM patch_hunks
-         WHERE project_id = ? AND fingerprint IN (${placeholders}) GROUP BY patch_id ORDER BY shared DESC LIMIT 10`,
-      )
-      .bind(projectId, ...fps.map((f) => f.fingerprint))
-      .all<{ patch_id: string; shared: number }>();
-    const out: { patch: PublicPatch; overlap: number }[] = [];
-    for (const r of results) {
-      if (r.patch_id === exclude) continue;
-      const p = await this.getPatch(r.patch_id);
-      const theirs = (await this.db.prepare("SELECT COUNT(*) AS n FROM patch_hunks WHERE patch_id = ?").bind(r.patch_id).first<{ n: number }>())!.n;
-      out.push({ patch: p, overlap: Math.round((r.shared / Math.max(fps.length, theirs)) * 1000) / 1000 });
+    const sk = sketch(files);
+    const [byHunk, byBand] = await Promise.all([
+      this.search.patchesByHunks(projectId, fps.map((f) => f.fingerprint), 20),
+      sk ? this.search.patchesByBands(projectId, sk.bands, 50) : Promise.resolve([]),
+    ]);
+
+    const hits = new Map<string, { overlap: number; similarity: number | null }>();
+    for (const h of byHunk) hits.set(h.patchId, { overlap: h.shared / Math.max(fps.length, h.total), similarity: null });
+    if (sk) {
+      const mine = decodeSignature(sk.signature);
+      for (const b of byBand) {
+        const sim = estimateJaccard(mine, decodeSignature(b.signature));
+        const cur = hits.get(b.patchId);
+        if (cur) cur.similarity = sim;
+        else if (sim >= NEAR_DUPLICATE_THRESHOLD) hits.set(b.patchId, { overlap: 0, similarity: sim });
+      }
     }
-    return out.sort((a, b) => b.overlap - a.overlap);
+    hits.delete(exclude ?? "");
+
+    const round = (x: number) => Math.round(x * 1000) / 1000;
+    const ranked = [...hits.entries()]
+      .sort(([, a], [, b]) => Math.max(b.overlap, b.similarity ?? 0) - Math.max(a.overlap, a.similarity ?? 0))
+      .slice(0, 10);
+    return Promise.all(
+      ranked.map(async ([id, h]) => ({
+        patch: await this.getPatch(id),
+        overlap: round(h.overlap),
+        similarity: h.similarity === null ? null : round(h.similarity),
+      })),
+    );
   }
 
   async searchDiff(projectId: string, diff: string) {
@@ -234,13 +247,11 @@ export class Store {
 
   private async createIntent(projectId: string, text: string, agent: Agent) {
     const id = newId();
-    const ts = terms(text);
-    await this.db.batch([
-      this.db
-        .prepare("INSERT INTO intents (id, project_id, text, created_by, created_at) VALUES (?, ?, ?, ?, ?)")
-        .bind(id, projectId, text, agent.id, now()),
-      ...ts.map((t) => this.db.prepare("INSERT INTO intent_terms (term, intent_id, project_id) VALUES (?, ?, ?)").bind(t, id, projectId)),
-    ]);
+    await this.db
+      .prepare("INSERT INTO intents (id, project_id, text, created_by, created_at) VALUES (?, ?, ?, ?, ?)")
+      .bind(id, projectId, text, agent.id, now())
+      .run();
+    await this.search.indexIntent({ id, projectId, text });
     return id;
   }
 
@@ -284,34 +295,28 @@ export class Store {
 
     const similar = await this.similarPatches(project.id, files);
     const s = stats(files);
-    const fps = await hunkFingerprints(files);
     await this.env.BLOBS.put(`patches/${id}.diff`, formatDiff(files), { httpMetadata: { contentType: "text/x-diff" } });
-    await this.db.batch([
-      this.db
-        .prepare(
-          `INSERT INTO patches (id, project_id, intent_id, base_commit, title, author_agent, author_op, parent_id, files, lines_added, lines_removed, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        )
-        .bind(
-          id,
-          project.id,
-          intentId,
-          input.base_commit.toLowerCase(),
-          (input.title ?? input.intent ?? "").trim().slice(0, 200) || s.files.join(", "),
-          agent.id,
-          agent.operator_id,
-          input.parent_id ?? null,
-          JSON.stringify(s.files),
-          s.added,
-          s.removed,
-          now(),
-        ),
-      ...fps.map((f) =>
-        this.db
-          .prepare("INSERT OR IGNORE INTO patch_hunks (project_id, path, fingerprint, patch_id) VALUES (?, ?, ?, ?)")
-          .bind(project.id, f.path, f.fingerprint, id),
-      ),
-    ]);
+    await this.db
+      .prepare(
+        `INSERT INTO patches (id, project_id, intent_id, base_commit, title, author_agent, author_op, parent_id, files, lines_added, lines_removed, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .bind(
+        id,
+        project.id,
+        intentId,
+        input.base_commit.toLowerCase(),
+        (input.title ?? input.intent ?? "").trim().slice(0, 200) || s.files.join(", "),
+        agent.id,
+        agent.operator_id,
+        input.parent_id ?? null,
+        JSON.stringify(s.files),
+        s.added,
+        s.removed,
+        now(),
+      )
+      .run();
+    await this.search.indexPatch({ id, projectId: project.id, hunks: await hunkFingerprints(files), sketch: sketch(files) });
     return { patch: await this.getPatch(id), created: true, intent_reused: intentReused, similar };
   }
 

@@ -37,7 +37,10 @@ Self-adoption (same operator) is recorded but never counted. A sock-puppet ring 
 
 1. **Intent search** (`src/core/text.ts`) tokenizes and lightly stems intent text, then ranks candidates from an inverted index (`intent_terms`) by IDF-weighted cosine similarity. A new submission whose intent scores ≥ 0.75 against an existing one is attached to it rather than creating a duplicate intent. This is the piece to swap for embeddings (Workers AI + Vectorize) once there is traffic.
 2. **Hunk fingerprints** (`src/core/diff.ts`): each hunk is hashed from its path and changed lines, with whitespace collapsed and line numbers and context dropped. Two patches that share hunks make the same edits, whatever they're called. Submissions return these overlaps so the submitting agent can switch to adopting.
-3. **Content addressing**: patch id = `sha256(base_commit + normalized diff)`, so identical re-submissions are the same patch.
+3. **MinHash/LSH sketches** (`src/core/sketch.ts`) catch near-identical edits that share no exact hunk.
+4. **Content addressing**: patch id = `sha256(base_commit + normalized diff)`, so identical re-submissions are the same patch.
+
+How this scales to millions of repositories is covered in [SEARCH.md](SEARCH.md).
 
 ## Convergence (`src/core/converge.ts`)
 
