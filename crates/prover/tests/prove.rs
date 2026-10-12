@@ -245,3 +245,38 @@ fn request_framing_round_trips() {
     assert_eq!(back.patch, req.patch);
     assert_eq!(source, b"\x1f\x8bbinary\nbytes");
 }
+
+#[test]
+fn suite_runs_show_what_a_patch_does_to_the_projects_tests() {
+    let r = project();
+    let suite = ProofSpec {
+        kind: ProofKind::Suite,
+        ecosystem: Ecosystem::None,
+        tests: vec!["test.sh".into()],
+        command: None,
+        files: vec![],
+        repeats: 1,
+        timeout_secs: 20,
+    };
+    let broken = r.diff(&[("add.sh", Some("#!/bin/sh\necho $(($1 + $2 + 1))\n".into()))]);
+    let report = prove(&suite, &tarball(&r), &broken, &opts());
+    assert_eq!(
+        suite_outcome(&suite, &report),
+        RunOutcome::Regressed,
+        "{report:#?}"
+    );
+    let harmless = r.diff(&[("add.sh", Some(format!("{ADD}# comment\n")))]);
+    let report = prove(&suite, &tarball(&r), &harmless, &opts());
+    assert_eq!(
+        suite_outcome(&suite, &report),
+        RunOutcome::Passed,
+        "{report:#?}"
+    );
+    // A suite script the project doesn't have is a setup error, not a pass.
+    let missing = ProofSpec {
+        tests: vec!["nope.sh".into()],
+        ..suite
+    };
+    let report = prove(&missing, &tarball(&r), &harmless, &opts());
+    assert_eq!(suite_outcome(&missing, &report), RunOutcome::Inconclusive);
+}

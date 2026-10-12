@@ -314,11 +314,23 @@ async fn route(req: &mut Request, env: &Env) -> ApiResult<Response> {
         (Method::Post, ["v1", "reviews", "next"]) => {
             ok(call("collective_review_next", json!({})).await?)
         }
-        (Method::Post, ["v1", "reviews", shard]) => ok(call(
+        (Method::Post, ["v1", "reviews", task]) => ok(call(
             "collective_review_submit",
-            with(body(req).await?, "shard_id", shard),
+            with(body(req).await?, "task_id", task),
         )
         .await?),
+        (Method::Post, ["v1", "reviews", task, "run"]) => {
+            let me = require(&agent)?;
+            let sub: review::RunSubmission = serde_json::from_value(body(req).await?)?;
+            ok(review::submit_run(&store, me, task, sub).await?)
+        }
+        (Method::Get, ["v1", "reviews", task, "source"]) => {
+            let me = require(&agent)?;
+            let bytes = review::task_source(&store, me, task).await?;
+            let headers = Headers::new();
+            headers.set("content-type", "application/gzip")?;
+            Ok(Response::from_bytes(bytes)?.with_headers(headers))
+        }
         (Method::Get, ["v1", "projects", p, "leaderboard"]) => {
             let mut q = query(req)?;
             q["project"] = json!(p);
@@ -373,6 +385,11 @@ async fn route(req: &mut Request, env: &Env) -> ApiResult<Response> {
                 .await?;
             ok(json!({ "pool": store.balance(POOL).await? }))
         }
+        (Method::Put, ["v1", "admin", "projects", p, "run"]) => {
+            require_admin(req, env)?;
+            let project = store.require_project(p, false).await?;
+            ok(review::set_run_spec(&store, &project.id, body(req).await?).await?)
+        }
         (Method::Put, ["v1", "admin", "sources", p, base]) => {
             require_admin(req, env)?;
             let bytes = req.bytes().await?;
@@ -403,6 +420,11 @@ struct CanaryInput {
     provenance: Option<Value>,
     #[serde(default)]
     verified: Option<Value>,
+    /// What running the project's suite with the canary shows, when known
+    /// (usually `regressed`: the reverted fix's own test fails). Runs of
+    /// the canary are graded against it.
+    #[serde(default)]
+    expected_run: Option<collective_core::proof::RunOutcome>,
 }
 
 /// Plants an inert, known-bad patch in the review queue. It never appears
@@ -415,6 +437,8 @@ async fn create_canary(store: &Store, v: Value) -> ApiResult<Value> {
     let project = store.require_project(&input.project, true).await?;
     let files =
         parse_diff(&input.diff).map_err(|e| ApiError::new(400, format!("invalid diff: {e}")))?;
+    // Canaries obey the same size cap, so they look like any other task.
+    collective_core::review::check_task_size(&files).map_err(|e| ApiError::new(413, e))?;
     let agent = platform_agent(store).await?;
     let intent_id = new_id();
     store
@@ -438,14 +462,21 @@ async fn create_canary(store: &Store, v: Value) -> ApiResult<Value> {
             status: "canary",
         })
         .await?;
-    let shards = review::create_shards(store, &row, &files, Some(&input.planted)).await?;
+    let task = review::create_task(
+        store,
+        &row,
+        &files,
+        Some(&input.planted),
+        input.expected_run,
+    )
+    .await?;
     let meta = json!({ "provenance": input.provenance, "verified": input.verified, "planted": input.planted });
     store
         .blobs
         .put(format!("canaries/{id}.json"), serde_json::to_string(&meta)?)
         .execute()
         .await?;
-    Ok(json!({ "canary_patch": id, "shards": shards, "reviewers_per_shard": REVIEW.redundancy }))
+    Ok(json!({ "canary_patch": id, "task": task, "reviewers": REVIEW.redundancy }))
 }
 
 /// The platform's own operator and agent, which author canaries.

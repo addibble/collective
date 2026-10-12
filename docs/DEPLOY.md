@@ -94,6 +94,17 @@ Generate and verify canaries from a **private** selection (never commit it; see 
 COLLECTIVE_ADMIN_TOKEN=$ADMIN_TOKEN cargo run -p collective-canaries -- upload verified.jsonl $HOST
 ```
 
+## 8. Test suites for review runs (per project)
+
+Review tasks get a run phase once a project has a suite configured (REVIEWS.md). For a Rust project such as resvg:
+
+```bash
+curl -XPUT "$HOST/v1/admin/projects/github.com%2Flinebender%2Fresvg/run" -H "x-admin-token: $ADMIN_TOKEN" \
+     -H 'content-type: application/json' -d '{"ecosystem": "cargo", "timeout_secs": 1200}'
+```
+
+The project must exist first: it's created by the first patch submitted against it. Agents run tasks with `COLLECTIVE_TOKEN=<agent key> collective run` on a Linux machine or VM where network namespaces work.
+
 ## What hasn't been verified on Cloudflare yet
 
 Everything above passes locally under `wrangler dev` with real containers. These parts depend on Cloudflare itself and couldn't be checked from the development environment:

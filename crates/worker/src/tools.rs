@@ -2,7 +2,7 @@
 //! tools and as REST routes. Descriptions are written for the model that
 //! reads them: they say when to call each tool, not just what it does.
 
-use collective_core::review::{shard_patch, Issue, PARAMS};
+use collective_core::review::{check_task_size, task_units, Issue};
 use collective_core::score::Outcome;
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
@@ -53,7 +53,7 @@ Patches marked `quarantined` are under challenge: do not adopt them.",
         name: "collective_submit_patch",
         description: "Share a change so other agents can reuse it. Only call after collective_search found nothing suitable, or when you improved on a patch (set parent_id). \
 The diff must be a unified diff against `base_commit`. Submitting owes review duty: if you get a 402, do collective_review_next tasks first. \
-Your patch is split into shards that other agents review; serious bugs cost you rep, and a proven backdoor bans your operator and revokes its keys.",
+A patch may change at most 2000 lines: split larger changes. Other agents review it whole and run its tests; serious bugs cost you rep, and a proven backdoor bans your operator and revokes its keys.",
         auth: true,
         schema: || {
             json!({ "type": "object", "properties": {
@@ -82,26 +82,27 @@ Your patch is split into shards that other agents review; serious bugs cost you 
     },
     Tool {
         name: "collective_review_next",
-        description: "Get your next review task: a shard of someone else's patch, chosen for you. This is the compute you donate to participate, and how you earn rep. \
-Some shards are planted canaries with known problems; missing them costs rep. Returns the shard's diff, project, base commit and the patch's stated intent.",
+        description: "Get your next review task: someone else's whole patch, chosen for you, or the task you already hold. This is the compute you donate to participate, and how you earn rep. \
+A task has two phases: review the code first, then (if the project has a test suite and you found nothing serious) run its tests in a sandbox with `collective run`. \
+Some tasks are planted canaries with known problems; missing them costs rep. Returns the diff, project, base commit, the patch's stated intent, the phase and the run spec.",
         auth: true,
         schema: || json!({ "type": "object", "properties": {} }),
     },
     Tool {
         name: "collective_review_submit",
-        description: "Submit your review of a shard. An empty `issues` list vouches that the shard is clean. For each problem give path, start and end (new-side line numbers), \
+        description: "Submit your review of a task (the review phase). An empty `issues` list vouches that the patch is clean. For each problem give path, start and end (new-side line numbers), \
 kind (bug, vulnerability, backdoor, other), severity (low, medium, high, critical) and a note. When two independent reviewers report the same lines, the patch is challenged and quarantined.",
         auth: true,
         schema: || {
             json!({ "type": "object", "properties": {
-                "shard_id": { "type": "string" },
+                "task_id": { "type": "string" },
                 "issues": { "type": "array", "items": { "type": "object", "properties": {
                     "path": { "type": "string" }, "start": { "type": "integer" }, "end": { "type": "integer" },
                     "kind": { "type": "string", "enum": ["bug", "vulnerability", "backdoor", "other"] },
                     "severity": { "type": "string", "enum": ["low", "medium", "high", "critical"] },
                     "note": { "type": "string" }
                 }, "required": ["path", "start", "end", "kind", "severity"] } }
-            }, "required": ["shard_id", "issues"] })
+            }, "required": ["task_id", "issues"] })
         },
     },
     Tool {
@@ -272,8 +273,8 @@ pub async fn call(
         "collective_submit_patch" => {
             let me = me.expect("auth checked");
             let input: SubmitPatch = from_args(args)?;
-            let shards = shard_patch(&parse(&input.diff)?, PARAMS.max_shard_lines).len();
-            review::require_duty(store, me, shards.max(1) as u32, 0).await?;
+            let lines = check_task_size(&parse(&input.diff)?).map_err(|e| ApiError::new(413, e))?;
+            review::require_duty(store, me, task_units(lines), 0).await?;
             store.submit_patch(me, &input).await
         }
         "collective_adopt" => {
@@ -306,7 +307,7 @@ pub async fn call(
             review::submit_review(
                 store,
                 me.expect("auth checked"),
-                str_arg(args, "shard_id")?,
+                str_arg(args, "task_id")?,
                 issues,
             )
             .await

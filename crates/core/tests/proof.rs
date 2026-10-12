@@ -253,3 +253,105 @@ fn regressions_must_actually_run_the_named_tests() {
     assert_eq!(with(Some(1), None).verdict, Verdict::Demonstrated);
     assert_eq!(with(Some(1), Some(1)).verdict, Verdict::Proven);
 }
+
+fn suite(ecosystem: Ecosystem, tests: &[&str]) -> ProofSpec {
+    ProofSpec {
+        kind: ProofKind::Suite,
+        ecosystem,
+        tests: tests.iter().map(|t| t.to_string()).collect(),
+        command: None,
+        files: vec![],
+        repeats: 1,
+        timeout_secs: 900,
+    }
+}
+
+#[test]
+fn suite_runs_validate_and_use_the_whole_suite() {
+    assert!(suite(Ecosystem::Cargo, &[]).validate().is_ok());
+    assert!(suite(Ecosystem::None, &["test.sh"]).validate().is_ok());
+    // A suite run is the project's own: no selectors, scripts outside the tree, files or commands.
+    assert!(suite(Ecosystem::Cargo, &["only_this"]).validate().is_err());
+    assert!(suite(Ecosystem::None, &[]).validate().is_err());
+    assert!(suite(Ecosystem::None, &["../x.sh"]).validate().is_err());
+    let mut s = suite(Ecosystem::Cargo, &[]);
+    s.command = Some("true".into());
+    assert!(s.validate().is_err());
+    s = suite(Ecosystem::Cargo, &[]);
+    s.timeout_secs = MAX_SUITE_TIMEOUT_SECS + 1;
+    assert!(s.validate().is_err());
+    assert_eq!(
+        suite(Ecosystem::Go, &[]).argv(),
+        ["go", "test", "./...", "-count=1"]
+    );
+    assert_eq!(
+        suite(Ecosystem::None, &["test.sh"]).argv(),
+        ["sh", "test.sh"]
+    );
+    // Never a challenge proof.
+    let r = report(&[Passed], &[Failed]);
+    assert_eq!(
+        assess(&suite(Ecosystem::None, &["t.sh"]), &r).verdict,
+        Verdict::Inconclusive
+    );
+}
+
+#[test]
+fn suite_outcomes_fail_closed() {
+    let s = suite(Ecosystem::None, &["test.sh"]);
+    assert_eq!(
+        suite_outcome(&s, &report(&[Passed], &[Passed])),
+        RunOutcome::Passed
+    );
+    assert_eq!(
+        suite_outcome(&s, &report(&[Passed], &[Failed])),
+        RunOutcome::Regressed
+    );
+    assert_eq!(
+        suite_outcome(&s, &report(&[Passed], &[TimedOut])),
+        RunOutcome::Regressed
+    );
+    assert_eq!(
+        suite_outcome(&s, &report(&[Failed], &[Failed])),
+        RunOutcome::BaseFails
+    );
+    let two = ProofSpec {
+        repeats: 2,
+        ..s.clone()
+    };
+    assert_eq!(
+        suite_outcome(&two, &report(&[Passed, Failed], &[Passed, Passed])),
+        RunOutcome::Flaky
+    );
+    assert_eq!(
+        suite_outcome(&two, &report(&[Passed, Passed], &[Passed, Failed])),
+        RunOutcome::Flaky
+    );
+    // Missing or skipped runs, failed setup and missing isolation are inconclusive.
+    assert_eq!(
+        suite_outcome(&two, &report(&[Passed], &[Passed])),
+        RunOutcome::Inconclusive
+    );
+    assert_eq!(
+        suite_outcome(&s, &report(&[Skipped], &[Passed])),
+        RunOutcome::Inconclusive
+    );
+    let mut r = report(&[Passed], &[Passed]);
+    r.setup.network_isolated = false;
+    assert_eq!(suite_outcome(&s, &r), RunOutcome::Inconclusive);
+    // A counted runner that ran no tests proves nothing.
+    let mut cargo = report(&[Passed], &[Passed]);
+    cargo.runs[0].tests_run = Some(0);
+    assert_eq!(
+        suite_outcome(&suite(Ecosystem::Cargo, &[]), &cargo),
+        RunOutcome::Inconclusive
+    );
+    // Only suite specs are judged as suites.
+    assert_eq!(
+        suite_outcome(
+            &spec(ProofKind::Regression),
+            &report(&[Passed, Passed], &[Passed, Passed])
+        ),
+        RunOutcome::Inconclusive
+    );
+}

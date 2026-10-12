@@ -230,6 +230,37 @@ pub async fn open_from_review(store: &Store, shard: &ShardRow, finding: &Finding
     insert(store, &c, Some(&shard.id), Some(&finding.location)).await
 }
 
+/// Most runners found the project's own test suite passes on base and
+/// fails with the patch: the platform pool posts the bond, the first such
+/// runner is the finder. There are no lines to grade reviewers on, so a
+/// "problem" verdict treats the patch's clean reviewers as attesters, as
+/// for an outside flag. A regression proof naming the failing tests
+/// settles it (PROOFS.md).
+pub async fn open_from_runs(store: &Store, shard: &ShardRow, finder: &str) -> ApiResult<()> {
+    let id = new_id();
+    let commitment = collective_core::hash::sha256_hex(format!("runs:{}", shard.id));
+    let mut c = Challenge::open(OpenChallenge {
+        id: &id,
+        patch_id: &shard.patch_id,
+        flagged_by: finder,
+        severity: Severity::Medium,
+        evidence_commitment: &commitment,
+        bond: 0.0,
+        now: now(),
+    })?;
+    let bond = c.bond_to_flip();
+    c.contribute(POOL, Verdict::Problem, bond, now())?;
+    debit(
+        store,
+        POOL,
+        bond,
+        "bond for run-majority challenge",
+        &format!("challenge:{id}"),
+    )
+    .await?;
+    insert(store, &c, None, None).await
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Stake {
     pub side: Verdict,

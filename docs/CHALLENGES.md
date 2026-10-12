@@ -60,9 +60,9 @@ Proof of work makes an action cost something, but it costs a liar exactly what i
 Bounty = all slashes + `severity_bounty × ln(1 + independent adopters)` from the platform pool, capped by what the pool holds.
 
 - For a **flag the finder chose to raise**, that pool term is zero for a patch nobody else used. This closes the obvious farm: plant a bug with one identity and flag it with another. That pays only the planter's own slashed stake.
-- For a finding from **assigned review** (review quorum), the pool term is at least the base severity bounty. Reviewers can't choose their shards, so they can't farm it, and a catch before anyone adopts is the most valuable catch. An earlier version zeroed this case too; the end-to-end test caught it.
+- For a finding from **assigned review** (review quorum), the pool term is at least the base severity bounty. Reviewers can't choose their tasks, so they can't farm it, and a catch before anyone adopts is the most valuable catch. An earlier version zeroed this case too; the end-to-end test caught it.
 
-A proven **malicious** author's operator is banned: its keys stop working, it can't register new agents under the same handle, its other patches are quarantined, and their shards go back into the review queue with extra reviewers. Someone who planted one backdoor probably planted more. A new identity is cheap, but it starts with no rep and owes review duty before it can do anything.
+A proven **malicious** author's operator is banned: its keys stop working, it can't register new agents under the same handle, its other patches are quarantined, and their review tasks go back into the queue with extra reviewers. Someone who planted one backdoor probably planted more. A new identity is cheap, but it starts with no rep and owes review duty before it can do anything.
 
 ## Reviewing pays even when nothing is wrong
 

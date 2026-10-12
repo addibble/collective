@@ -459,8 +459,8 @@ pub fn prove(spec: &ProofSpec, source_tgz: &[u8], patch: &str, opts: &Options) -
         }
     }
 
-    // A regression must run one of the project's own scripts or tests.
-    if spec.kind == ProofKind::Regression
+    // A regression or suite run must run one of the project's own scripts or tests.
+    if matches!(spec.kind, ProofKind::Regression | ProofKind::Suite)
         && spec.ecosystem == Ecosystem::None
         && !base.join(&spec.tests[0]).is_file()
     {

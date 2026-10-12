@@ -25,13 +25,18 @@ fn review(who: &str, issues: Vec<Issue>) -> Review {
 }
 
 #[test]
-fn duty_scales_with_shards_and_adoptions_after_a_free_allowance() {
-    // A shard costs its reviewers plus the canaries mixed in around them.
-    assert_eq!(shard_cost(1), 4); // ⌈3 / 0.9⌉
-    assert_eq!(shard_cost(10), 34); // ⌈30 / 0.9⌉
+fn duty_scales_with_work_units_and_adoptions_after_a_free_allowance() {
+    // Units: one per 500 changed lines, at least one.
+    assert_eq!(task_units(1), 1);
+    assert_eq!(task_units(500), 1);
+    assert_eq!(task_units(501), 2);
+    assert_eq!(task_units(2000), 4);
+    // A task costs its reviewers plus the canaries mixed in around them.
+    assert_eq!(review_cost(1), 4); // ⌈3 / 0.9⌉
+    assert_eq!(review_cost(4), 14); // ⌈12 / 0.9⌉
     assert_eq!(duty_owed(0, 4, 0), 0); // free adoptions
-    assert_eq!(duty_owed(1, 0, 0), 0); // a first one-shard patch is within the allowance
-    assert_eq!(duty_owed(10, 0, 0), 30); // a big patch pays for its reviews
+    assert_eq!(duty_owed(1, 0, 0), 0); // a first small patch is within the allowance
+    assert_eq!(duty_owed(4, 0, 0), 10); // a 2000-line patch pays for its review
     assert_eq!(duty_owed(2, 4, 0), 7); // ⌈6 / 0.9⌉ + 4 − 4
     assert_eq!(duty_owed(2, 4, 5), 2);
     assert_eq!(duty_owed(2, 4, 50), 0);
@@ -40,11 +45,11 @@ fn duty_scales_with_shards_and_adoptions_after_a_free_allowance() {
 #[test]
 fn review_supply_covers_demand_for_any_patch_size() {
     // Duty from a patch alone, before any adoptions, must pay for the
-    // reviews it consumes, canaries included.
-    for shards in 1..50 {
-        let real = shards * PARAMS.redundancy as u32;
+    // review work it consumes, canaries included.
+    for units in 1..50 {
+        let real = units * PARAMS.redundancy as u32;
         let with_canaries = real as f64 / (1.0 - PARAMS.canary_percent as f64 / 100.0);
-        assert!(shard_cost(shards) as f64 >= with_canaries, "{shards}");
+        assert!(review_cost(units) as f64 >= with_canaries, "{units}");
     }
 }
 
@@ -58,29 +63,40 @@ fn rubber_stamping_loses_rep_on_average() {
 }
 
 #[test]
-fn shards_bound_review_size_and_reassemble_into_valid_diffs() {
-    let r = Repo::new(&[("a.txt", &lines(400, "line")), ("b.txt", &lines(10, "b"))]);
-    let mut a = lines(400, "line");
-    for i in (10..400).step_by(20) {
-        a = a.replace(&format!("line {i}\n"), &format!("changed {i}\nadded {i}\n"));
-    }
-    let files = parse_diff(&r.diff(&[
-        ("a.txt", Some(a)),
-        ("b.txt", Some(lines(10, "b").replace("b 3\n", "bee\n"))),
-    ]))
-    .unwrap();
-    let shards = shard_patch(&files, 20);
-    assert!(shards.len() > 3);
-    assert!(shards
-        .iter()
-        .all(|s| s.changed_lines <= 20 || s.hunks.len() == 1));
-    assert_eq!(shards.last().unwrap().path, "b.txt");
-    // Every shard is itself a diff git accepts.
-    for s in &shards {
-        let d = collective_core::diff::format_diff(&shard_diff(&files, s).unwrap());
-        assert!(r.applies(&d), "{d}");
-    }
-    assert_ne!(shard_id("p", 0), shard_id("p", 1));
+fn a_task_is_a_whole_patch_up_to_the_cap() {
+    let r = Repo::new(&[("a.txt", &lines(3000, "line")), ("b.txt", &lines(10, "b"))]);
+    let edit = |every: usize| {
+        let mut a = lines(3000, "line");
+        for i in (10..3000).step_by(every) {
+            a = a.replace(&format!("line {i}\n"), &format!("changed {i}\n"));
+        }
+        parse_diff(&r.diff(&[
+            ("a.txt", Some(a)),
+            ("b.txt", Some(lines(10, "b").replace("b 3\n", "bee\n"))),
+        ]))
+        .unwrap()
+    };
+    // Lines across every file count: 2 per changed line (− and +).
+    let small = edit(20);
+    assert_eq!(changed_lines(&small), 2 * 150 + 2);
+    assert_eq!(check_task_size(&small), Ok(302));
+    let big = edit(2);
+    let err = check_task_size(&big).unwrap_err();
+    assert!(err.contains("at most 2000"), "{err}");
+    assert_ne!(task_id("p"), task_id("q"));
+}
+
+#[test]
+fn running_follows_review_unless_the_reviewer_reports_danger() {
+    let minor = issue("x.rs", 3, IssueKind::Bug, Severity::Low);
+    let danger = issue("x.rs", 9, IssueKind::Backdoor, Severity::Medium);
+    let high = issue("x.rs", 9, IssueKind::Bug, Severity::High);
+    assert!(run_required(&[], true));
+    assert!(run_required(std::slice::from_ref(&minor), true));
+    assert!(!run_required(&[minor.clone(), danger], true));
+    assert!(!run_required(&[high], true));
+    // Nothing to run without a test suite.
+    assert!(!run_required(&[], false));
 }
 
 #[test]
@@ -251,4 +267,78 @@ fn resolved_findings_grade_hits_misses_and_false_positives() {
     );
     let e = grade(&Truth::Unchallenged, &[review("ok", vec![])]);
     assert!(credits_duty(&e, "ok"));
+}
+
+fn claim(who: &str, outcome: RunOutcome) -> RunClaim {
+    RunClaim {
+        runner: who.into(),
+        outcome,
+    }
+}
+
+use collective_core::proof::RunOutcome;
+
+#[test]
+fn canary_runs_have_a_known_outcome() {
+    let claims = [
+        claim("ran", RunOutcome::Regressed),
+        claim("skipped", RunOutcome::Passed),
+        claim("broken", RunOutcome::Inconclusive),
+    ];
+    let e = grade_runs(Some(RunOutcome::Regressed), &claims);
+    assert_eq!(net(&e, "ran"), PARAMS.run_canary_correct);
+    assert_eq!(net(&e, "skipped"), PARAMS.run_canary_misreported);
+    assert_eq!(net(&e, "broken"), 0.0);
+    assert!(run_completes(RunOutcome::Regressed, &e, "ran"));
+    assert!(!run_completes(RunOutcome::Passed, &e, "skipped"));
+    // An inconclusive run costs nothing but doesn't complete the task.
+    assert!(!run_completes(RunOutcome::Inconclusive, &e, "broken"));
+}
+
+#[test]
+fn real_runs_are_checked_against_the_other_runners() {
+    use RunOutcome::*;
+    assert_eq!(
+        run_majority(&[
+            claim("a", Regressed),
+            claim("b", Regressed),
+            claim("c", Passed)
+        ]),
+        Some(Regressed)
+    );
+    // No majority: one each, a tie, or too few conclusive claims.
+    assert_eq!(
+        run_majority(&[claim("a", Regressed), claim("b", Passed), claim("c", Flaky)]),
+        None
+    );
+    assert_eq!(
+        run_majority(&[
+            claim("a", Regressed),
+            claim("b", Regressed),
+            claim("c", Passed),
+            claim("d", Passed)
+        ]),
+        None
+    );
+    assert_eq!(
+        run_majority(&[
+            claim("a", Passed),
+            claim("b", Inconclusive),
+            claim("c", Inconclusive)
+        ]),
+        None
+    );
+
+    let claims = [
+        claim("a", Regressed),
+        claim("b", Regressed),
+        claim("liar", Passed),
+        claim("x", Inconclusive),
+    ];
+    let e = grade_runs(None, &claims);
+    assert_eq!(net(&e, "liar"), PARAMS.run_disagreed);
+    assert_eq!(net(&e, "a") + net(&e, "b") + net(&e, "x"), 0.0);
+    // Disagreeing costs rep but not the credit: majorities can be wrong.
+    assert!(run_completes(Passed, &e, "liar"));
+    assert!(grade_runs(None, &claims[..2]).is_empty());
 }

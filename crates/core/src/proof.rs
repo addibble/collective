@@ -18,6 +18,10 @@
 //!   unknown users") passes on base and fails with the patch. Verified the
 //!   same way, judged the same way.
 //!
+//! - `Suite`: not a challenge proof but a review run: the project's whole
+//!   test suite on base and on the patch, as every review task runs it
+//!   (see `review`). [`suite_outcome`] says what such a run shows.
+//!
 //! The sandbox (crates/prover) runs every attempt on a fresh copy of the
 //! tree with no network; this module only decides what the runs mean.
 
@@ -29,6 +33,7 @@ pub enum ProofKind {
     Regression,
     Exploit,
     Property,
+    Suite,
 }
 
 /// Dependency fetch before the tests run. Each is a fixed command that
@@ -86,6 +91,17 @@ impl Ecosystem {
             Ecosystem::Pip => &[("PIP_NO_INDEX", "1"), ("VIRTUAL_ENV", ".venv")],
             Ecosystem::Go => &[("GOPROXY", "off"), ("GOFLAGS", "-mod=mod")],
             Ecosystem::None => &[],
+        }
+    }
+
+    /// The whole test suite, as argv. `None` runs the project's own test
+    /// script (`script`) with `sh`.
+    pub fn suite_argv(self, script: &[String]) -> Vec<String> {
+        match self {
+            Ecosystem::Go => ["go", "test", "./...", "-count=1"]
+                .map(String::from)
+                .to_vec(),
+            _ => self.test_argv(script),
         }
     }
 
@@ -148,6 +164,8 @@ pub struct ProofFile {
 
 pub const MAX_REPEATS: u8 = 5;
 pub const MAX_TIMEOUT_SECS: u32 = 120;
+/// A whole test suite gets longer than a single proof test.
+pub const MAX_SUITE_TIMEOUT_SECS: u32 = 1800;
 pub const MAX_FILES: usize = 20;
 pub const MAX_FILE_BYTES: usize = 256 * 1024;
 /// Time allowed to compile a tree's tests before the runs.
@@ -213,6 +231,21 @@ impl ProofSpec {
                     return Err("without an ecosystem, `tests` is the path of one of the project's own test scripts".into());
                 }
             }
+            ProofKind::Suite => {
+                if self.command.is_some() || !self.files.is_empty() {
+                    return Err(
+                        "a suite run uses the project's own test suite: no command, no files"
+                            .into(),
+                    );
+                }
+                let script_ok = match self.ecosystem {
+                    Ecosystem::None => self.tests.len() == 1 && safe_relative_path(&self.tests[0]),
+                    _ => self.tests.is_empty(),
+                };
+                if !script_ok {
+                    return Err("a suite run names its test script only without an ecosystem (`tests`: [path])".into());
+                }
+            }
             ProofKind::Exploit | ProofKind::Property => {
                 let cmd = self.command.as_deref().unwrap_or_default();
                 if cmd.trim().is_empty() || cmd.len() > 2000 {
@@ -226,13 +259,18 @@ impl ProofSpec {
         if !(1..=MAX_REPEATS).contains(&self.repeats) {
             return Err(format!("repeats must be 1-{MAX_REPEATS}"));
         }
-        if !(1..=MAX_TIMEOUT_SECS).contains(&self.timeout_secs) {
-            return Err(format!("timeout_secs must be 1-{MAX_TIMEOUT_SECS}"));
+        let max_timeout = if self.kind == ProofKind::Suite {
+            MAX_SUITE_TIMEOUT_SECS
+        } else {
+            MAX_TIMEOUT_SECS
+        };
+        if !(1..=max_timeout).contains(&self.timeout_secs) {
+            return Err(format!("timeout_secs must be 1-{max_timeout}"));
         }
         if self.kind == ProofKind::Regression && !self.files.is_empty() {
             return Err("a regression proof uses the project's own tests: add no files (use exploit or property instead)".into());
         }
-        if self.kind != ProofKind::Regression && self.files.is_empty() {
+        if matches!(self.kind, ProofKind::Exploit | ProofKind::Property) && self.files.is_empty() {
             return Err("exploit and property proofs need the test file(s) they run".into());
         }
         if self.files.len() > MAX_FILES {
@@ -253,6 +291,7 @@ impl ProofSpec {
     pub fn argv(&self) -> Vec<String> {
         match self.kind {
             ProofKind::Regression => self.ecosystem.test_argv(&self.tests),
+            ProofKind::Suite => self.ecosystem.suite_argv(&self.tests),
             _ => vec![
                 "sh".into(),
                 "-c".into(),
@@ -266,6 +305,7 @@ impl ProofSpec {
         match self.kind {
             ProofKind::Regression | ProofKind::Property => (Expect::Pass, Expect::Fail),
             ProofKind::Exploit => (Expect::Fail, Expect::Pass),
+            ProofKind::Suite => (Expect::Pass, Expect::Pass),
         }
     }
 
@@ -422,6 +462,12 @@ fn assessment(verdict: Verdict, reason: impl Into<String>) -> Assessment {
 /// Decides what a prover's runs establish. Fails closed: anything short of
 /// complete, isolated, unanimous runs is not a proof.
 pub fn assess(spec: &ProofSpec, report: &ProofReport) -> Assessment {
+    if spec.kind == ProofKind::Suite {
+        return assessment(
+            Verdict::Inconclusive,
+            "a suite run is review evidence, not a challenge proof",
+        );
+    }
     if let Err(e) = spec.validate() {
         return assessment(Verdict::Inconclusive, format!("invalid spec: {e}"));
     }
@@ -504,6 +550,7 @@ pub fn assess(spec: &ProofSpec, report: &ProofReport) -> Assessment {
                 Verdict::Demonstrated,
                 "the property holds on base and is broken by the patch, in every run",
             ),
+            ProofKind::Suite => unreachable!("handled above"),
         };
     }
     let consistent = |k: usize| k == 0 || k == n;
@@ -521,6 +568,62 @@ pub fn assess(spec: &ProofSpec, report: &ProofReport) -> Assessment {
         Verdict::Flaky,
         format!("runs disagree: base {base_ok}/{n}, patched {patched_ok}/{n} as claimed"),
     )
+}
+
+/// What a suite run (a review task's run) shows about a patch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunOutcome {
+    /// The suite passes on base and with the patch.
+    Passed,
+    /// The suite passes on base and fails (or hangs) with the patch.
+    Regressed,
+    /// The suite already fails on base, so the run says nothing about the patch.
+    BaseFails,
+    /// Runs of the same tree disagree.
+    Flaky,
+    /// The run could not be done properly (setup, isolation, missing runs).
+    Inconclusive,
+}
+
+impl RunOutcome {
+    /// Whether the run says something definite that other runners can check.
+    pub fn conclusive(self) -> bool {
+        !matches!(self, RunOutcome::Inconclusive)
+    }
+}
+
+/// Decides what a suite run shows. Fails closed like [`assess`]: a run that
+/// wasn't isolated, complete and non-vacuous is inconclusive.
+pub fn suite_outcome(spec: &ProofSpec, report: &ProofReport) -> RunOutcome {
+    if spec.kind != ProofKind::Suite
+        || spec.validate().is_err()
+        || !report.setup.ok
+        || !report.setup.network_isolated
+    {
+        return RunOutcome::Inconclusive;
+    }
+    let of = |t: Tree| report.runs.iter().filter(move |r| r.tree == t);
+    let n = spec.repeats as usize;
+    if [Tree::Base, Tree::Patched]
+        .iter()
+        .any(|t| of(*t).count() != n)
+        || report.runs.iter().any(|r| r.status == RunStatus::Skipped)
+    {
+        return RunOutcome::Inconclusive;
+    }
+    // A runner that ran nothing exits 0: a vacuous pass is not a pass.
+    if spec.ecosystem.counts_tests() && of(Tree::Base).any(|r| r.tests_run.unwrap_or(0) == 0) {
+        return RunOutcome::Inconclusive;
+    }
+    let passed = |t: Tree| of(t).filter(|r| r.status == RunStatus::Passed).count();
+    match (passed(Tree::Base), passed(Tree::Patched)) {
+        (0, _) => RunOutcome::BaseFails,
+        (b, _) if b < n => RunOutcome::Flaky,
+        (_, p) if p == n => RunOutcome::Passed,
+        (_, 0) => RunOutcome::Regressed,
+        _ => RunOutcome::Flaky,
+    }
 }
 
 /// What the Worker sends the prover: one line of JSON, then the raw

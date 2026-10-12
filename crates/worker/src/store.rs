@@ -614,6 +614,7 @@ impl Store {
             return bad("base_commit must be a commit SHA");
         }
         let files = parse(&input.diff)?;
+        collective_core::review::check_task_size(&files).map_err(|e| ApiError::new(413, e))?;
         let id = patch_id(&base, &files);
 
         if let Some(existing) = self.patch_row(&id).await? {
@@ -697,9 +698,9 @@ impl Store {
                 status: "open",
             })
             .await?;
-        let shards = crate::review::create_shards(self, &row, &files, None).await?;
+        let task = crate::review::create_task(self, &row, &files, None, None).await?;
         Ok(
-            json!({ "patch": row.public(), "created": true, "intent_reused": intent_reused, "similar": similar, "review_shards": shards }),
+            json!({ "patch": row.public(), "created": true, "intent_reused": intent_reused, "similar": similar, "review_task": task }),
         )
     }
 

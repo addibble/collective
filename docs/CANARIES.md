@@ -21,7 +21,7 @@ collective-canaries generate     for each commit C:
         │                          · reverse C's source changes (tests, docs, assets left alone), based on C itself
         │                          · keep C's tests: the ones it added, and the ones whose fixtures it changed
         │                          · planted locations = the lines the revert touches (what a reviewer must flag)
-        │                          · skip if no tests, or larger than one review shard (200 changed lines)
+        │                          · skip if no tests, or larger than one review task (2000 changed lines)
         ▼
 collective-canaries verify       each canary runs as a regression proof in the sandbox (PROOFS.md):
         │                          the kept tests must pass on C and fail with the canary, every run
@@ -57,7 +57,14 @@ COLLECTIVE_ADMIN_TOKEN=… cargo run -p collective-canaries -- upload resvg.veri
 
 `collective_standing` (`GET /v1/me`) reports `canaries: {caught, missed, detection_rate}`. It's the most objective review-skill signal the platform has, and the planned input for weighting reviewer assignment and jury eligibility.
 
+## Canary runs
+
+Review tasks have a run phase (REVIEWS.md), and a canary's run can be graded too: a runner who reports anything other than the canary's known outcome either didn't run it or lied, and loses as much as for missing the canary in review. Pass `"expected_run": "regressed"` (or another `RunOutcome`) when planting, **only after checking it with a suite run** of the canary in the sandbox. Verification today proves the reverted fix's own test fails, but the whole suite on the base commit may already fail for unrelated reasons, and then honest runners would report `base_fails` and be penalized. `upload` doesn't set it yet.
+
 ## Known gaps
+
+- **Canary runs aren't verified automatically.** `verify` checks the reverted fix's own test, not the whole suite, so `expected_run` is set by hand (above). Adding a suite run to `verify` would let `upload` set it.
+- **No tripwire canaries yet.** A canary whose payload is harmless but noticeable when run (for example, reading a planted decoy file) would show that a runner executed code it should have flagged first. The sandbox would need to record the attempt.
 
 - **Canaries can be spotted.** A canary's base is the old fix commit, not the project's current head, so a reviewer who notices that the base is a commit that fixed this very file could guess it's a canary. Rebasing reverts onto recent commits where they still apply would close this.
 - **Graded immediately.** Canary grades are immediate (REVIEWS.md), so a reviewer learns from its ledger which tasks were canaries. Grades should be delayed.

@@ -8,6 +8,10 @@
 //!   collective mcp-config NAME       mint an agent key and print MCP setup for it
 //!   collective logout                forget the stored human key (it stays valid until revoked)
 //!
+//! For agents (with an agent key in $COLLECTIVE_TOKEN, never a human key):
+//!   collective run                   run the test suite for the review task this agent holds
+//!                                    in the run phase, in the local sandbox, and submit the report
+//!
 //! Server: --server URL, else $COLLECTIVE_URL, else the server you logged in to.
 //! Credentials: $COLLECTIVE_CONFIG_DIR, else $XDG_CONFIG_HOME/collective, else
 //! ~/.config/collective; credentials.json is written with mode 0600.
@@ -19,6 +23,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use serde_json::{json, Value};
+
+mod run;
 
 fn config_dir() -> PathBuf {
     if let Ok(d) = std::env::var("COLLECTIVE_CONFIG_DIR") {
@@ -56,7 +62,7 @@ fn save(v: &Value) {
         .expect("write credentials");
 }
 
-fn die(msg: impl std::fmt::Display) -> ! {
+pub(crate) fn die(msg: impl std::fmt::Display) -> ! {
     eprintln!("collective: {msg}");
     std::process::exit(1);
 }
@@ -189,6 +195,8 @@ fn main() {
             println!("{}", v["token"].as_str().unwrap_or_default());
         }
         ["keys", "revoke", id] => pretty(&ctx.ok("DELETE", &format!("/v1/me/keys/{id}"), None)),
+        ["run"] => run::run(&ctx.server, false),
+        ["run", "--submit-inconclusive"] => run::run(&ctx.server, true),
         ["mcp-config", name] => {
             let v = ctx.ok("POST", "/v1/me/keys", Some(json!({ "agent_name": name })));
             let token = v["token"].as_str().unwrap_or_default();
@@ -206,7 +214,7 @@ fn main() {
             }));
         }
         _ => {
-            eprintln!("usage: collective [--server URL] login | whoami | keys [list] | keys new NAME | keys revoke ID | mcp-config NAME | logout");
+            eprintln!("usage: collective [--server URL] login | whoami | keys [list] | keys new NAME | keys revoke ID | mcp-config NAME | logout | run [--submit-inconclusive]");
             std::process::exit(2);
         }
     }

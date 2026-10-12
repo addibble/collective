@@ -1,11 +1,19 @@
-//! Review duty over D1: shards, leases, submissions and grading. The rules
-//! (sharding, task picking, quorum, grading) are in collective_core::review.
+//! Review duty over D1: tasks, leases, the review and run phases, and
+//! grading. The rules (task size, units, picking, quorum, grading, runs)
+//! are in collective_core::review; what a run shows is
+//! collective_core::proof::suite_outcome.
+//!
+//! The `shards` table holds one task per patch (its name predates
+//! whole-patch tasks; migrations are append-only).
 
-use collective_core::diff::{format_diff, FileDiff};
+use collective_core::diff::FileDiff;
+use collective_core::proof::{suite_outcome, ProofReport, ProofSpec, RunOutcome};
 use collective_core::review::{
-    credits_duty, duty_owed, duty_required, grade, next_step, pick_task, shard_diff, shard_id,
-    shard_patch, Issue, Location, NextStep, OpenShard, Review, ShardSpec, Truth, PARAMS,
+    changed_lines, credits_duty, duty_owed, duty_required, grade, grade_runs, next_step, pick_task,
+    run_completes, run_majority, run_required, task_id, task_units, Issue, Location, NextStep,
+    OpenShard, Review, RunClaim, Truth, PARAMS,
 };
+use collective_core::LedgerEntry;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -17,64 +25,64 @@ use crate::store::{now, parse, Agent, PatchRow, Store};
 /// outside challenge (one that review quorum did not raise).
 pub const ATTESTATION_STAKE: f64 = 5.0;
 
+/// Largest run report accepted: output tails are capped at 8 KB per run by
+/// the prover, so a real report is far smaller.
+const MAX_REPORT_BYTES: usize = 256 * 1024;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ShardRow {
     pub id: String,
     pub patch_id: String,
-    pub idx: f64,
-    pub path: String,
-    pub hunk_start: f64,
-    pub hunk_end: f64,
     pub changed_lines: f64,
+    pub units: f64,
     pub wanted: f64,
     pub canary: f64,
     pub planted: Option<String>,
+    pub expected_run: Option<String>,
+    pub run_majority: Option<String>,
     pub state: String,
 }
 
-impl ShardRow {
-    fn spec(&self) -> ShardSpec {
-        ShardSpec {
-            index: self.idx as u32,
-            path: self.path.clone(),
-            hunks: self.hunk_start as usize..self.hunk_end as usize,
-            changed_lines: self.changed_lines as u32,
-        }
-    }
+fn outcome_str(o: RunOutcome) -> String {
+    serde_json::to_value(o)
+        .ok()
+        .and_then(|v| v.as_str().map(String::from))
+        .unwrap_or_default()
 }
 
-pub async fn create_shards(
+fn parse_outcome(s: &str) -> Option<RunOutcome> {
+    serde_json::from_value(json!(s)).ok()
+}
+
+/// Creates the review task for a patch. `planted` and `expected_run` are
+/// for canaries only.
+pub async fn create_task(
     store: &Store,
     patch: &PatchRow,
     files: &[FileDiff],
     planted: Option<&[Location]>,
-) -> ApiResult<usize> {
-    let specs = shard_patch(files, PARAMS.max_shard_lines);
-    let planted_json = planted.map(serde_json::to_string).transpose()?;
-    let t = now();
-    let mut stmts = Vec::new();
-    for s in &specs {
-        stmts.push(store.db.stmt(
-            "INSERT OR IGNORE INTO shards (id, patch_id, idx, path, hunk_start, hunk_end, changed_lines, author_op, wanted, canary, planted, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            args![
-                shard_id(&patch.id, s.index),
-                &patch.id,
-                s.index,
-                &s.path,
-                s.hunks.start,
-                s.hunks.end,
-                s.changed_lines,
-                &patch.author_op,
-                PARAMS.redundancy,
-                planted.is_some(),
-                planted_json.clone(),
-                t,
-            ],
-        )?);
-    }
-    store.db.batch(stmts).await?;
-    Ok(specs.len())
+    expected_run: Option<RunOutcome>,
+) -> ApiResult<String> {
+    let lines = changed_lines(files);
+    let id = task_id(&patch.id);
+    store.db.run(
+        "INSERT OR IGNORE INTO shards (id, patch_id, idx, path, hunk_start, hunk_end, changed_lines, units, author_op, wanted, canary, planted, expected_run, created_at)
+         VALUES (?, ?, 0, '', 0, 0, ?, ?, ?, ?, ?, ?, ?, ?)",
+        args![
+            &id,
+            &patch.id,
+            lines,
+            task_units(lines),
+            &patch.author_op,
+            PARAMS.redundancy,
+            planted.is_some(),
+            planted.map(serde_json::to_string).transpose()?,
+            expected_run.map(outcome_str),
+            now(),
+        ],
+    )
+    .await?;
+    Ok(id)
 }
 
 pub struct Duty {
@@ -83,10 +91,12 @@ pub struct Duty {
     pub owed: u32,
 }
 
-pub async fn duty(store: &Store, operator_id: &str) -> ApiResult<Duty> {
-    let shards = store
+/// Units of the operator's own submitted patches, adoptions reported, and
+/// units of credited tasks.
+async fn activity(store: &Store, operator_id: &str) -> ApiResult<(u32, u32, u32)> {
+    let units = store
         .count(
-            "SELECT COUNT(*) AS n FROM shards WHERE author_op = ? AND canary = 0",
+            "SELECT COALESCE(SUM(units), 0) AS n FROM shards WHERE author_op = ? AND canary = 0",
             args![operator_id],
         )
         .await?;
@@ -98,47 +108,36 @@ pub async fn duty(store: &Store, operator_id: &str) -> ApiResult<Duty> {
         .await?;
     let credited = store
         .count(
-            "SELECT COUNT(*) AS n FROM review_tasks WHERE operator_id = ? AND credited = 1",
+            "SELECT COALESCE(SUM(s.units), 0) AS n FROM review_tasks t JOIN shards s ON s.id = t.shard_id
+             WHERE t.operator_id = ? AND t.credited = 1",
             args![operator_id],
         )
         .await?;
+    Ok((units, adoptions, credited))
+}
+
+pub async fn duty(store: &Store, operator_id: &str) -> ApiResult<Duty> {
+    let (units, adoptions, credited) = activity(store, operator_id).await?;
     Ok(Duty {
-        required: duty_required(shards, adoptions),
+        required: duty_required(units, adoptions),
         credited,
-        owed: duty_owed(shards, adoptions, credited),
+        owed: duty_owed(units, adoptions, credited),
     })
 }
 
-/// Blocks a submission (of `shards` review shards) or adoption unless the
-/// operator's credited reviews already cover the duty that action creates:
+/// Blocks a submission (worth `units` work units) or adoption unless the
+/// operator's credited work already covers the duty that action creates:
 /// review first, then act.
 pub async fn require_duty(
     store: &Store,
     agent: &Agent,
-    shards: u32,
+    units: u32,
     adoptions: u32,
 ) -> ApiResult<()> {
-    let mine = store
-        .count(
-            "SELECT COUNT(*) AS n FROM shards WHERE author_op = ? AND canary = 0",
-            args![&agent.operator_id],
-        )
-        .await?;
-    let adopts = store
-        .count(
-            "SELECT COUNT(*) AS n FROM adoptions WHERE operator_id = ?",
-            args![&agent.operator_id],
-        )
-        .await?;
-    let credited = store
-        .count(
-            "SELECT COUNT(*) AS n FROM review_tasks WHERE operator_id = ? AND credited = 1",
-            args![&agent.operator_id],
-        )
-        .await?;
-    let owed = duty_owed(mine + shards, adopts + adoptions, credited);
+    let (mine, adopts, credited) = activity(store, &agent.operator_id).await?;
+    let owed = duty_owed(mine + units, adopts + adoptions, credited);
     if owed > 0 {
-        return status(402, format!("review duty: {owed} review(s) owed before this action. Call collective_review_next and review what you are given."));
+        return status(402, format!("review duty: {owed} work unit(s) owed before this action. Call collective_review_next and complete what you are given."));
     }
     Ok(())
 }
@@ -151,19 +150,62 @@ fn seed_secret(store: &Store) -> String {
         .unwrap_or_else(|_| "dev-seed".into())
 }
 
+/// How a project's test suite is run, if it has one.
+pub async fn project_run_spec(store: &Store, project_id: &str) -> ApiResult<Option<ProofSpec>> {
+    #[derive(Deserialize)]
+    struct R {
+        run_spec: Option<String>,
+    }
+    let row = store
+        .db
+        .first::<R>(
+            "SELECT run_spec FROM projects WHERE id = ?",
+            args![project_id],
+        )
+        .await?;
+    Ok(row
+        .and_then(|r| r.run_spec)
+        .and_then(|s| serde_json::from_str(&s).ok()))
+}
+
+/// Sets how a project's test suite runs (admin). `spec` must be a valid
+/// suite spec; `null` makes the project's tasks review-only.
+pub async fn set_run_spec(store: &Store, project_id: &str, spec: Value) -> ApiResult<Value> {
+    let stored = if spec.is_null() {
+        None
+    } else {
+        let mut v = spec;
+        v["kind"] = json!("suite");
+        let spec: ProofSpec = serde_json::from_value(v)?;
+        if let Err(e) = spec.validate() {
+            return bad(e);
+        }
+        Some(serde_json::to_string(&spec)?)
+    };
+    store
+        .db
+        .run(
+            "UPDATE projects SET run_spec = ? WHERE id = ?",
+            args![stored.clone(), project_id],
+        )
+        .await?;
+    Ok(json!({ "run_spec": stored.map(|s| serde_json::from_str::<Value>(&s).unwrap_or_default()) }))
+}
+
 #[derive(Deserialize)]
 struct Lease {
     shard_id: String,
     expires_at: f64,
 }
 
-/// Leases a review task. The reviewer cannot choose which shard it gets.
+/// Leases a review task, or returns the one the operator already holds. The
+/// reviewer cannot choose which task it gets.
 pub async fn next_task(store: &Store, agent: &Agent) -> ApiResult<Value> {
     let t = now();
     let held = store
         .db
         .first::<Lease>(
-            "SELECT shard_id, expires_at FROM review_tasks WHERE operator_id = ? AND submitted_at IS NULL AND expires_at > ? ORDER BY leased_at LIMIT 1",
+            "SELECT shard_id, expires_at FROM review_tasks WHERE operator_id = ? AND phase IN ('review','run') AND expires_at > ? ORDER BY leased_at LIMIT 1",
             args![&agent.operator_id, t],
         )
         .await?;
@@ -176,10 +218,9 @@ pub async fn next_task(store: &Store, agent: &Agent) -> ApiResult<Value> {
                 author_op: String,
                 wanted: f64,
                 taken: f64,
-                mine: f64,
                 canary: f64,
             }
-            // Canaries and real shards are fetched separately so a deep
+            // Canaries and real tasks are fetched separately so a deep
             // queue of real work can't hide the canaries from the draw.
             let mut cands: Vec<C> = Vec::new();
             for (canary, limit) in [(false, 200u32), (true, 50)] {
@@ -188,31 +229,24 @@ pub async fn next_task(store: &Store, agent: &Agent) -> ApiResult<Value> {
                         .db
                         .all::<C>(
                             "SELECT s.id, s.author_op, s.wanted, s.canary,
-                               (SELECT COUNT(*) FROM review_tasks r WHERE r.shard_id = s.id AND (r.submitted_at IS NOT NULL OR r.expires_at > ?)) AS taken,
-                               (SELECT COUNT(*) FROM review_tasks r WHERE r.shard_id = s.id AND r.operator_id = ?) AS mine
+                               (SELECT COUNT(*) FROM review_tasks r WHERE r.shard_id = s.id AND (r.submitted_at IS NOT NULL OR r.expires_at > ?)) AS taken
                              FROM shards s JOIN patches p ON p.id = s.patch_id
                              WHERE s.state = 'open' AND s.canary = ? AND s.author_op != ? AND p.status NOT IN ('withdrawn','rejected')
                                AND NOT EXISTS (SELECT 1 FROM review_tasks r WHERE r.shard_id = s.id AND r.operator_id = ?)
                              ORDER BY s.created_at LIMIT ?",
-                            args![t, &agent.operator_id, canary, &agent.operator_id, &agent.operator_id, limit],
+                            args![t, canary, &agent.operator_id, &agent.operator_id, limit],
                         )
                         .await?,
                 );
             }
             let open: Vec<OpenShard> = cands
                 .into_iter()
-                .map(|c| {
-                    let mut assigned = vec![String::new(); c.taken as usize];
-                    if c.mine > 0.0 {
-                        assigned.push(agent.operator_id.clone());
-                    }
-                    OpenShard {
-                        id: c.id,
-                        author_operator: c.author_op,
-                        assigned,
-                        wanted: c.wanted as usize,
-                        canary: c.canary > 0.0,
-                    }
+                .map(|c| OpenShard {
+                    id: c.id,
+                    author_operator: c.author_op,
+                    assigned: vec![String::new(); c.taken as usize],
+                    wanted: c.wanted as usize,
+                    canary: c.canary > 0.0,
                 })
                 .collect();
             let seed = format!(
@@ -230,20 +264,26 @@ pub async fn next_task(store: &Store, agent: &Agent) -> ApiResult<Value> {
             store
                 .db
                 .run(
-                    "INSERT OR REPLACE INTO review_tasks (shard_id, operator_id, agent_id, leased_at, expires_at) VALUES (?, ?, ?, ?, ?)",
+                    "INSERT OR REPLACE INTO review_tasks (shard_id, operator_id, agent_id, leased_at, expires_at, phase) VALUES (?, ?, ?, ?, ?, 'review')",
                     args![&pick.id, &agent.operator_id, &agent.id, t, expires],
                 )
                 .await?;
             (pick.id.clone(), expires)
         }
     };
+    task_view(store, &shard_id, &agent.operator_id, expires_at).await
+}
 
-    let shard = load_shard(store, &shard_id).await?;
+async fn task_view(
+    store: &Store,
+    shard_id: &str,
+    operator_id: &str,
+    expires_at: i64,
+) -> ApiResult<Value> {
+    let shard = load_shard(store, shard_id).await?;
     let patch = store.require_patch_any(&shard.patch_id).await?;
-    let files = parse(&store.diff_text(&patch.id).await?)?;
-    let diff = shard_diff(&files, &shard.spec())
-        .map(|d| format_diff(&d))
-        .unwrap_or_default();
+    let task = load_task(store, shard_id, operator_id).await?;
+    let phase = task.map(|t| t.phase).unwrap_or_else(|| "review".into());
     #[derive(Deserialize)]
     struct Ctx {
         upstream_url: String,
@@ -256,19 +296,35 @@ pub async fn next_task(store: &Store, agent: &Agent) -> ApiResult<Value> {
             args![&patch.project_id, &patch.intent_id],
         )
         .await?;
+    let run = project_run_spec(store, &patch.project_id).await?;
+    let instructions = if phase == "run" {
+        "Your review is in. Now run the project's test suite with this patch in a sandbox: `collective run` (with this agent's key in COLLECTIVE_TOKEN) fetches the source, \
+runs `run` with and without the patch, network-isolated, and submits the report. Runs are graded: canaries have a known outcome, and runners who contradict the others lose rep."
+    } else if run.is_some() {
+        "Review this whole patch for bugs, vulnerabilities and backdoors BEFORE running anything. Read the upstream code at base_commit if you need context. \
+Submit with collective_review_submit: an empty `issues` list vouches that it is clean; report each problem with its path and new-side line range. \
+If you report anything serious (high or critical, or a backdoor), do not run it: your report goes to the other reviewers. Otherwise you will then run the test suite (phase `run`). \
+Reviews are graded: missing a planted or confirmed problem costs rep, and so does reporting problems that are rejected."
+    } else {
+        "Review this whole patch for bugs, vulnerabilities and backdoors. Read the upstream code at base_commit if you need context. \
+Submit with collective_review_submit: an empty `issues` list vouches that it is clean; report each problem with its path and new-side line range. \
+Reviews are graded: missing a planted or confirmed problem costs rep, and so does reporting problems that are rejected."
+    };
     Ok(json!({
         "task": {
-            "shard_id": shard.id,
+            "task_id": shard.id,
+            "phase": phase,
             "project": ctx.as_ref().map(|c| c.upstream_url.clone()),
             "base_commit": patch.base_commit,
             "intent": ctx.map(|c| c.text),
-            "path": shard.path,
-            "diff": diff,
+            "changed_lines": shard.changed_lines as u32,
+            "units": shard.units as u32,
+            "diff": store.diff_text(&patch.id).await?,
+            "run": run,
+            "source": format!("/v1/reviews/{}/source", shard.id),
             "lease_expires_at": expires_at,
         },
-        "instructions": "Review this part of a patch for bugs, vulnerabilities and backdoors. Read the surrounding upstream code at base_commit if you need context. \
-    Submit with collective_review_submit: an empty `issues` list means you vouch that it is clean. Report each problem with the new-side line range. \
-    Reviews are graded: missing a planted or confirmed problem costs rep, and so does reporting problems that are rejected.",
+        "instructions": instructions,
     }))
 }
 
@@ -279,7 +335,7 @@ pub async fn load_shard(store: &Store, id: &str) -> ApiResult<ShardRow> {
         .await?
     {
         Some(s) => Ok(s),
-        None => status(404, "unknown shard"),
+        None => status(404, "unknown task"),
     }
 }
 
@@ -289,12 +345,24 @@ struct TaskRow {
     expires_at: f64,
     submitted_at: Option<f64>,
     issues: Option<String>,
+    phase: String,
+    review_ok: f64,
+}
+
+async fn load_task(store: &Store, shard_id: &str, operator_id: &str) -> ApiResult<Option<TaskRow>> {
+    store
+        .db
+        .first::<TaskRow>(
+            "SELECT operator_id, expires_at, submitted_at, issues, phase, review_ok FROM review_tasks WHERE shard_id = ? AND operator_id = ?",
+            args![shard_id, operator_id],
+        )
+        .await
 }
 
 pub async fn submitted_reviews(store: &Store, shard_id: &str) -> ApiResult<Vec<Review>> {
     let rows: Vec<TaskRow> = store
         .db
-        .all("SELECT operator_id, expires_at, submitted_at, issues FROM review_tasks WHERE shard_id = ? AND submitted_at IS NOT NULL ORDER BY submitted_at, operator_id", args![shard_id])
+        .all("SELECT operator_id, expires_at, submitted_at, issues, phase, review_ok FROM review_tasks WHERE shard_id = ? AND submitted_at IS NOT NULL ORDER BY submitted_at, operator_id", args![shard_id])
         .await?;
     Ok(rows
         .into_iter()
@@ -305,7 +373,8 @@ pub async fn submitted_reviews(store: &Store, shard_id: &str) -> ApiResult<Vec<R
         .collect())
 }
 
-/// Applies grading entries and revokes duty credit for failed reviews.
+/// Applies grading entries and revokes duty credit for failed reviews. A
+/// task stays credited only while both its review and its run count.
 pub async fn apply_grades(
     store: &Store,
     shard_id: &str,
@@ -316,14 +385,17 @@ pub async fn apply_grades(
     store.credit(&entries, &format!("shard:{shard_id}")).await?;
     let mut stmts = Vec::new();
     for r in reviews {
+        let ok = credits_duty(&entries, &r.reviewer);
         stmts.push(store.db.stmt(
-            "UPDATE review_tasks SET graded = 1, credited = ? WHERE shard_id = ? AND operator_id = ?",
-            args![credits_duty(&entries, &r.reviewer), shard_id, &r.reviewer],
+            "UPDATE review_tasks SET graded = 1, review_ok = ?, credited = ? * run_ok WHERE shard_id = ? AND operator_id = ?",
+            args![ok, ok, shard_id, &r.reviewer],
         )?);
     }
     store.db.batch(stmts).await
 }
 
+/// The review phase. If the project has a test suite and the reviewer
+/// reported nothing serious, the task moves on to the run phase.
 pub async fn submit_review(
     store: &Store,
     agent: &Agent,
@@ -331,21 +403,14 @@ pub async fn submit_review(
     issues: Vec<Issue>,
 ) -> ApiResult<Value> {
     let shard = load_shard(store, shard_id).await?;
-    let task = store
-        .db
-        .first::<TaskRow>(
-            "SELECT operator_id, expires_at, submitted_at, issues FROM review_tasks WHERE shard_id = ? AND operator_id = ?",
-            args![shard_id, &agent.operator_id],
-        )
-        .await?;
-    let Some(task) = task else {
+    let Some(task) = load_task(store, shard_id, &agent.operator_id).await? else {
         return status(
             403,
             "you do not hold this task; call collective_review_next",
         );
     };
     if task.submitted_at.is_some() {
-        return status(409, "already submitted");
+        return status(409, "review already submitted");
     }
     if (task.expires_at as i64) < now() {
         return status(410, "lease expired; request a new task");
@@ -353,31 +418,43 @@ pub async fn submit_review(
     if issues.len() > 50 {
         return bad("at most 50 issues per review");
     }
+    let patch = store.require_patch_any(&shard.patch_id).await?;
+    let files = parse(&store.diff_text(&patch.id).await?)?;
     for i in &issues {
-        if i.path != shard.path || i.start > i.end || i.start == 0 {
+        if !files.iter().any(|f| f.path() == i.path) || i.start > i.end || i.start == 0 {
             return bad(format!(
-                "issue location must be lines in {} with start <= end",
-                shard.path
+                "issue location must be lines (start <= end) in a file the patch changes, not {}",
+                i.path
             ));
         }
     }
-    store
-        .db
-        .run(
-            "UPDATE review_tasks SET submitted_at = ?, issues = ?, credited = 1 WHERE shard_id = ? AND operator_id = ?",
-            args![now(), serde_json::to_string(&issues)?, shard_id, &agent.operator_id],
+    let runnable = project_run_spec(store, &patch.project_id).await?.is_some();
+    let run = run_required(&issues, runnable);
+    let t = now();
+    if run {
+        store.db.run(
+            "UPDATE review_tasks SET submitted_at = ?, issues = ?, phase = 'run', review_ok = 1, run_ok = 0, credited = 0, expires_at = ? WHERE shard_id = ? AND operator_id = ?",
+            args![t, serde_json::to_string(&issues)?, t + PARAMS.run_lease_ms, shard_id, &agent.operator_id],
         )
         .await?;
+    } else {
+        store.db.run(
+            "UPDATE review_tasks SET submitted_at = ?, issues = ?, phase = 'done', review_ok = 1, run_ok = 1, credited = 1 WHERE shard_id = ? AND operator_id = ?",
+            args![t, serde_json::to_string(&issues)?, shard_id, &agent.operator_id],
+        )
+        .await?;
+    }
+    let next = if run {
+        json!({ "phase": "run", "message": "Review recorded. Now run the test suite: `collective run` submits the report.", "run_by": t + PARAMS.run_lease_ms })
+    } else {
+        json!({ "phase": "done" })
+    };
 
     if shard.canary > 0.0 {
-        // Graded at once against the planted problem.
-        // Only the problems planted in this shard's file count; a canary
-        // shard without one is a control and grades like a clean shard.
+        // Graded at once against the planted problem. A canary without
+        // planted lines is a control and grades like a clean patch.
         let planted: Vec<Location> =
-            serde_json::from_str::<Vec<Location>>(shard.planted.as_deref().unwrap_or("[]"))?
-                .into_iter()
-                .filter(|l| l.path == shard.path)
-                .collect();
+            serde_json::from_str(shard.planted.as_deref().unwrap_or("[]"))?;
         let truth = if planted.is_empty() {
             Truth::Unchallenged
         } else {
@@ -388,7 +465,7 @@ pub async fn submit_review(
             issues,
         };
         apply_grades(store, shard_id, &truth, &[me]).await?;
-        return Ok(json!({ "accepted": true }));
+        return Ok(json!({ "accepted": true, "next": next }));
     }
 
     let reviews = submitted_reviews(store, shard_id).await?;
@@ -425,13 +502,178 @@ pub async fn submit_review(
         }
         _ => {}
     }
+    Ok(json!({
+        "accepted": true,
+        "next": next,
+        "task": { "reviews": reviews.len(), "wanted": shard.wanted as usize },
+    }))
+}
+
+/// The source tarball a runner needs, for a task it holds in the run phase.
+pub async fn task_source(store: &Store, agent: &Agent, shard_id: &str) -> ApiResult<Vec<u8>> {
+    let shard = load_shard(store, shard_id).await?;
+    match load_task(store, shard_id, &agent.operator_id).await? {
+        Some(t) if t.phase == "run" && t.expires_at as i64 >= now() => {}
+        _ => {
+            return status(
+                403,
+                "you can fetch the source of a task you hold in the run phase, before its deadline",
+            )
+        }
+    }
+    let patch = store.require_patch_any(&shard.patch_id).await?;
+    #[derive(Deserialize)]
+    struct P {
+        upstream_url: String,
+    }
+    let Some(p) = store
+        .db
+        .first::<P>(
+            "SELECT upstream_url FROM projects WHERE id = ?",
+            args![&patch.project_id],
+        )
+        .await?
+    else {
+        return status(404, "unknown project");
+    };
+    crate::proofs::source_tarball(
+        store,
+        &patch.project_id,
+        &p.upstream_url,
+        &patch.base_commit,
+    )
+    .await
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RunSubmission {
+    pub report: ProofReport,
+}
+
+/// The run phase: the runner's sandbox report. The outcome is computed here
+/// from the report, never taken from the runner's word.
+pub async fn submit_run(
+    store: &Store,
+    agent: &Agent,
+    shard_id: &str,
+    sub: RunSubmission,
+) -> ApiResult<Value> {
+    let shard = load_shard(store, shard_id).await?;
+    let Some(task) = load_task(store, shard_id, &agent.operator_id).await? else {
+        return status(403, "you do not hold this task");
+    };
+    if task.phase != "run" {
+        return status(
+            409,
+            "this task is not waiting for a run: submit your review first, and a run only once",
+        );
+    }
+    if (task.expires_at as i64) < now() {
+        return status(410, "run deadline passed");
+    }
+    let patch = store.require_patch_any(&shard.patch_id).await?;
+    let Some(spec) = project_run_spec(store, &patch.project_id).await? else {
+        return status(409, "this project has no test suite to run");
+    };
+    let report_json = serde_json::to_string(&sub.report)?;
+    if report_json.len() > MAX_REPORT_BYTES {
+        return status(413, "run report too large");
+    }
+    let outcome = suite_outcome(&spec, &sub.report);
+    let me = RunClaim {
+        runner: agent.operator_id.clone(),
+        outcome,
+    };
+
+    // Canaries have a known outcome; real tasks are checked against the
+    // other runners once enough runs are in.
+    let expected = shard.expected_run.as_deref().and_then(parse_outcome);
+    let mut entries = Vec::new();
+    let mut majority = None;
+    if shard.canary > 0.0 {
+        if expected.is_some() {
+            entries = grade_runs(expected, std::slice::from_ref(&me));
+        }
+    } else if let Some(m) = shard.run_majority.as_deref() {
+        // Already graded: check this late run against the settled majority.
+        if let Some(m) = parse_outcome(m) {
+            if outcome.conclusive() && outcome != m {
+                entries.push(LedgerEntry::new(
+                    &me.runner,
+                    PARAMS.run_disagreed,
+                    "run disagreed with the other runners",
+                ));
+            }
+        }
+    }
+    let ok = run_completes(outcome, &entries, &me.runner);
+    store.db.run(
+        "UPDATE review_tasks SET phase = 'done', run_outcome = ?, run_report = ?, run_submitted_at = ?, run_ok = ?, credited = review_ok * ? WHERE shard_id = ? AND operator_id = ?",
+        args![outcome_str(outcome), report_json, now(), ok, ok, shard_id, &agent.operator_id],
+    )
+    .await?;
+    store.credit(&entries, &format!("run:{shard_id}")).await?;
+
+    if shard.canary == 0.0 && shard.run_majority.is_none() {
+        let claims = run_claims(store, shard_id).await?;
+        if claims.len() >= PARAMS.redundancy {
+            majority = run_majority(&claims);
+            let claimed = store
+                .db
+                .changes(
+                    "UPDATE shards SET run_majority = ? WHERE id = ? AND run_majority IS NULL",
+                    args![
+                        majority.map(outcome_str).unwrap_or_else(|| "none".into()),
+                        shard_id
+                    ],
+                )
+                .await?;
+            if claimed > 0 {
+                store
+                    .credit(&grade_runs(None, &claims), &format!("run:{shard_id}"))
+                    .await?;
+                if majority == Some(RunOutcome::Regressed) {
+                    let first = claims
+                        .iter()
+                        .find(|c| c.outcome == RunOutcome::Regressed)
+                        .map(|c| c.runner.clone())
+                        .unwrap_or_default();
+                    crate::challenges::open_from_runs(store, &shard, &first).await?;
+                }
+            }
+        }
+    }
     Ok(
-        json!({ "accepted": true, "shard": { "reviews": reviews.len(), "wanted": shard.wanted as usize } }),
+        json!({ "accepted": true, "outcome": outcome, "credited": ok && task.review_ok > 0.0, "majority": majority }),
     )
 }
 
-/// Operators that called a patch's shards clean, for slashing when an
-/// outside challenge proves it bad.
+async fn run_claims(store: &Store, shard_id: &str) -> ApiResult<Vec<RunClaim>> {
+    #[derive(Deserialize)]
+    struct R {
+        operator_id: String,
+        run_outcome: String,
+    }
+    let rows: Vec<R> = store
+        .db
+        .all(
+            "SELECT operator_id, run_outcome FROM review_tasks WHERE shard_id = ? AND run_outcome IS NOT NULL ORDER BY run_submitted_at, operator_id",
+            args![shard_id],
+        )
+        .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|r| {
+            Some(RunClaim {
+                outcome: parse_outcome(&r.run_outcome)?,
+                runner: r.operator_id,
+            })
+        })
+        .collect())
+}
+
+/// Operators that called a patch clean, for slashing when an outside
+/// challenge proves it bad.
 pub async fn clean_reviewers(store: &Store, patch_id: &str) -> ApiResult<Vec<String>> {
     #[derive(Deserialize)]
     struct R {
@@ -486,7 +728,7 @@ pub async fn standing(store: &Store, agent: &Agent) -> ApiResult<Value> {
         "agent_name": agent.name,
         "operator_id": agent.operator_id,
         "rep": store.balance(&agent.operator_id).await?,
-        "duty": { "required": d.required, "credited": d.credited, "owed": d.owed },
+        "duty": { "required": d.required, "credited": d.credited, "owed": d.owed, "unit": "work units (one per 500 changed lines of a task)" },
         "canaries": canary_record(store, &agent.operator_id).await?,
         "recent": recent,
     }))

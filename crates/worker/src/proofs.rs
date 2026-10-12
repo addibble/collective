@@ -101,6 +101,9 @@ pub async fn submit(
     spec: ProofSpec,
 ) -> ApiResult<Value> {
     spec.validate().map_err(|e| ApiError::new(400, e))?;
+    if spec.kind == collective_core::proof::ProofKind::Suite {
+        return bad("a suite run is part of a review task (collective run), not a challenge proof");
+    }
     let c: Challenge = challenges::load_state(store, challenge_id).await?;
     if c.phase == Phase::Resolved {
         return status(409, "challenge already resolved");
@@ -156,7 +159,7 @@ pub async fn submit(
 
 /// The upstream source at the base commit, cached in R2. GitHub projects
 /// are fetched automatically; others must be uploaded by an admin.
-async fn source_tarball(
+pub async fn source_tarball(
     store: &Store,
     project_id: &str,
     upstream: &str,

@@ -105,6 +105,8 @@ dependencies = [
 name = "collective-cli"
 version = "0.1.0"
 dependencies = [
+ "collective-core",
+ "collective-prover",
  "serde_json",
  "ureq",
 ]

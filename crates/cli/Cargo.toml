@@ -11,5 +11,7 @@ name = "collective"
 path = "src/main.rs"
 
 [dependencies]
+collective-core = { path = "../core" }
+collective-prover = { path = "../prover" }
 serde_json.workspace = true
 ureq = { version = "2", features = ["json"] }

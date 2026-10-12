@@ -38,7 +38,7 @@ fn cmd_generate(sel_path: &str, repo: &str, out: &str) {
     let sel = selection(sel_path);
     let mut canaries = Vec::new();
     for src in &sel.sources {
-        match generate(Path::new(repo), &sel, src, PARAMS.max_shard_lines) {
+        match generate(Path::new(repo), &sel, src, PARAMS.max_task_lines) {
             Ok(c) => {
                 eprintln!(
                     "ok    {} {:?}: {} test(s), {} planted location(s), cover \"{}\"",
