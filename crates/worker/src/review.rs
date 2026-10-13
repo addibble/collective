@@ -9,9 +9,9 @@
 use collective_core::diff::FileDiff;
 use collective_core::proof::{suite_outcome, ProofReport, ProofSpec, RunOutcome};
 use collective_core::review::{
-    changed_lines, credits_duty, duty_owed, duty_required, grade, grade_runs, median_cpu_ms,
-    next_step, pick_task, run_completes, run_majority, run_required, task_id, task_units, Issue,
-    Location, NextStep, OpenShard, Review, RunClaim, Truth, PARAMS,
+    changed_lines, check_issue_location, credits_duty, duty_owed, duty_required, grade, grade_runs,
+    median_cpu_ms, next_step, pick_task, run_completes, run_majority, run_required, task_id,
+    task_units, Issue, Location, NextStep, OpenShard, Review, RunClaim, Truth, PARAMS,
 };
 use collective_core::LedgerEntry;
 use serde::Deserialize;
@@ -292,6 +292,8 @@ pub async fn next_task(store: &Store, agent: &Agent) -> ApiResult<Value> {
             }
             // Canaries and real tasks are fetched separately so a deep
             // queue of real work can't hide the canaries from the draw.
+            // An operator that ran a contributed canary's verification
+            // knows what it is, so it is never offered it to review.
             let mut cands: Vec<C> = Vec::new();
             for (canary, limit) in [(false, 200u32), (true, 50)] {
                 cands.extend(
@@ -303,8 +305,10 @@ pub async fn next_task(store: &Store, agent: &Agent) -> ApiResult<Value> {
                              FROM shards s JOIN patches p ON p.id = s.patch_id
                              WHERE s.state = 'open' AND s.canary = ? AND s.author_op != ? AND p.status NOT IN ('withdrawn','rejected')
                                AND NOT EXISTS (SELECT 1 FROM review_tasks r WHERE r.shard_id = s.id AND r.operator_id = ?)
+                               AND NOT EXISTS (SELECT 1 FROM canary_contributions c JOIN proof_runs v ON v.job_kind = 'canary' AND v.job_id = c.id
+                                               WHERE c.task_id = s.id AND v.operator_id = ?)
                              ORDER BY s.created_at LIMIT ?",
-                            args![t, canary, &agent.operator_id, &agent.operator_id, limit],
+                            args![t, canary, &agent.operator_id, &agent.operator_id, &agent.operator_id, limit],
                         )
                         .await?,
                 );
@@ -495,11 +499,8 @@ pub async fn submit_review(
     let patch = store.require_patch_any(&shard.patch_id).await?;
     let files = parse(&store.diff_text(&patch.id).await?)?;
     for i in &issues {
-        if !files.iter().any(|f| f.path() == i.path) || i.start > i.end || i.start == 0 {
-            return bad(format!(
-                "issue location must be lines (start <= end) in a file the patch changes, not {}",
-                i.path
-            ));
+        if let Err(e) = check_issue_location(&files, i) {
+            return bad(e);
         }
     }
     let runnable = project_run_spec(store, &patch.project_id).await?.is_some();

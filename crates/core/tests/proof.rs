@@ -356,3 +356,111 @@ fn suite_outcomes_fail_closed() {
         RunOutcome::Inconclusive
     );
 }
+
+fn claim(runner: &str, trust: f64, verdict: Verdict) -> ProofClaim {
+    ProofClaim {
+        runner: runner.into(),
+        trust,
+        verdict,
+    }
+}
+
+#[test]
+fn a_proof_settles_only_when_enough_trusted_operators_agree() {
+    use Verdict::*;
+    // One runner settles nothing, however trusted.
+    assert_eq!(proof_quorum(&[claim("a", 1.0, Proven)]), Quorum::Pending);
+    assert_eq!(
+        proof_quorum(&[claim("a", 1.0, Proven), claim("b", 1.0, Proven)]),
+        Quorum::Pending
+    );
+    // Three operators with enough trust between them do.
+    let three = [
+        claim("a", 0.7, Proven),
+        claim("b", 0.7, Proven),
+        claim("c", 0.7, Proven),
+    ];
+    assert_eq!(proof_quorum(&three), Quorum::Settled(Proven));
+    // The same operator reporting three times is one runner.
+    assert_eq!(
+        proof_quorum(&[
+            claim("a", 1.0, Proven),
+            claim("a", 1.0, Proven),
+            claim("a", 1.0, Proven)
+        ]),
+        Quorum::Pending
+    );
+    // Inconclusive runs count for nothing.
+    assert_eq!(
+        proof_quorum(&[
+            claim("a", 1.0, Proven),
+            claim("b", 1.0, Proven),
+            claim("c", 1.0, Inconclusive)
+        ]),
+        Quorum::Pending
+    );
+}
+
+#[test]
+fn new_accounts_alone_never_reach_quorum() {
+    use Verdict::*;
+    let newcomers: Vec<ProofClaim> = (0..MAX_RUNNERS)
+        .map(|i| claim(&format!("new{i}"), 0.25, Proven))
+        .collect();
+    assert_eq!(proof_quorum(&newcomers[..3]), Quorum::Pending);
+    assert_eq!(proof_quorum(&newcomers), Quorum::Split);
+    // Two trusted runners still need a third operator, and any will do.
+    assert_eq!(
+        proof_quorum(&[
+            claim("a", 1.0, Proven),
+            claim("b", 1.0, Proven),
+            claim("new", 0.25, Proven)
+        ]),
+        Quorum::Settled(Proven)
+    );
+}
+
+#[test]
+fn disagreement_fails_closed() {
+    use Verdict::*;
+    // Three say proven, but more trust says otherwise: no verdict.
+    let mut claims = vec![
+        claim("a", 0.7, Proven),
+        claim("b", 0.7, Proven),
+        claim("c", 0.7, Proven),
+        claim("d", 1.0, NotReproduced),
+        claim("e", 1.0, NotReproduced),
+        claim("f", 0.25, Demonstrated),
+    ];
+    assert_eq!(proof_quorum(&claims), Quorum::Pending);
+    // A fourth agreeing runner outweighs the dissent.
+    claims.push(claim("g", 0.7, Proven));
+    assert_eq!(proof_quorum(&claims), Quorum::Settled(Proven));
+    // Without one, the job runs out of runners and is split.
+    claims.pop();
+    claims.push(claim("g", 0.25, Flaky));
+    assert_eq!(proof_quorum(&claims), Quorum::Split);
+}
+
+#[test]
+fn proof_runs_are_graded_against_the_settled_verdict() {
+    use Verdict::*;
+    let claims = [
+        claim("a", 1.0, Proven),
+        claim("b", 1.0, Proven),
+        claim("c", 1.0, Proven),
+        claim("d", 0.25, NotReproduced),
+        claim("e", 0.25, Inconclusive),
+    ];
+    assert_eq!(proof_quorum(&claims), Quorum::Settled(Proven));
+    let entries = grade_proof_runs(Proven, &claims);
+    assert_eq!(collective_core::net(&entries, "a"), PROOF_RUN_AGREED);
+    assert_eq!(collective_core::net(&entries, "d"), PROOF_RUN_DISAGREED);
+    assert_eq!(collective_core::net(&entries, "e"), 0.0);
+}
+
+#[test]
+fn a_run_lease_covers_the_provers_budget() {
+    let s = spec(ProofKind::Regression);
+    assert!(run_lease_secs(&s) > s.budget_secs());
+}

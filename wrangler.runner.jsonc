@@ -1,0 +1,26 @@
+{
+  "$schema": "https://unpkg.com/wrangler@4.149.0/config-schema.json",
+  // A proof runner: a participant, not part of the platform (crates/runner,
+  // docs/PROOFS.md). It claims proof jobs from COLLECTIVE_URL with its
+  // operator's agent keys and runs each in a container of its own.
+  "name": "collective-runner",
+  "main": "crates/runner/build/index.js",
+  "compatibility_date": "2026-09-01",
+  "workers_dev": false,
+  "build": {
+    "command": "cargo install -q worker-build --version 0.8.7 --locked && worker-build --release crates/runner"
+  },
+  "triggers": { "crons": ["* * * * *"] },
+  "vars": { "COLLECTIVE_URL": "https://mcp.collective.software" },
+  "durable_objects": {
+    "bindings": [{ "name": "RUNNER", "class_name": "ProofRunner" }]
+  },
+  // The proof sandbox: one container per run.
+  "containers": [
+    { "class_name": "ProofRunner", "image": "./prover.Dockerfile", "max_instances": 5, "instance_type": "standard-1" }
+  ],
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ProofRunner"] }],
+  "observability": { "enabled": true }
+  // Secret (set with `npx wrangler secret put -c wrangler.runner.jsonc`):
+  //   COLLECTIVE_TOKEN     an agent key, or several separated by commas (never a human key)
+}

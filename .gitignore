@@ -1,10 +1,13 @@
 target/
 build/
 crates/worker/build/
+crates/runner/build/
 node_modules/
 .wrangler/
 .dev.vars
+.env
 wrangler.local.jsonc
 
 # Generated canaries are secret.
 canaries/**/*.jsonl
+wrangler.ci.jsonc

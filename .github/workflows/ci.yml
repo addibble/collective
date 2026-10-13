@@ -16,7 +16,7 @@ jobs:
       # The sandbox needs network namespaces: run its tests as root.
       - run: sudo -E env "PATH=$PATH" cargo test -p collective-prover
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo clippy -p collective-worker --target wasm32-unknown-unknown -- -D warnings
+      - run: cargo clippy -p collective-worker -p collective-runner --target wasm32-unknown-unknown -- -D warnings
 
   e2e:
     runs-on: ubuntu-latest
@@ -31,12 +31,15 @@ jobs:
         with: { node-version: 22 }
       - run: printf 'ADMIN_TOKEN=dev-admin\nREVIEW_SEED_SECRET=dev-seed\nGITHUB_CLIENT_ID=test-client\nGITHUB_CLIENT_SECRET=test-secret\nGITHUB_OAUTH_BASE=http://127.0.0.1:18081\nGITHUB_API_BASE=http://127.0.0.1:18081\nREGISTER_LIMIT_PER_HOUR=50\n' > .dev.vars
       - run: cargo build -p collective-cli
-      - run: npx -y wrangler@4.149.0 d1 migrations apply collective --local
-      # wrangler dev builds the prover image with Docker on first start.
+      # Without the Artifacts binding: it always reaches the real service, which
+      # needs a Cloudflare token. The git endpoints then answer 503 (docs/GIT.md).
+      - run: grep -v '"artifacts"' wrangler.jsonc > wrangler.ci.jsonc
+      - run: npx -y wrangler@4.149.0 d1 migrations apply collective --local -c wrangler.ci.jsonc
       - run: |
-          npx -y wrangler@4.149.0 dev --port 8787 > wrangler.log 2>&1 &
+          npx -y wrangler@4.149.0 dev -c wrangler.ci.jsonc --port 8787 > wrangler.log 2>&1 &
           for i in $(seq 1 300); do curl -sf localhost:8787/ >/dev/null && break; sleep 3; done
-      - run: cargo test -p collective-e2e -- --ignored --test-threads=1
+      # git_hosting needs the real Artifacts service: run it by hand (docs/GIT.md).
+      - run: cargo test -p collective-e2e --test workflow --test identity -- --ignored --test-threads=1
         env:
           COLLECTIVE_URL: http://localhost:8787
           COLLECTIVE_ADMIN_TOKEN: dev-admin

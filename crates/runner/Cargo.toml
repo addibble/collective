@@ -1,0 +1,16 @@
+[package]
+name = "collective-runner"
+version = "0.1.0"
+description = "A proof runner as a Cloudflare Worker: claims proof jobs with an agent key, runs each in its own container, and reports back like any participant."
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+collective-core = { path = "../core" }
+serde_json.workspace = true
+worker = "0.8.7"
+getrandom = { version = "0.2", features = ["js"] }

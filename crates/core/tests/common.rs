@@ -76,6 +76,65 @@ impl Repo {
         d
     }
 
+    /// Like [`Repo::diff`] for raw bytes, as `git diff --binary` writes it.
+    pub fn diff_bytes(&self, edits: &[(&str, Option<&[u8]>)]) -> String {
+        git(&self.dir, &["reset", "-q", "--hard", &self.base]);
+        // `applies` leaves created files behind, untracked.
+        git(&self.dir, &["clean", "-fdq"]);
+        for (p, c) in edits {
+            match c {
+                Some(c) => {
+                    let path = self.dir.join(p);
+                    fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    fs::write(path, c).unwrap();
+                }
+                None => {
+                    git(&self.dir, &["rm", "-q", p]);
+                }
+            }
+        }
+        git(&self.dir, &["add", "-A"]);
+        let d = git(&self.dir, &["diff", "--cached", "--binary", &self.base]);
+        git(&self.dir, &["reset", "-q", "--hard", &self.base]);
+        d
+    }
+
+    /// Whether `git apply` accepts the diff on a copy of the base tree that
+    /// is not a git repository, which is how the sandbox applies patches.
+    /// Returns the patched copy's bytes of `path` when it does.
+    pub fn applies_outside_git(&self, diff: &str, path: &str) -> Option<Vec<u8>> {
+        git(&self.dir, &["reset", "-q", "--hard", &self.base]);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let tree = self.dir.with_extension(format!("{n}.tree"));
+        let _ = fs::remove_dir_all(&tree);
+        fs::create_dir_all(&tree).unwrap();
+        let tar = Command::new("git")
+            .args(["archive", "--format=tar", "-o"])
+            .arg(tree.join("base.tar"))
+            .arg(&self.base)
+            .current_dir(&self.dir)
+            .status()
+            .unwrap();
+        assert!(tar.success());
+        assert!(Command::new("tar")
+            .args(["-xf", "base.tar"])
+            .current_dir(&tree)
+            .status()
+            .unwrap()
+            .success());
+        fs::write(tree.join("patch.diff"), diff).unwrap();
+        let ok = Command::new("git")
+            .args(["apply", "patch.diff"])
+            .current_dir(&tree)
+            .env("GIT_CEILING_DIRECTORIES", tree.parent().unwrap())
+            .status()
+            .unwrap()
+            .success();
+        let out = ok.then(|| fs::read(tree.join(path)).unwrap_or_default());
+        let _ = fs::remove_dir_all(&tree);
+        out
+    }
+
     /// Replaces line `at` (1-based) of `path` and returns the diff.
     pub fn edit_line(&self, path: &str, at: usize, text: &str) -> String {
         git(&self.dir, &["reset", "-q", "--hard", &self.base]);

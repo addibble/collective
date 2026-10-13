@@ -23,7 +23,6 @@ use crate::error::{bad, status, ApiError, ApiResult};
 use crate::store::{new_id, Agent, NewPatch, Store, POOL};
 
 pub use project::ProjectCoordinator;
-pub use proofs::ProofRunner;
 
 const MCP_PROTOCOL: &str = "2025-06-18";
 
@@ -308,6 +307,24 @@ async fn route(req: &mut Request, env: &Env) -> ApiResult<Response> {
         (Method::Get, ["v1", "proofs", id]) => {
             ok(call("collective_proof", json!({ "proof_id": id })).await?)
         }
+        // Proof jobs, for runners (`collective prove`, or a runner Worker).
+        (Method::Post, ["v1", "proofs", "next"]) => {
+            ok(proofs::next_job(&store, require(&agent)?).await?)
+        }
+        (Method::Get, ["v1", "proof-runs", run]) => {
+            ok(proofs::get_run(&store, require(&agent)?, run).await?)
+        }
+        (Method::Get, ["v1", "proof-runs", run, "source"]) => {
+            let bytes = proofs::run_source(&store, require(&agent)?, run).await?;
+            let headers = Headers::new();
+            headers.set("content-type", "application/gzip")?;
+            Ok(Response::from_bytes(bytes)?.with_headers(headers))
+        }
+        (Method::Post, ["v1", "proof-runs", run, "report"]) => {
+            let me = require(&agent)?;
+            let sub: proofs::RunSubmission = serde_json::from_value(body(req).await?)?;
+            ok(proofs::submit_run(&store, me, run, sub).await?)
+        }
         (Method::Post, ["v1", "challenges", id, "stake"]) => ok(call(
             "collective_stake",
             with(body(req).await?, "challenge_id", id),
@@ -325,7 +342,7 @@ async fn route(req: &mut Request, env: &Env) -> ApiResult<Response> {
             let me = require(&agent)?;
             let c: contributions::Contribution = serde_json::from_value(body(req).await?)?;
             Ok(json_response(
-                &contributions::contribute(&store, env, me, c).await?,
+                &contributions::contribute(&store, me, c).await?,
                 202,
             )?)
         }

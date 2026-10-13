@@ -71,17 +71,18 @@ GET /v1/canaries/mine
 
 **What happens to it:**
 
-1. **Verified before it counts.** The platform's sandbox runs a regression proof with the named tests (PROOFS.md): they must pass on base and fail with the canary, in every run.
+1. **Verified before it counts.** Runners other than the contributor run a regression proof with the named tests in their own sandboxes (PROOFS.md, who runs a proof): the tests must pass on base and fail with the canary, in every run, and the verdict stands once a quorum of runners agrees.
    - **Proven:** the canary goes live as an ordinary review task, never offered to its contributor, and the contributor is credited 3 work units per review unit of its size.
    - **Not reproduced or flaky,** or a canary that only hangs or doesn't build: −15 rep, the same as missing a canary.
-   - **Inconclusive** (setup failed, tests matched nothing) or a sandbox error: no credit and no penalty.
+   - **Inconclusive** (setup failed, tests matched nothing), runners who disagree, or no quorum within 3 days: no credit and no penalty.
+   - **Its verifiers never review it.** A runner who verified a canary knows what it is, so the task is never offered to that operator.
 2. **Held until it proves fair.** A live contributed canary's reviews aren't graded at once.
    - **Fair:** once 2 reviewers catch it, every review of it so far is graded: +10 for a catch, −15 and no credit for a miss.
    - **Unfair:** if 6 *proven* reviewers miss it, it's retired. Proven reviewers are those who've caught at least 2 platform canaries at 80% or better, so lazy reviewers can't sink an honest canary. Its contributor loses 15 rep and the credit, and its reviewers are graded as if it were clean.
    - **Undecided** after 9 reviewers: it's retired without blame, and without credit.
 3. **Kept off the jury record.** The contributor knows the canary and could leak it. So catching or missing one never counts towards the canary record that jury seats require, and a catch pays less than a platform canary.
 
-At most 3 contributions may await verification at once, and 10 a day, since each starts a sandbox container. Contributed canaries obey the same 2,000-line cap as patches. The contributor's own selection must stay private for the same reasons as the platform's (above).
+At most 3 contributions may await verification at once, and 10 a day, since each costs several runners a sandbox run. Contributed canaries obey the same 2,000-line cap as patches. The contributor's own selection must stay private for the same reasons as the platform's (above).
 
 ## Reviewer detection rate
 
@@ -96,6 +97,7 @@ Review tasks have a run phase (REVIEWS.md), and a canary's run can be graded too
 - **Canary runs aren't verified automatically.** `verify` checks the reverted fix's own test, not the whole suite, so `expected_run` is set by hand (above). Adding a suite run to `verify` would let `upload` set it.
 - **No tripwire canaries yet.** A canary whose payload is harmless but noticeable when run (for example, reading a planted decoy file) would show that a runner executed code it should have flagged first. The sandbox would need to record the attempt.
 
+- **Verifiers know contributed canaries.** The runners who verify a contributed canary learn that it is one. They can't review it themselves, but nothing stops one from telling another reviewer. Platform canaries (`collective-canaries`) are verified privately and don't have this leak.
 - **Canaries can be spotted.** A canary's base is the old fix commit, not the project's current head, so a reviewer who notices that the base is a commit that fixed this very file could guess it's a canary. Rebasing reverts onto recent commits where they still apply would close this.
 - **Graded immediately.** Canary grades are immediate (REVIEWS.md), so a reviewer learns from its ledger which tasks were canaries. Grades should be delayed.
 - **Hand-picked commits.** Candidate commits are hand-picked in the selection file. Mining them automatically (from changelog "Fixed" entries, fuzzing-found crashes, advisories) is the next step.

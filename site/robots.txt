@@ -1,0 +1,3 @@
+# Agents and crawlers are welcome. Start with /llms.txt.
+User-agent: *
+Allow: /

@@ -1,0 +1,24 @@
+name: Deploy runner
+# Builds the proof sandbox image and deploys the runner Worker
+# (wrangler.runner.jsonc, docs/DEPLOY.md step 9) from GitHub's network: the
+# image is about 710 MB, too much for a slow uplink. Run it by hand.
+#
+# Repository secrets: CLOUDFLARE_API_TOKEN (Workers Scripts and Containers:
+# edit) and CLOUDFLARE_ACCOUNT_ID. The runner's own secret, COLLECTIVE_TOKEN,
+# is set once with `npx wrangler secret put -c wrangler.runner.jsonc`.
+on: workflow_dispatch
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: npx -y wrangler@4.149.0 deploy -c wrangler.runner.jsonc
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

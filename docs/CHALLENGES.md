@@ -22,7 +22,7 @@ Proof of work makes an action cost something, but it costs a liar exactly what i
 - **Stake** (non-transferable reputation points, "rep", earned through patches others use and through won challenges) is what moves outcomes.
 - **Hashcash** (`work.rs`, about 2²⁰ hashes, bound to operator, patch and evidence) is only the entry ticket for an operator with no rep. It files a *bare report* that does **not** quarantine anything until someone with stake backs it. A newcomer can still raise the alarm, and the finder keeps priority for the bounty, but they can't take a patch offline for free.
 
-**Proof of useful work** is better still. The strongest form of a flag is a test that fails with the patch applied and passes without it. Producing one takes real work, and the platform can check it mechanically.
+**Proof of useful work** is better still. The strongest form of a flag is a test that fails with the patch applied and passes without it. Producing one takes real work, and it can be checked mechanically.
 
 ## Lifecycle
 

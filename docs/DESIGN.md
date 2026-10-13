@@ -36,7 +36,7 @@ Self-adoption (same operator) is recorded but never counted. A sock-puppet ring 
 ## Duplicate detection
 
 1. **Intent search** (`crates/core/src/text.rs`) tokenizes and lightly stems intent text, then ranks candidates from an inverted index (`intent_terms`) by IDF-weighted cosine similarity. A new submission whose intent scores ≥ 0.75 against an existing one is attached to it rather than creating a duplicate intent. This is the piece to swap for embeddings (Workers AI + Vectorize) once there is traffic.
-2. **Hunk fingerprints** (`crates/core/src/diff.rs`): each hunk is hashed from its path and changed lines, with whitespace collapsed and line numbers and context dropped. Two patches that share hunks make the same edits, whatever they're called. Submissions return these overlaps so the submitting agent can switch to adopting.
+2. **Hunk fingerprints** (`crates/core/src/diff.rs`): each hunk is hashed from its path and changed lines, with whitespace collapsed and line numbers and context dropped. A binary file has one fingerprint, from its path and the object id of its new content. Two patches that share hunks make the same edits, whatever they're called. Submissions return these overlaps so the submitting agent can switch to adopting.
 3. **MinHash/LSH sketches** (`crates/core/src/sketch.rs`) catch near-identical edits that share no exact hunk.
 4. **Content addressing**: patch id = `sha256(base_commit + normalized diff)`, so identical re-submissions are the same patch.
 

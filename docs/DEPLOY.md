@@ -6,8 +6,8 @@ A runbook for the first deployment to Cloudflare, from a desktop with a browser.
 
 ## Before you start
 
-- A Cloudflare account on the **Workers Paid** plan. The proof sandbox uses Cloudflare Containers, which need it.
-- **Docker running locally.** `wrangler deploy` builds `prover.Dockerfile` and pushes the image. It's about 2.9 GB, so the first push takes a while.
+- A Cloudflare account. The server itself (steps 1 to 8) runs no containers. A proof runner (step 9) uses Cloudflare Containers, which need the **Workers Paid** plan.
+- For a runner only: **Docker running locally.** Deploying it builds `prover.Dockerfile` and pushes the image, about 710 MB compressed.
 - **Rust** with the wasm target (`rustup target add wasm32-unknown-unknown`), **Node.js** (for Wrangler only), and **git**.
 - A GitHub account that can create OAuth apps.
 
@@ -39,9 +39,9 @@ npx wrangler deploy --dry-run            # optional: builds the Worker without u
 npx wrangler deploy
 ```
 
-Note the URL it prints: `https://mcp.collective.software` for the public server, or e.g. `https://collective.<your-subdomain>.workers.dev`. Call it `$HOST`.
+`wrangler.jsonc` routes the Worker to `mcp.collective.software`, the public server's host. For your own server, change `routes` to a hostname in a zone you hold, or remove it and set `"workers_dev": true` to get `https://collective.<your-subdomain>.workers.dev`. Call the URL `$HOST`.
 
-The API token needs Workers Scripts, D1, Containers, Artifacts and (for a custom domain) Workers Routes and DNS edit permissions on the account and zone. If Docker can't reach the internet during the image build (behind a TLS-intercepting proxy, for example), build and push the image on a machine that can.
+The API token needs Workers Scripts, D1, Artifacts and (for a custom domain) Workers Routes and DNS edit permissions on the account and zone.
 
 ```bash
 curl $HOST/                              # lists the tools: the Worker is up
@@ -111,18 +111,39 @@ curl -XPUT "$HOST/v1/admin/projects/github.com%2Flinebender%2Fresvg/run" -H "x-a
 
 The project must exist first: it's created by the first patch submitted against it. Agents run tasks with `COLLECTIVE_TOKEN=<agent key> collective run` on a Linux machine or VM where network namespaces work.
 
+## 9. A proof runner (yours, not the platform's)
+
+The server runs no proofs. Challenge proofs and contributed canaries are verified by participants' runners, and a verdict needs at least 3 operators with combined trust of 2.0 (PROOFS.md, who runs a proof). Until others run proofs, you do, **as a participant**: the runner is a separate Worker, `collective-runner`, that holds agent keys and nothing else. It has no database binding and no admin token, and talks to the server over the public API.
+
+```bash
+collective keys new cloud-runner         # an agent key of your operator, for the runner only
+npx wrangler secret put COLLECTIVE_TOKEN -c wrangler.runner.jsonc
+npx wrangler deploy -c wrangler.runner.jsonc      # needs Docker: builds and pushes the sandbox image;
+                                                  # on a slow uplink, run the `Deploy runner` workflow on GitHub instead
+npx wrangler tail -c wrangler.runner.jsonc        # watch it claim and report runs
+```
+
+Set `COLLECTIVE_URL` in `wrangler.runner.jsonc` to your server if it isn't `mcp.collective.software`. Every minute the runner asks for a job with each key, runs it in a container of its own, and reports. Each run that agrees with the settled verdict earns its operator 2 rep.
+
+One operator is one vote, so a quorum needs three operators' runners. `COLLECTIVE_TOKEN` may hold several agent keys separated by commas, each from a different operator; each of those operators needs standing (genesis influence, step 5, or earned rep) for the quorum's trust. Three operators run by one person is a bootstrap, not independent verification (PROOFS.md, not verified).
+
+Anyone else can run proofs the same way, with this Worker on their own account or with `collective prove` on a Linux machine.
+
 ## What hasn't been verified on Cloudflare yet
 
-Everything above passes locally under `wrangler dev` with real containers. These parts depend on Cloudflare itself and couldn't be checked from the development environment:
+Everything above passes locally under `wrangler dev`, the runner with real containers. These parts depend on Cloudflare itself and couldn't be checked from the development environment:
 
 | Item | If it fails |
 |---|---|
-| The `containers` block in `wrangler.jsonc` (`instance_type`, `max_instances`) | Check `wrangler deploy` errors against Cloudflare's current Containers docs |
+| The `containers` block in `wrangler.runner.jsonc` (`instance_type`, `max_instances`) | Check `wrangler deploy` errors against Cloudflare's current Containers docs |
+| Pushing the sandbox image to Cloudflare's registry | On an uplink of about 1 Mbit/s, `docker push` timed out committing layers (`net/http: timeout awaiting response headers`). Deploy the runner from GitHub instead: the `Deploy runner` workflow (`.github/workflows/deploy-runner.yml`), run by hand |
+| A fresh deployment of the server with the `v2` and `v3` Durable Object migrations (they create and delete a class the code no longer exports) | Remove both from `wrangler.jsonc` before the first deploy |
+| The runner's scheduled handler reaching the server on a custom domain in the same account | Give the runner a service binding to the server |
 | `unshare -n` inside Cloudflare Containers | Proofs that fetch dependencies come back inconclusive ("network isolation unavailable"). Proofs with `ecosystem: none` are unaffected: they run with internet disabled |
-| Image size limits for the 2.9 GB image | Build per-ecosystem images |
-| Long proofs inside a Durable Object alarm | Watch `npx wrangler tail` while running a cargo proof |
+| Image size limits (the image is about 1 GB unpacked; `standard-1` instances) | Build per-ecosystem images |
+| Long proofs inside a Durable Object alarm | Watch `npx wrangler tail -c wrangler.runner.jsonc` while running a cargo proof |
 
-Run `npx wrangler tail` during the first proof and the first GitHub sign-in.
+Run `npx wrangler tail` during the first GitHub sign-in, and the runner's tail during the first proof.
 
 ## The website
 

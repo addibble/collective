@@ -144,9 +144,42 @@ fn changed(h: &Hunk) -> u32 {
         .count() as u32
 }
 
-/// Changed lines in a patch: what a reviewer has to read.
+/// Changed lines in a patch: what a reviewer has to read. A binary file
+/// counts its encoded payload lines, so a large blob costs what a large
+/// text change does and the cap bounds both.
 pub fn changed_lines(files: &[FileDiff]) -> u32 {
-    files.iter().flat_map(|f| &f.hunks).map(changed).sum()
+    files
+        .iter()
+        .map(|f| {
+            f.hunks.iter().map(changed).sum::<u32>()
+                + f.binary.as_ref().map_or(0, |b| b.payload_lines())
+        })
+        .sum()
+}
+
+/// Whether an issue points at something the patch changes. A binary file
+/// has no lines, so it is reported whole, as lines 1 to 1: two reviewers
+/// who distrust the same blob then report the same location.
+pub fn check_issue_location(files: &[FileDiff], issue: &Issue) -> Result<(), String> {
+    let Some(file) = files.iter().find(|f| f.path() == issue.path) else {
+        return Err(format!(
+            "issue location must be in a file the patch changes, not {}",
+            issue.path
+        ));
+    };
+    if issue.start == 0 || issue.start > issue.end {
+        return Err(format!(
+            "issue location in {} must be lines with 1 <= start <= end",
+            issue.path
+        ));
+    }
+    if file.binary.is_some() && (issue.start, issue.end) != (1, 1) {
+        return Err(format!(
+            "{} is a binary file: report it whole, as lines 1 to 1",
+            issue.path
+        ));
+    }
+    Ok(())
 }
 
 /// A patch's changed lines, or why it is too large to be one task.

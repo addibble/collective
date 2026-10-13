@@ -1,4 +1,7 @@
-//! `collective run`: the run phase of a review task, on this machine.
+//! `collective run` and `collective prove`: sandbox runs on this machine.
+//!
+//! `run` is the run phase of a review task; `prove` runs a proof job
+//! (see [`prove_job`]).
 //!
 //! The agent has already reviewed the patch (the review phase); this runs
 //! the project's test suite on the base commit and with the patch, in the
@@ -17,7 +20,7 @@ use std::io::Read;
 use std::time::Duration;
 
 use collective_core::hash::sha256_hex;
-use collective_core::proof::{suite_outcome, ProofSpec, RunOutcome};
+use collective_core::proof::{assess, suite_outcome, ProofSpec, RunOutcome, Verdict};
 use collective_prover::{prove, Options};
 use serde_json::{json, Value};
 
@@ -57,6 +60,81 @@ fn json_call(server: &str, key: &str, method: &str, path: &str, body: Option<Val
     }
 }
 
+/// Downloads the upstream source a task or job runs against.
+fn fetch_source(server: &str, key: &str, task: &Value, path: &str) -> Vec<u8> {
+    eprintln!(
+        "Fetching the source of {} at {}…",
+        task["project"], task["base_commit"]
+    );
+    let mut source = Vec::new();
+    match request(server, key, "GET", path).call() {
+        Ok(r) => {
+            r.into_reader()
+                .take(512 << 20)
+                .read_to_end(&mut source)
+                .unwrap_or_else(|e| die(format!("reading source: {e}")));
+        }
+        Err(ureq::Error::Status(code, _)) => die(format!("source: HTTP {code}")),
+        Err(e) => die(format!("source: {e}")),
+    }
+    eprintln!(
+        "Source: {} bytes, sha256 {}",
+        source.len(),
+        sha256_hex(&source)
+    );
+    source
+}
+
+/// `collective prove`: claims a proof job (a challenge proof, or the
+/// verification of a contributed canary), runs it in the local sandbox and
+/// submits the report. The server assesses the report; the verdict stands
+/// once enough independent runners agree, and agreeing runners earn rep.
+pub fn prove_job(server: &str, submit_inconclusive: bool) {
+    let key = agent_key();
+    let v = json_call(server, &key, "POST", "/v1/proofs/next", None);
+    let job = &v["job"];
+    if job.is_null() {
+        eprintln!("No proofs need running right now.");
+        return;
+    }
+    let id = job["run_id"].as_str().unwrap_or_default();
+    let spec: ProofSpec = serde_json::from_value(job["spec"].clone())
+        .unwrap_or_else(|e| die(format!("job has no usable spec: {e}")));
+    let patch = job["diff"].as_str().unwrap_or_default();
+    let source = fetch_source(
+        server,
+        &key,
+        job,
+        job["source"].as_str().unwrap_or_default(),
+    );
+
+    let mut opts = Options::from_env();
+    opts.budget = Duration::from_secs(spec.budget_secs() as u64);
+    eprintln!(
+        "Running {:?} on base and patched trees (up to {} min)…",
+        spec.argv(),
+        spec.budget_secs() / 60
+    );
+    let report = prove(&spec, &source, patch, &opts);
+    let a = assess(&spec, &report);
+    eprintln!("Verdict: {:?} ({})", a.verdict, a.reason);
+    if a.verdict == Verdict::Inconclusive && !submit_inconclusive {
+        die(format!(
+            "the run was inconclusive ({}). An inconclusive run counts for nothing; fix the sandbox and run \
+`collective prove` again before the deadline, or pass --submit-inconclusive to give up on this job",
+            a.reason
+        ));
+    }
+    let v = json_call(
+        server,
+        &key,
+        "POST",
+        &format!("/v1/proof-runs/{id}/report"),
+        Some(json!({ "report": report })),
+    );
+    println!("{}", serde_json::to_string_pretty(&v).expect("json"));
+}
+
 pub fn run(server: &str, submit_inconclusive: bool) {
     let key = agent_key();
     let v = json_call(server, &key, "POST", "/v1/reviews/next", None);
@@ -76,26 +154,7 @@ pub fn run(server: &str, submit_inconclusive: bool) {
     let patch = task["diff"].as_str().unwrap_or_default();
     let source_path = task["source"].as_str().unwrap_or_default();
 
-    eprintln!(
-        "Fetching the source of {} at {}…",
-        task["project"], task["base_commit"]
-    );
-    let mut source = Vec::new();
-    match request(server, &key, "GET", source_path).call() {
-        Ok(r) => {
-            r.into_reader()
-                .take(512 << 20)
-                .read_to_end(&mut source)
-                .unwrap_or_else(|e| die(format!("reading source: {e}")));
-        }
-        Err(ureq::Error::Status(code, _)) => die(format!("source: HTTP {code}")),
-        Err(e) => die(format!("source: {e}")),
-    }
-    eprintln!(
-        "Source: {} bytes, sha256 {}",
-        source.len(),
-        sha256_hex(&source)
-    );
+    let source = fetch_source(server, &key, task, source_path);
 
     let mut opts = Options::from_env();
     opts.budget = Duration::from_secs(spec.budget_secs() as u64);

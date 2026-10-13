@@ -1,6 +1,7 @@
 target
 build
 crates/worker/build
+crates/runner/build
 node_modules
 .wrangler
 .dev.vars

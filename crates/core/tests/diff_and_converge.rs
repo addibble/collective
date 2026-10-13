@@ -89,6 +89,165 @@ fn rejects_garbage() {
     assert!(parse_diff("hello").is_err());
 }
 
+/// Bytes no text diff could carry: every byte value, repeated.
+fn blob(seed: u8, len: usize) -> Vec<u8> {
+    (0..len)
+        .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed) ^ (i >> 8) as u8)
+        .collect()
+}
+
+fn binary_fixture() -> (Repo, Vec<u8>) {
+    let r = fixture();
+    let old = blob(1, 3000);
+    let dir = r.dir.join("img");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("ref.png"), &old).unwrap();
+    for args in [&["add", "-A"][..], &["commit", "-qm", "image"]] {
+        assert!(std::process::Command::new("git")
+            .args(args)
+            .current_dir(&r.dir)
+            .status()
+            .unwrap()
+            .success());
+    }
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&r.dir)
+        .output()
+        .unwrap();
+    let base = String::from_utf8(out.stdout).unwrap().trim().to_string();
+    (
+        Repo {
+            dir: r.dir.clone(),
+            base,
+        },
+        {
+            std::mem::forget(r);
+            old
+        },
+    )
+}
+
+#[test]
+fn binary_changes_round_trip_and_apply() {
+    let (r, old) = binary_fixture();
+    let mut edited = old.clone();
+    edited[1500] ^= 0xff;
+    let (new, added) = (blob(7, 4000), blob(9, 500));
+    let mut a = lines(60, "line");
+    a = a.replace("line 10\n", "changed\n");
+    // Modify (git writes a delta), replace (a literal), create and delete,
+    // next to a text change.
+    for (path, content) in [
+        ("img/ref.png", Some(&edited[..])),
+        ("img/ref.png", Some(&new[..])),
+        ("img/new file.png", Some(&added[..])),
+        ("img/ref.png", None),
+    ] {
+        let raw = r.diff_bytes(&[(path, content), ("src/a.txt", Some(a.as_bytes()))]);
+        let files = parse_diff(&raw).unwrap();
+        assert_eq!(files.len(), 2, "{raw}");
+        let bin = files.iter().find(|f| f.path() == path).unwrap();
+        assert!(bin.binary.is_some() && bin.hunks.is_empty());
+        assert_eq!(bin.new_path.is_none(), content.is_none());
+        let s = stats(&files);
+        assert_eq!((s.binary, s.added, s.removed), (1, 1, 1));
+
+        let out = format_diff(&files);
+        assert_eq!(parse_diff(&out).unwrap(), files);
+        assert!(r.applies(&out), "{out}");
+        // The sandbox applies patches to an extracted tarball, not a repo.
+        let patched = r.applies_outside_git(&out, path).expect("applies");
+        assert_eq!(patched, content.unwrap_or_default());
+    }
+}
+
+#[test]
+fn binary_changes_fail_closed() {
+    let (r, old) = binary_fixture();
+    let new = blob(7, 4000);
+    let good = r.diff_bytes(&[("img/ref.png", Some(&new[..]))]);
+    let files = parse_diff(&good).unwrap();
+    let bin = files[0].binary.clone().unwrap();
+
+    // Without --binary there is no content to review or apply.
+    let bare = format!(
+        "diff --git a/img/ref.png b/img/ref.png\nindex {}..{} 100644\nBinary files a/img/ref.png and b/img/ref.png differ\n",
+        bin.old_id, bin.new_id
+    );
+    let e = parse_diff(&bare).unwrap_err().0;
+    assert!(e.contains("git diff --binary"), "{e}");
+
+    // Abbreviated object ids can't be checked by git, so they are refused.
+    let short = good.replace(&bin.old_id, &bin.old_id[..7]);
+    assert!(parse_diff(&short)
+        .unwrap_err()
+        .0
+        .contains("full object ids"));
+    let no_index: String = good
+        .lines()
+        .filter(|l| !l.starts_with("index "))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    assert!(parse_diff(&no_index).is_err());
+
+    // A payload that isn't what the patch says it is does not apply: git
+    // checks the result against the declared object id. (Inside a repository
+    // that already has that object, git uses it and ignores the payload, so
+    // the result is still the declared content.)
+    let other = parse_diff(&r.diff_bytes(&[("img/ref.png", Some(&blob(8, 4000)[..]))])).unwrap();
+    let mut forged = files.clone();
+    forged[0].binary.as_mut().unwrap().forward = other[0].binary.clone().unwrap().forward;
+    if r.applies(&format_diff(&forged)) {
+        assert_eq!(std::fs::read(r.dir.join("img/ref.png")).unwrap(), new);
+    }
+    assert!(r
+        .applies_outside_git(&format_diff(&forged), "img/ref.png")
+        .is_none());
+
+    // Nor does a patch made against different content of the same file.
+    let mut edited = old.clone();
+    edited[0] ^= 1;
+    let stale = Repo::new(&[("src/a.txt", "x\n")]);
+    std::fs::create_dir_all(stale.dir.join("img")).unwrap();
+    let on_other_base = stale.diff_bytes(&[("img/ref.png", Some(&edited[..]))]);
+    assert!(parse_diff(&on_other_base).is_ok());
+    assert!(!r.applies(&on_other_base), "creates a file that exists");
+
+    // The same path twice in one diff is ambiguous.
+    assert!(parse_diff(&format!("{good}{good}"))
+        .unwrap_err()
+        .0
+        .contains("twice"));
+}
+
+#[test]
+fn binary_changes_identify_conflict_and_combine() {
+    let (r, _) = binary_fixture();
+    let (one, two) = (blob(7, 4000), blob(8, 4000));
+    let p1 = parse_diff(&r.diff_bytes(&[("img/ref.png", Some(&one[..]))])).unwrap();
+    let p2 = parse_diff(&r.diff_bytes(&[("img/ref.png", Some(&two[..]))])).unwrap();
+    let text = parse_diff(&r.edit_line("src/a.txt", 10, "one")).unwrap();
+
+    // Different content is a different patch and a different fingerprint;
+    // the same content is the same.
+    assert_ne!(patch_id(&r.base, &p1), patch_id(&r.base, &p2));
+    assert_ne!(hunk_fingerprints(&p1), hunk_fingerprints(&p2));
+    let again = parse_diff(&r.diff_bytes(&[("img/ref.png", Some(&one[..]))])).unwrap();
+    assert_eq!(hunk_fingerprints(&p1), hunk_fingerprints(&again));
+    assert!(collective_core::sketch::sketch(&p1).is_some());
+
+    // Two patches can't both rewrite a binary file; a binary and a text
+    // change to different files combine into one diff that applies.
+    assert!(find_conflict(&p1, &p2).is_some());
+    assert!(find_conflict(&p1, &p1).is_some());
+    assert!(find_conflict(&text, &p1).is_none());
+    let merged = format_diff(&combine(&[&text, &p1]));
+    assert!(r.applies(&merged), "{merged}");
+    assert_eq!(std::fs::read(r.dir.join("img/ref.png")).unwrap(), one);
+    assert!(r.read("src/a.txt").contains("one\n"));
+}
+
 #[test]
 fn matches_reworded_intents_above_unrelated_ones() {
     let q = terms("Add a --json flag to the list command output");

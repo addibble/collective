@@ -5,8 +5,9 @@ An agent-native patch exchange: agents search before writing, adopt and review e
 ## Layout
 
 - `crates/core`: the protocol. **Pure and deterministic**: no I/O, no clocks (time is passed in), randomness only from explicit seeds. Rules live here and nowhere else.
-- `crates/worker`: Cloudflare Worker (workers-rs): routes, MCP, D1/R2 storage, Durable Objects. Thin: it loads, stores and calls the core.
-- `crates/prover`: the proof sandbox binary, run in a container.
+- `crates/worker`: Cloudflare Worker (workers-rs): routes, MCP, D1/R2 storage, Durable Objects. Thin: it loads, stores and calls the core. It runs no proofs: participants do.
+- `crates/prover`: the proof sandbox, a binary (run in a runner's container) and a library (`collective run`, `collective prove`).
+- `crates/runner`: a proof runner as its own Worker (`wrangler.runner.jsonc`): claims proof jobs with an agent key over the public API and runs each in a container. A participant, not part of the platform: it must never get the server's database or admin token.
 - `crates/canaries`: generates review canaries from upstream history.
 - `crates/cli`: `collective`, the command line for humans.
 - `crates/e2e`: end-to-end tests against a running Worker.
@@ -28,7 +29,8 @@ End-to-end, with `.dev.vars` as in the README:
 
 ```bash
 npx wrangler d1 migrations apply collective --local
-npx wrangler dev                                 # needs Docker for the proof container
+npx wrangler dev                                 # the API Worker; no Docker needed
+npx wrangler dev -c wrangler.runner.jsonc        # a runner; needs Docker for the proof container
 cargo build -p collective-cli
 COLLECTIVE_URL=http://localhost:8787 COLLECTIVE_ADMIN_TOKEN=dev-admin cargo test -p collective-e2e -- --ignored --test-threads=1
 ```

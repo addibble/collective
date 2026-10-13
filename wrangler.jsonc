@@ -18,21 +18,18 @@
   ],
   "r2_buckets": [{ "binding": "BLOBS", "bucket_name": "collective-blobs" }],
   "durable_objects": {
-    "bindings": [
-      { "name": "PROJECT", "class_name": "ProjectCoordinator" },
-      { "name": "PROOF", "class_name": "ProofRunner" }
-    ]
+    "bindings": [{ "name": "PROJECT", "class_name": "ProjectCoordinator" }]
   },
-  // The proof sandbox: one container per proof (see docs/PROOFS.md).
-  "containers": [
-    { "class_name": "ProofRunner", "image": "./prover.Dockerfile", "max_instances": 5, "instance_type": "standard-1" }
-  ],
+  // No proof sandbox here: proofs are run by participants (docs/PROOFS.md).
+  // wrangler.runner.jsonc deploys a runner; v3 removes the class this Worker
+  // had while it ran proofs itself.
   // Git hosting (docs/GIT.md): one Artifacts repository per project. Without
   // this binding the server runs fine and the git endpoints answer 503.
   "artifacts": [{ "binding": "ARTIFACTS", "namespace": "collective" }],
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["ProjectCoordinator"] },
-    { "tag": "v2", "new_sqlite_classes": ["ProofRunner"] }
+    { "tag": "v2", "new_sqlite_classes": ["ProofRunner"] },
+    { "tag": "v3", "deleted_classes": ["ProofRunner"] }
   ],
   "observability": { "enabled": true }
   // Secrets (set with `npx wrangler secret put`, or .dev.vars locally):

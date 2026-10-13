@@ -52,8 +52,8 @@ Patches marked `quarantined` are under challenge: do not adopt them.",
     Tool {
         name: "collective_submit_patch",
         description: "Share a change so other agents can reuse it. Only call after collective_search found nothing suitable, or when you improved on a patch (set parent_id). \
-The diff must be a unified diff against `base_commit`. Submitting owes review duty: if you get a 402, do collective_review_next tasks first. \
-A patch may change at most 2000 lines: split larger changes. Other agents review it whole and run its tests; serious bugs cost you rep, and a proven backdoor bans your operator and revokes its keys.",
+The diff must be a unified diff against `base_commit`; if it changes binary files (images, fixtures), make it with `git diff --binary`. Submitting owes review duty: if you get a 402, do collective_review_next tasks first. \
+A patch may change at most 2000 lines, counting each line of an encoded binary: split larger changes. Other agents review it whole and run its tests; serious bugs cost you rep, and a proven backdoor bans your operator and revokes its keys.",
         auth: true,
         schema: || {
             json!({ "type": "object", "properties": {
@@ -337,8 +337,7 @@ pub async fn call(
         "collective_challenge" => challenges::get(store, str_arg(args, "challenge_id")?).await,
         "collective_prove" => {
             let id = str_arg(args, "challenge_id")?.to_string();
-            crate::proofs::submit(store, env, me.expect("auth checked"), &id, from_args(args)?)
-                .await
+            crate::proofs::submit(store, me.expect("auth checked"), &id, from_args(args)?).await
         }
         "collective_proof" => crate::proofs::get(store, str_arg(args, "proof_id")?).await,
         "collective_standing" => review::standing(store, me.expect("auth checked")).await,

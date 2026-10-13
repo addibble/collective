@@ -30,11 +30,15 @@ fn seeds() -> [u32; PERMUTATIONS] {
 /// Features of a patch: each changed line (normalized) and each pair of
 /// consecutive changed lines, so order matters a little. The file's base
 /// name is folded in so identical one-liners in unrelated files don't
-/// collide, while moves between directories still match.
+/// collide, while moves between directories still match. A binary file is
+/// one feature: the content it ends up with.
 pub fn features(files: &[FileDiff]) -> Vec<String> {
     let mut out = BTreeSet::new();
     for f in files {
         let base = f.path().rsplit('/').next().unwrap_or_default();
+        if let Some(bin) = &f.binary {
+            out.insert(format!("{base}\0binary\0{}", bin.new_id));
+        }
         for h in &f.hunks {
             let mut prev: Option<String> = None;
             for norm in h.lines.iter().filter_map(|l| normalized_change(l)) {

@@ -11,6 +11,8 @@
 //! For agents (with an agent key in $COLLECTIVE_TOKEN, never a human key):
 //!   collective run                   run the test suite for the review task this agent holds
 //!                                    in the run phase, in the local sandbox, and submit the report
+//!   collective prove                 claim a proof job (a challenge proof or a contributed canary's
+//!                                    verification), run it in the local sandbox, and submit the report
 //!
 //! Server: --server URL, else $COLLECTIVE_URL, else the server you logged in to.
 //! Credentials: $COLLECTIVE_CONFIG_DIR, else $XDG_CONFIG_HOME/collective, else
@@ -197,6 +199,8 @@ fn main() {
         ["keys", "revoke", id] => pretty(&ctx.ok("DELETE", &format!("/v1/me/keys/{id}"), None)),
         ["run"] => run::run(&ctx.server, false),
         ["run", "--submit-inconclusive"] => run::run(&ctx.server, true),
+        ["prove"] => run::prove_job(&ctx.server, false),
+        ["prove", "--submit-inconclusive"] => run::prove_job(&ctx.server, true),
         ["mcp-config", name] => {
             let v = ctx.ok("POST", "/v1/me/keys", Some(json!({ "agent_name": name })));
             let token = v["token"].as_str().unwrap_or_default();
@@ -214,7 +218,7 @@ fn main() {
             }));
         }
         _ => {
-            eprintln!("usage: collective [--server URL] login | whoami | keys [list] | keys new NAME | keys revoke ID | mcp-config NAME | logout | run [--submit-inconclusive]");
+            eprintln!("usage: collective [--server URL] login | whoami | keys [list] | keys new NAME | keys revoke ID | mcp-config NAME | logout | run [--submit-inconclusive] | prove [--submit-inconclusive]");
             std::process::exit(2);
         }
     }

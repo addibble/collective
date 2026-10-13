@@ -80,18 +80,6 @@ impl Api {
         )
     }
 
-    /// Waits for a proof to finish running in the sandbox.
-    fn await_proof(&self, id: &str) -> Value {
-        for _ in 0..240 {
-            let (_, v) = self.call("GET", &format!("/v1/proofs/{id}"), None, None);
-            if v["status"] == "done" || v["status"] == "error" {
-                return v;
-            }
-            std::thread::sleep(std::time::Duration::from_secs(1));
-        }
-        panic!("proof {id} did not finish");
-    }
-
     /// Files a stake-less report, paying with proof of work.
     fn report(&self, token: &str, patch: &str) -> String {
         let op = self.me(token)["operator_id"].as_str().unwrap().to_string();
@@ -437,11 +425,30 @@ fn find_challenge(api: &Api, token: &str, patch_id: &str) -> String {
         .unwrap_or_else(|| panic!("no challenge listed: {v}"))
 }
 
-/// Proofs run in the sandbox container: needs `wrangler dev` with container
-/// support (Docker) and the prover image.
+/// A synthetic sandbox report for a proof job, as `collective prove` would
+/// submit it: every run of each tree passes or fails as given.
+fn proof_report(spec: &Value, base_passes: bool, patched_passes: bool) -> Value {
+    let repeats = spec["repeats"].as_u64().unwrap();
+    let runs: Vec<Value> = [("base", base_passes), ("patched", patched_passes)]
+        .iter()
+        .flat_map(|(tree, ok)| {
+            (0..repeats).map(move |i| {
+                json!({ "tree": tree, "attempt": i, "status": if *ok { "passed" } else { "failed" },
+                "exit_code": if *ok { 0 } else { 1 }, "duration_ms": 5, "output_tail": "", "tests_run": null })
+            })
+        })
+        .collect();
+    json!({ "prover_version": "e2e", "setup": { "ok": true, "error": null, "network_isolated": true, "isolation": "network namespace" },
+            "runs": runs, "cpu_ms": 1000 })
+}
+
+/// Proofs are run by participants: a job settles only when enough
+/// independent, trusted runners agree, and nobody with a stake in it may
+/// run it. Runs no sandbox: the reports are synthetic (the sandbox itself
+/// is tested in crates/prover).
 #[test]
-#[ignore = "needs a running Worker with the proof container; see module docs"]
-fn proofs_run_in_the_sandbox_and_resolve_challenges() {
+#[ignore = "needs a running Worker; see module docs"]
+fn proofs_settle_by_a_quorum_of_runners() {
     let api = Api::new();
     let run = format!(
         "p{:x}",
@@ -463,6 +470,24 @@ fn proofs_run_in_the_sandbox_and_resolve_challenges() {
     let bob = api.register(&format!("bob-{run}"));
     let eve = api.register(&format!("eve-{run}"));
     let carol = api.register(&format!("carol-{run}"));
+    // Three runners with standing (founders, here), and three newcomers.
+    let trusted: Vec<String> = (0..3)
+        .map(|i| {
+            let name = format!("runner{i}-{run}");
+            let token = api.register(&name);
+            let (s, v) = api.call(
+                "POST",
+                "/v1/admin/genesis",
+                None,
+                Some(json!({ "operator": name, "amount": 100 })),
+            );
+            assert_eq!(s, 200, "{v}");
+            token
+        })
+        .collect();
+    let newcomers: Vec<String> = (0..3)
+        .map(|i| api.register(&format!("newcomer{i}-{run}")))
+        .collect();
 
     // Bob breaks addition; Eve slips a backdoor into login.
     let breaking = repo.diff(&[("add.sh", Some("#!/bin/sh\necho $(($1 + $2 + 1))\n".into()))]);
@@ -490,9 +515,30 @@ fn proofs_run_in_the_sandbox_and_resolve_challenges() {
     let (s, v) = api.put_bytes(&format!("/v1/admin/sources/{project_path}/{base}"), &tgz);
     assert_eq!(s, 200, "{v}");
 
-    // Contributed canaries are verified in the sandbox before they count:
-    // one whose own tests catch it goes live and earns duty credit; one
-    // they don't catch costs its contributor like a missed canary.
+    let next =
+        |token: &str| api.call("POST", "/v1/proofs/next", Some(token), None).1["job"].clone();
+    // Claims the open job, fetches what a runner needs, and reports runs
+    // that pass or fail as given. Returns the run id and the server's answer.
+    let run_job = |token: &str, base_passes: bool, patched_passes: bool| -> (String, Value) {
+        let job = next(token);
+        assert!(!job.is_null(), "no job offered");
+        assert_eq!(job["base_commit"], json!(base), "{job}");
+        let id = job["run_id"].as_str().unwrap().to_string();
+        // The same job comes back until it is reported.
+        assert_eq!(next(token)["run_id"], json!(id));
+        let (s, _) = api.call("GET", job["source"].as_str().unwrap(), Some(token), None);
+        assert_eq!(s, 200, "a runner can fetch the source of a job it holds");
+        let (s, v) = api.call(
+            "POST",
+            &format!("/v1/proof-runs/{id}/report"),
+            Some(token),
+            Some(json!({ "report": proof_report(&job["spec"], base_passes, patched_passes) })),
+        );
+        assert_eq!(s, 200, "{v}");
+        (id, v)
+    };
+
+    // A contributed canary is verified by runners before it counts.
     let maker = api.register(&format!("maker-{run}"));
     let contribute = |diff: String| {
         let (s, v) = api.call("POST", "/v1/canaries", Some(&maker), Some(json!({
@@ -501,30 +547,70 @@ fn proofs_run_in_the_sandbox_and_resolve_challenges() {
         assert_eq!(s, 202, "{v}");
         v["id"].as_str().unwrap().to_string()
     };
-    let await_canary = |id: &str| -> Value {
-        for _ in 0..240 {
-            let (_, v) = api.call("GET", "/v1/canaries/mine", Some(&maker), None);
-            let c = v["contributions"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|c| c["id"] == json!(id))
-                .cloned()
-                .unwrap();
-            if c["state"] != "verifying" {
-                return c;
-            }
-            std::thread::sleep(std::time::Duration::from_secs(1));
-        }
-        panic!("canary {id} still verifying");
+    let canary = |id: &str| -> Value {
+        let (_, v) = api.call("GET", "/v1/canaries/mine", Some(&maker), None);
+        v["contributions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"] == json!(id))
+            .cloned()
+            .unwrap()
     };
     let good = contribute(repo.diff(&[("add.sh", Some("#!/bin/sh\necho $(($1 - $2))\n".into()))]));
-    let c = await_canary(&good);
+    assert!(
+        next(&maker).is_null(),
+        "a contributor can't verify its own canary"
+    );
+
+    // New accounts alone settle nothing, however many agree.
+    for n in &newcomers {
+        let (_, v) = run_job(n, true, false);
+        assert_eq!(v["verdict"], "proven", "{v}");
+        assert!(v["settled"].is_null(), "{v}");
+    }
+    assert_eq!(canary(&good)["state"], "verifying");
+    // A report is taken once, and only from the runner that holds the run.
+    let (id, v) = run_job(&trusted[0], true, false);
+    assert!(
+        v["settled"].is_null(),
+        "one trusted runner is not a quorum: {v}"
+    );
+    let again = Some(json!({ "report": proof_report(&json!({ "repeats": 2 }), true, false) }));
+    let (s, _) = api.call(
+        "POST",
+        &format!("/v1/proof-runs/{id}/report"),
+        Some(&trusted[0]),
+        again.clone(),
+    );
+    assert_eq!(s, 409);
+    let (s, _) = api.call(
+        "POST",
+        &format!("/v1/proof-runs/{id}/report"),
+        Some(&trusted[1]),
+        again,
+    );
+    assert_eq!(s, 403);
+    // Enough trust behind one verdict settles it.
+    let (_, v) = run_job(&trusted[1], true, false);
+    assert_eq!(v["settled"], "proven", "{v}");
+    let c = canary(&good);
     assert_eq!(c["state"], "live", "{c}");
     assert_eq!(c["credited_units"], 3.0, "{c}");
     assert_eq!(api.me(&maker)["duty"]["credited"], 3);
+    assert!(ledger_has(&api.me(&trusted[1]), "ran a proof"));
+    assert!(ledger_has(&api.me(&newcomers[0]), "ran a proof"));
+    assert!(
+        next(&trusted[2]).is_null(),
+        "a settled job is no longer offered"
+    );
+
+    // A canary its own tests don't catch costs its contributor.
     let bad = contribute(repo.diff(&[("add.sh", Some(format!("{add}# nothing breaks\n")))]));
-    let c = await_canary(&bad);
+    for t in &trusted {
+        run_job(t, true, true);
+    }
+    let c = canary(&bad);
     assert_eq!(c["state"], "failed", "{c}");
     assert!(ledger_has(
         &api.me(&maker),
@@ -554,8 +640,30 @@ fn proofs_run_in_the_sandbox_and_resolve_challenges() {
         Some(json!({ "kind": "regression", "tests": ["test.sh"], "repeats": 2 })),
     );
     assert_eq!(s, 202, "{v}");
-    let proof = api.await_proof(v["id"].as_str().unwrap());
+    let proof_id = v["id"].as_str().unwrap().to_string();
+    // Neither the finder nor the patch's author may run it.
+    assert!(next(&carol).is_null(), "the finder can't run its own proof");
+    assert!(
+        next(&bob).is_null(),
+        "the author can't run a proof of its patch"
+    );
+    // Two trusted runners agree, one dissents: not settled until a third
+    // operator agrees. The dissenter then pays for it.
+    run_job(&trusted[0], true, false);
+    let (_, v) = run_job(&trusted[2], true, true);
+    assert_eq!(v["verdict"], "not_reproduced", "{v}");
+    let (_, v) = run_job(&trusted[1], true, false);
+    assert!(v["settled"].is_null(), "{v}");
+    let (_, v) = run_job(&newcomers[0], true, false);
+    assert_eq!(v["settled"], "proven", "{v}");
+    assert!(ledger_has(
+        &api.me(&trusted[2]),
+        "proof run disagreed with the other runners"
+    ));
+    let (_, proof) = api.call("GET", &format!("/v1/proofs/{proof_id}"), None, None);
+    assert_eq!(proof["status"], "done", "{proof}");
     assert_eq!(proof["verdict"], "proven", "{proof}");
+    assert_eq!(proof["runs"].as_array().unwrap().len(), 4, "{proof}");
     assert!(proof["report"]["setup"]["network_isolated"]
         .as_bool()
         .unwrap());
@@ -575,8 +683,9 @@ fn proofs_run_in_the_sandbox_and_resolve_challenges() {
                      "files": [{ "path": "proof/exploit.sh", "content": "sh login.sh debug | grep -qx admin" }] })),
     );
     assert_eq!(s, 202, "{v}");
-    let proof = api.await_proof(v["id"].as_str().unwrap());
-    assert_eq!(proof["verdict"], "demonstrated", "{proof}");
+    for t in &trusted {
+        run_job(t, false, true);
+    }
     let (_, c) = api.call("GET", &format!("/v1/challenges/{c2}"), None, None);
     assert_eq!(c["phase"], "staking", "{c}");
     assert_eq!(c["proofs"][0]["verdict"], "demonstrated");
@@ -855,8 +964,8 @@ fn review_then_run_tasks() {
     assert_eq!(s, 409, "the same canary twice: {v}");
     let (_, mine) = api.call("GET", "/v1/canaries/mine", Some(&newcomer), None);
     assert_eq!(mine["contributions"].as_array().unwrap().len(), 1, "{mine}");
-    // Unverified, it earns nothing yet (verification runs in the sandbox; see
-    // proofs_run_in_the_sandbox_and_resolve_challenges).
+    // Unverified, it earns nothing yet (runners verify it; see
+    // proofs_settle_by_a_quorum_of_runners).
     let (s, _) = api.call("POST", "/v1/patches", Some(&newcomer),
         Some(json!({ "project": upstream, "intent": format!("Tidy addition ({run})"), "base_commit": base, "diff": tweak })));
     assert_eq!(s, 402);
@@ -919,4 +1028,117 @@ fn review_then_run_tasks() {
         }
     }
     assert!(got);
+}
+
+#[test]
+#[ignore = "needs a running Worker; see module docs"]
+fn binary_patches_are_stored_whole_and_reviewed_whole() {
+    let api = Api::new();
+    let run = format!(
+        "b{:x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+    );
+    let upstream = format!("https://github.com/e2e/images-{run}");
+    let repo = Repo::new(&[("render.py", &lines(20, "x"))]);
+    let base = repo.base.clone();
+    let author = api.register(&format!("painter-{run}"));
+    let reviewer = api.register(&format!("critic-{run}"));
+
+    // A text change with the reference image its test compares against.
+    let image: Vec<u8> = (0..2000u32).map(|i| (i * 31 % 251) as u8).collect();
+    let text = lines(20, "x").replace("x 5\n", "x five\n");
+    let edits = [
+        ("render.py", Some(text.as_bytes())),
+        ("tests/ref.png", Some(&image[..])),
+    ];
+    let submit = |diff: String| {
+        api.call(
+            "POST",
+            "/v1/patches",
+            Some(&author),
+            Some(json!({ "project": upstream, "intent": format!("Render fives as words ({run})"), "base_commit": base, "diff": diff })),
+        )
+    };
+
+    // Without --binary the image's content is missing: refused, with the fix.
+    let (s, v) = submit(
+        "diff --git a/tests/ref.png b/tests/ref.png\nnew file mode 100644\nindex 0000000..1234567\nBinary files /dev/null and b/tests/ref.png differ\n"
+            .into(),
+    );
+    assert_eq!(s, 400, "{v}");
+    assert!(
+        v["error"].as_str().unwrap().contains("git diff --binary"),
+        "{v}"
+    );
+
+    let (s, v) = submit(repo.diff_bytes(&edits));
+    assert_eq!(s, 201, "{v}");
+    let patch = v["patch"]["id"].as_str().unwrap().to_string();
+    let task_id = v["review_task"].as_str().unwrap().to_string();
+
+    // What comes back applies outside a repository, as in the sandbox, and
+    // produces the image byte for byte.
+    let (s, v) = api.call("GET", &format!("/v1/patches/{patch}/diff"), None, None);
+    assert_eq!(s, 200, "{v}");
+    let stored = v.as_str().unwrap();
+    assert_eq!(
+        repo.applies_outside_git(stored, "tests/ref.png").as_deref(),
+        Some(&image[..])
+    );
+
+    // The reviewer gets the image with the rest of the patch, and reports
+    // it whole. The queue is global: other tests' tasks may come first.
+    let mut v = Value::Null;
+    for _ in 0..50 {
+        let (s, next) = api.call("POST", "/v1/reviews/next", Some(&reviewer), None);
+        assert_eq!(s, 200, "{next}");
+        let task = &next["task"];
+        assert!(!task.is_null(), "never got the task");
+        let id = task["task_id"].as_str().unwrap().to_string();
+        if id == task_id {
+            v = next;
+            break;
+        }
+        let (s, r) = if task["phase"] == "run" {
+            api.call(
+                "POST",
+                &format!("/v1/reviews/{id}/run"),
+                Some(&reviewer),
+                Some(json!({ "report": suite_report(true, true, 60_000) })),
+            )
+        } else {
+            let issues: Value = marker_issues(task["diff"].as_str().unwrap()).into();
+            api.call(
+                "POST",
+                &format!("/v1/reviews/{id}"),
+                Some(&reviewer),
+                Some(json!({ "issues": issues })),
+            )
+        };
+        assert_eq!(s, 200, "{r}");
+    }
+    assert_eq!(v["task"]["task_id"], task_id.as_str(), "{v}");
+    assert!(
+        v["task"]["diff"]
+            .as_str()
+            .unwrap()
+            .contains("GIT binary patch"),
+        "{v}"
+    );
+    let report = |start: u32, end: u32| {
+        api.call(
+            "POST",
+            &format!("/v1/reviews/{task_id}"),
+            Some(&reviewer),
+            Some(json!({ "issues": [{ "path": "tests/ref.png", "start": start, "end": end, "kind": "other", "severity": "low", "note": "not a PNG" }] })),
+        )
+    };
+    let (s, v) = report(5, 9);
+    assert_eq!(s, 400, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("binary file"), "{v}");
+    let (s, v) = report(1, 1);
+    assert_eq!(s, 200, "{v}");
 }

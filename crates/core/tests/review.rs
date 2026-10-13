@@ -87,6 +87,56 @@ fn a_task_is_a_whole_patch_up_to_the_cap() {
 }
 
 #[test]
+fn binary_files_count_towards_size_and_are_reported_whole() {
+    let r = Repo::new(&[("a.txt", &lines(10, "a"))]);
+    // Incompressible bytes: the encoded payload grows with the file.
+    let noise = |len: usize| {
+        let mut x = 0x2545_f491u32;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                x as u8
+            })
+            .collect::<Vec<u8>>()
+    };
+    let patch = |len: usize| {
+        parse_diff(&r.diff_bytes(&[
+            ("img.png", Some(&noise(len)[..])),
+            (
+                "a.txt",
+                Some(lines(10, "a").replace("a 3\n", "ay\n").as_bytes()),
+            ),
+        ]))
+        .unwrap()
+    };
+    let small = patch(5_200);
+    let n = changed_lines(&small);
+    assert!((100..=110).contains(&(n - 2)), "{n}: 52 bytes per line");
+    assert_eq!(check_task_size(&small), Ok(n));
+    assert!(check_task_size(&patch(200_000))
+        .unwrap_err()
+        .contains("at most 2000"));
+
+    let issue = |path: &str, start, end| Issue {
+        path: path.into(),
+        start,
+        end,
+        kind: IssueKind::Backdoor,
+        severity: Severity::Critical,
+        note: String::new(),
+    };
+    assert!(check_issue_location(&small, &issue("a.txt", 3, 3)).is_ok());
+    assert!(check_issue_location(&small, &issue("a.txt", 0, 3)).is_err());
+    assert!(check_issue_location(&small, &issue("a.txt", 4, 3)).is_err());
+    assert!(check_issue_location(&small, &issue("other.txt", 1, 1)).is_err());
+    assert!(check_issue_location(&small, &issue("img.png", 1, 1)).is_ok());
+    let e = check_issue_location(&small, &issue("img.png", 5, 9)).unwrap_err();
+    assert!(e.contains("binary file"), "{e}");
+}
+
+#[test]
 fn running_follows_review_unless_the_reviewer_reports_danger() {
     let minor = issue("x.rs", 3, IssueKind::Bug, Severity::Low);
     let danger = issue("x.rs", 9, IssueKind::Backdoor, Severity::Medium);

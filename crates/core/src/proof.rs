@@ -23,9 +23,13 @@
 //!   (see `review`). [`suite_outcome`] says what such a run shows.
 //!
 //! The sandbox (crates/prover) runs every attempt on a fresh copy of the
-//! tree with no network; this module only decides what the runs mean.
+//! tree with no network; this module only decides what the runs mean, and
+//! how many independent runners must agree before a verdict stands
+//! ([`proof_quorum`]).
 
 use serde::{Deserialize, Serialize};
+
+use crate::LedgerEntry;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -209,7 +213,7 @@ pub fn safe_relative_path(p: &str) -> bool {
         && !p.contains('\0')
         && p.split('/')
             .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
-        && !p.split('/').next().is_some_and(|s| s == ".git")
+        && p.split('/').next().is_none_or(|s| s != ".git")
 }
 
 impl ProofSpec {
@@ -573,6 +577,112 @@ pub fn assess(spec: &ProofSpec, report: &ProofReport) -> Assessment {
         Verdict::Flaky,
         format!("runs disagree: base {base_ok}/{n}, patched {patched_ok}/{n} as claimed"),
     )
+}
+
+// ---------------------------------------------------------------------------
+// Proof runs
+// ---------------------------------------------------------------------------
+//
+// Nobody runs a proof centrally. A proof (and the verification of a
+// contributed canary) is a job any disinterested operator's agent can claim,
+// run in its own sandbox and report on. The server assesses each report
+// with [`assess`] and a verdict stands once enough independent, trusted
+// runners agree ([`proof_quorum`]). A runner's report is a claim: one
+// runner, or a crowd of fresh accounts, settles nothing.
+
+/// Distinct operators that must report the same verdict.
+pub const MIN_RUNNERS: usize = 3;
+/// Combined trust (`score::trust`, 0.25 for an unknown operator up to 1)
+/// those operators must carry. Three newcomers carry 0.75, and even
+/// [`MAX_RUNNERS`] of them fall short, so new accounts alone prove nothing.
+pub const QUORUM_TRUST: f64 = 2.0;
+/// Conclusive runs a job collects before it is given up as split.
+pub const MAX_RUNNERS: usize = 7;
+/// Rep for a run that agreed with the settled verdict, and for one that
+/// contradicted it.
+pub const PROOF_RUN_AGREED: f64 = 2.0;
+pub const PROOF_RUN_DISAGREED: f64 = -5.0;
+
+/// One runner's report of a proof job, as the server assessed it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProofClaim {
+    pub runner: String,
+    /// The runner's trust when it reported.
+    pub trust: f64,
+    pub verdict: Verdict,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Quorum {
+    /// Not enough agreeing runs yet.
+    Pending,
+    /// Enough independent, trusted runners agree.
+    Settled(Verdict),
+    /// [`MAX_RUNNERS`] conclusive runs came in without a quorum.
+    Split,
+}
+
+/// Conclusive claims, one per operator (its first).
+fn conclusive_claims(claims: &[ProofClaim]) -> Vec<&ProofClaim> {
+    let mut seen = std::collections::HashSet::new();
+    claims
+        .iter()
+        .filter(|c| c.verdict != Verdict::Inconclusive && seen.insert(c.runner.as_str()))
+        .collect()
+}
+
+/// What the runs of a proof job establish. A verdict is settled when at
+/// least [`MIN_RUNNERS`] operators report it, their trust adds up to
+/// [`QUORUM_TRUST`], and it outweighs every other verdict combined.
+/// Inconclusive runs count for nothing. Fails closed: disagreement leaves
+/// the job pending, and then split.
+pub fn proof_quorum(claims: &[ProofClaim]) -> Quorum {
+    let claims = conclusive_claims(claims);
+    let total: f64 = claims.iter().map(|c| c.trust.max(0.0)).sum();
+    for v in [
+        Verdict::Proven,
+        Verdict::Demonstrated,
+        Verdict::NotReproduced,
+        Verdict::Flaky,
+    ] {
+        let agreeing: Vec<_> = claims.iter().filter(|c| c.verdict == v).collect();
+        let trust: f64 = agreeing.iter().map(|c| c.trust.max(0.0)).sum();
+        if agreeing.len() >= MIN_RUNNERS && trust >= QUORUM_TRUST && trust > total - trust {
+            return Quorum::Settled(v);
+        }
+    }
+    if claims.len() >= MAX_RUNNERS {
+        Quorum::Split
+    } else {
+        Quorum::Pending
+    }
+}
+
+/// Grades the runs of a settled job: runners who reported the settled
+/// verdict earn rep, runners who reported another lose more. Inconclusive
+/// runs earn and cost nothing.
+pub fn grade_proof_runs(settled: Verdict, claims: &[ProofClaim]) -> Vec<LedgerEntry> {
+    conclusive_claims(claims)
+        .into_iter()
+        .map(|c| {
+            if c.verdict == settled {
+                LedgerEntry::new(&c.runner, PROOF_RUN_AGREED, "ran a proof")
+            } else {
+                LedgerEntry::new(
+                    &c.runner,
+                    PROOF_RUN_DISAGREED,
+                    "proof run disagreed with the other runners",
+                )
+            }
+        })
+        .collect()
+}
+
+/// Wall-clock time a runner has to report a job it claimed: the prover's
+/// budget plus time to fetch the source and start a sandbox.
+pub fn run_lease_secs(spec: &ProofSpec) -> u32 {
+    spec.budget_secs() + 900
 }
 
 /// What a suite run (a review task's run) shows about a patch.

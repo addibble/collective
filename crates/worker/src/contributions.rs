@@ -2,13 +2,14 @@
 //! when there is no review work (CANARIES.md). The rules (fairness,
 //! grading, credit) are in collective_core::review.
 //!
-//! A contribution is verified in the platform's sandbox before it goes
-//! live: its own named tests must pass on base and fail with it. Once live
+//! A contribution is verified before it goes live: its own named tests
+//! must pass on base and fail with it, in the sandboxes of a quorum of
+//! runners other than its contributor (crate::proofs). Once live
 //! it is an ordinary review task, but its reviews are held until it proves
 //! fair (enough catches) or unfair (proven reviewers keep missing it).
 
 use collective_core::diff::parse_diff;
-use collective_core::proof::{assess, Ecosystem, ProofKind, ProofReport, ProofSpec, Verdict};
+use collective_core::proof::{Ecosystem, ProofKind, ProofSpec, Verdict};
 use collective_core::review::{
     canary_credit, canary_fairness, catches, check_task_size, proven_reviewer, task_units,
     CanaryFairness, Location, Review, Truth, CANARY_FAILED_VERIFICATION, CANARY_UNFAIR,
@@ -16,7 +17,6 @@ use collective_core::review::{
 use collective_core::LedgerEntry;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use worker::{Env, State};
 
 use crate::args;
 use crate::error::{bad, status, ApiError, ApiResult};
@@ -24,7 +24,7 @@ use crate::review::{apply_grades, create_task, submitted_reviews, ShardRow};
 use crate::store::{new_id, now, Agent, NewPatch, Store};
 
 /// Contributions an operator may have awaiting verification, and per day:
-/// each verification starts a sandbox container.
+/// each verification costs several runners a sandbox run.
 pub const MAX_VERIFYING: u32 = 3;
 pub const MAX_PER_DAY: u32 = 10;
 /// Reviewers a contributed canary is offered to before an undecided one is
@@ -53,9 +53,7 @@ pub struct Contribution {
 struct Row {
     id: String,
     operator_id: String,
-    patch_id: String,
     task_id: String,
-    spec: String,
     planted: String,
     state: String,
 }
@@ -64,7 +62,7 @@ async fn load(store: &Store, id: &str) -> ApiResult<Row> {
     match store
         .db
         .first::<Row>(
-            "SELECT id, operator_id, patch_id, task_id, spec, planted, state FROM canary_contributions WHERE id = ?",
+            "SELECT id, operator_id, task_id, planted, state FROM canary_contributions WHERE id = ?",
             args![id],
         )
         .await?
@@ -75,12 +73,7 @@ async fn load(store: &Store, id: &str) -> ApiResult<Row> {
 }
 
 /// Accepts a contributed canary and queues its verification.
-pub async fn contribute(
-    store: &Store,
-    env: &Env,
-    agent: &Agent,
-    c: Contribution,
-) -> ApiResult<Value> {
+pub async fn contribute(store: &Store, agent: &Agent, c: Contribution) -> ApiResult<Value> {
     let base = c.base_commit.to_lowercase();
     if base.len() != 40 || !base.chars().all(|ch| ch.is_ascii_hexdigit()) {
         return bad("base_commit must be a full 40-character SHA");
@@ -115,6 +108,7 @@ pub async fn contribute(
     };
     spec.validate().map_err(|e| ApiError::new(400, e))?;
 
+    crate::proofs::sweep_stale(store).await?;
     let verifying = store
         .count(
             "SELECT COUNT(*) AS n FROM canary_contributions WHERE operator_id = ? AND state = 'verifying'",
@@ -191,39 +185,49 @@ pub async fn contribute(
         )
         .execute()
         .await?;
-    let stub = env
-        .durable_object("PROOF")?
-        .id_from_name(&format!("canary:{id}"))?
-        .get_stub()?;
-    stub.fetch_with_str(&format!("https://runner/start?canary={id}"))
-        .await?;
     Ok(json!({ "id": id, "state": "verifying", "units": task_units(lines) }))
 }
 
-/// Runs the verification proof (in the ProofRunner object's container).
-pub async fn verify(state: &State, store: &Store, id: &str) -> ApiResult<()> {
-    let row = load(store, id).await?;
-    if row.state != "verifying" {
-        return Ok(());
-    }
-    let spec: ProofSpec = serde_json::from_str(&row.spec)?;
-    let report = crate::proofs::run_in_container(state, store, &row.patch_id, &spec).await?;
-    complete_verification(store, &row, &spec, &report).await
+/// What a runner needs to know about a contribution awaiting verification.
+#[derive(Debug, Deserialize)]
+pub struct JobRow {
+    pub operator_id: String,
+    pub patch_id: String,
+    pub spec: String,
+    pub state: String,
+    pub verdict: Option<String>,
 }
 
-/// Applies a verification result. Proven: the canary goes live and its
-/// contributor is credited. Not reproduced, flaky, or only "demonstrated"
-/// (the canary hangs or doesn't build, which any reviewer would notice):
-/// a bad canary, penalized. Inconclusive: no credit and no penalty.
-async fn complete_verification(
+pub async fn job(store: &Store, id: &str) -> ApiResult<JobRow> {
+    match store
+        .db
+        .first::<JobRow>(
+            "SELECT operator_id, patch_id, spec, state, verdict FROM canary_contributions WHERE id = ?",
+            args![id],
+        )
+        .await?
+    {
+        Some(r) => Ok(r),
+        None => status(404, "unknown contribution"),
+    }
+}
+
+/// Applies the verdict a quorum of runners settled (crate::proofs), once;
+/// returns whether this call applied it. Proven: the canary goes live and
+/// its contributor is credited. Not reproduced, flaky, or only
+/// "demonstrated" (the canary hangs or doesn't build, which any reviewer
+/// would notice): a bad canary, penalized. Inconclusive: no credit and no
+/// penalty.
+pub async fn complete_verification(
     store: &Store,
-    row: &Row,
-    spec: &ProofSpec,
-    report: &ProofReport,
-) -> ApiResult<()> {
-    let a = assess(spec, report);
+    id: &str,
+    verdict: Verdict,
+    reason: &str,
+    report: Option<String>,
+) -> ApiResult<bool> {
+    let row = load(store, id).await?;
     let shard = crate::review::load_shard(store, &row.task_id).await?;
-    let (state, task_state, credit, penalty) = match a.verdict {
+    let (state, task_state, credit, penalty) = match verdict {
         Verdict::Proven => (
             "live",
             "open",
@@ -233,7 +237,7 @@ async fn complete_verification(
         Verdict::Inconclusive => ("inconclusive", "retired", 0, None),
         _ => ("failed", "retired", 0, Some(CANARY_FAILED_VERIFICATION)),
     };
-    let verdict = serde_json::to_value(a.verdict)?
+    let verdict = serde_json::to_value(verdict)?
         .as_str()
         .unwrap_or_default()
         .to_string();
@@ -241,11 +245,11 @@ async fn complete_verification(
         .db
         .changes(
             "UPDATE canary_contributions SET state = ?, verdict = ?, reason = ?, report = ?, credited_units = ?, finished_at = ? WHERE id = ? AND state = 'verifying'",
-            args![state, verdict, &a.reason, serde_json::to_string(report)?, credit, now(), &row.id],
+            args![state, verdict, reason, report, credit, now(), &row.id],
         )
         .await?;
     if claimed == 0 {
-        return Ok(());
+        return Ok(false);
     }
     store
         .db
@@ -266,10 +270,11 @@ async fn complete_verification(
             )
             .await?;
     }
-    Ok(())
+    Ok(true)
 }
 
-/// The sandbox itself failed: nobody's fault, so no credit and no penalty.
+/// No verdict was reached (the runners split, or none came in time):
+/// nobody's fault, so no credit and no penalty.
 pub async fn verification_error(store: &Store, id: &str, message: &str) -> ApiResult<()> {
     let row = load(store, id).await?;
     store
@@ -324,7 +329,7 @@ pub async fn on_review(store: &Store, shard: &ShardRow, me: Review) -> ApiResult
     let Some(row) = store
         .db
         .first::<Row>(
-            "SELECT id, operator_id, patch_id, task_id, spec, planted, state FROM canary_contributions WHERE task_id = ?",
+            "SELECT id, operator_id, task_id, planted, state FROM canary_contributions WHERE task_id = ?",
             args![&shard.id],
         )
         .await?

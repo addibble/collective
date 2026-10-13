@@ -1,8 +1,14 @@
 //! Unified diff (git flavour) parsing, fingerprinting and combination.
 //!
-//! Supported: modifications, file creation and deletion. Renames, copies,
-//! mode-only and binary changes are rejected for now; they make combination
-//! semantics much harder and are rare in the patches agents trade.
+//! Supported: modifications, file creation and deletion, of text files and
+//! of binary files (`git diff --binary`). Renames, copies and mode-only
+//! changes are rejected for now; they make combination semantics much
+//! harder and are rare in the patches agents trade.
+//!
+//! A binary change is carried verbatim and never decoded here. It must name
+//! the full object ids of both sides, which `git apply` checks against the
+//! file it patches and the file it produces, so a payload that doesn't
+//! match what the patch claims fails to apply.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -23,6 +29,32 @@ pub struct Hunk {
     pub lines: Vec<String>,
 }
 
+/// One side of a `GIT binary patch`: its `literal N` or `delta N` header
+/// followed by the base85 lines, exactly as git wrote them.
+pub type BinaryChunk = Vec<String>;
+
+/// A whole-file binary change (see the module docs).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BinaryChange {
+    /// Full object id of the file before; all zeros when it is created.
+    pub old_id: String,
+    /// Full object id of the file after; all zeros when it is deleted.
+    pub new_id: String,
+    /// The file mode from the `index` line, when git printed one.
+    pub mode: Option<String>,
+    pub forward: BinaryChunk,
+    /// What `git apply -R` uses. Git always writes it; it is optional here.
+    pub reverse: Option<BinaryChunk>,
+}
+
+impl BinaryChange {
+    /// Lines of encoded payload (at most 52 bytes of compressed data each):
+    /// what a binary change counts for where text counts changed lines.
+    pub fn payload_lines(&self) -> u32 {
+        self.forward.len().saturating_sub(1) as u32
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FileDiff {
     /// `None` when the file is created.
@@ -32,6 +64,9 @@ pub struct FileDiff {
     pub new_mode: Option<String>,
     pub deleted_mode: Option<String>,
     pub hunks: Vec<Hunk>,
+    /// Set for a binary file, which has no hunks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary: Option<BinaryChange>,
 }
 
 impl FileDiff {
@@ -104,7 +139,63 @@ fn new_file() -> FileDiff {
         new_mode: None,
         deleted_mode: None,
         hunks: Vec::new(),
+        binary: None,
     }
+}
+
+/// The path in `diff --git a/P b/P`. Binary changes have no `---`/`+++`
+/// lines, so this header is the only place their path appears. `None` if
+/// the two sides differ or the path is quoted.
+fn git_header_path(rest: &str) -> Option<&str> {
+    let n = rest.len().checked_sub(5)? / 2;
+    let (a, b) = (rest.get(..n + 2)?, rest.get(n + 3..)?);
+    let path = a.strip_prefix("a/")?;
+    (rest.len() == 2 * n + 5 && b.strip_prefix("b/") == Some(path) && !path.is_empty())
+        .then_some(path)
+}
+
+fn is_object_id(s: &str) -> bool {
+    matches!(s.len(), 40 | 64) && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Parses `index <old>..<new>[ <mode>]`.
+fn parse_index(rest: &str) -> Option<(String, String, Option<String>)> {
+    let (ids, mode) = match rest.split_once(' ') {
+        Some((ids, mode)) => (ids, Some(mode.to_string())),
+        None => (rest, None),
+    };
+    let (old, new) = ids.split_once("..")?;
+    Some((old.to_lowercase(), new.to_lowercase(), mode))
+}
+
+/// Git's base85 alphabet, plus the length letter that starts each line.
+fn is_base85_line(line: &str) -> bool {
+    let b = line.as_bytes();
+    b.len() > 1
+        && b[0].is_ascii_alphabetic()
+        && b[1..]
+            .iter()
+            .all(|c| c.is_ascii_alphanumeric() || b"!#$%&()*+-;<=>?@^_`{|}~".contains(c))
+}
+
+/// Reads one chunk of a binary patch starting at `lines[*i]`, through the
+/// blank line that ends it.
+fn parse_binary_chunk(lines: &[&str], i: &mut usize) -> Option<BinaryChunk> {
+    let header = *lines.get(*i)?;
+    let size = header
+        .strip_prefix("literal ")
+        .or_else(|| header.strip_prefix("delta "))?;
+    size.parse::<u64>().ok()?;
+    let mut chunk = vec![header.to_string()];
+    *i += 1;
+    while let Some(l) = lines.get(*i).filter(|l| is_base85_line(l)) {
+        chunk.push(l.to_string());
+        *i += 1;
+    }
+    if lines.get(*i).is_some_and(|l| l.is_empty()) {
+        *i += 1;
+    }
+    Some(chunk)
 }
 
 pub fn parse_diff(text: &str) -> Result<Vec<FileDiff>, DiffError> {
@@ -114,12 +205,17 @@ pub fn parse_diff(text: &str) -> Result<Vec<FileDiff>, DiffError> {
         lines.pop();
     }
     let mut files: Vec<FileDiff> = Vec::new();
+    // For the file being read: its `diff --git` path and `index` line.
+    let mut header_path: Option<&str> = None;
+    let mut index: Option<(String, String, Option<String>)> = None;
     let mut i = 0;
 
     while i < lines.len() {
         let line = lines[i];
-        if line.starts_with("diff --git ") {
+        if let Some(rest) = line.strip_prefix("diff --git ") {
             files.push(new_file());
+            header_path = git_header_path(rest);
+            index = None;
             i += 1;
             continue;
         }
@@ -128,7 +224,10 @@ pub fn parse_diff(text: &str) -> Result<Vec<FileDiff>, DiffError> {
                 return err(format!("line {}: '---' without '+++'", i + 1));
             };
             // Plain `diff -u` output has no `diff --git` header.
-            if files.last().is_none_or(|f| !f.hunks.is_empty()) {
+            if files
+                .last()
+                .is_none_or(|f| !f.hunks.is_empty() || f.binary.is_some())
+            {
                 files.push(new_file());
             }
             let cur = files.last_mut().expect("just pushed");
@@ -181,7 +280,10 @@ pub fn parse_diff(text: &str) -> Result<Vec<FileDiff>, DiffError> {
             cur.hunks.push(hunk);
             continue;
         }
-        if let Some(cur) = files.last_mut().filter(|f| f.hunks.is_empty()) {
+        if let Some(cur) = files
+            .last_mut()
+            .filter(|f| f.hunks.is_empty() && f.binary.is_none())
+        {
             if let Some(m) = line.strip_prefix("new file mode ") {
                 cur.new_mode = Some(m.into());
             } else if let Some(m) = line.strip_prefix("deleted file mode ") {
@@ -199,8 +301,40 @@ pub fn parse_diff(text: &str) -> Result<Vec<FileDiff>, DiffError> {
             .any(|p| line.starts_with(p))
             {
                 return err(format!("unsupported change: {line}"));
-            } else if line.starts_with("Binary files ") || line == "GIT binary patch" {
-                return err("binary patches are not supported");
+            } else if let Some(rest) = line.strip_prefix("index ") {
+                index = parse_index(rest);
+            } else if line.starts_with("Binary files ") {
+                return err(
+                    "binary change without its content: make the diff with `git diff --binary`",
+                );
+            } else if line == "GIT binary patch" {
+                let Some(path) = header_path else {
+                    return err(format!(
+                        "line {}: binary change without a plain `diff --git a/PATH b/PATH` header",
+                        i + 1
+                    ));
+                };
+                let Some((old_id, new_id, mode)) = index.take() else {
+                    return err(format!("binary change to {path} needs its `index` line"));
+                };
+                if !is_object_id(&old_id) || !is_object_id(&new_id) {
+                    return err(format!("binary change to {path} needs full object ids: make the diff with `git diff --binary`"));
+                }
+                i += 1;
+                let Some(forward) = parse_binary_chunk(&lines, &mut i) else {
+                    return err(format!("malformed binary patch for {path}"));
+                };
+                let reverse = parse_binary_chunk(&lines, &mut i);
+                cur.old_path = cur.new_mode.is_none().then(|| path.to_string());
+                cur.new_path = cur.deleted_mode.is_none().then(|| path.to_string());
+                cur.binary = Some(BinaryChange {
+                    old_id,
+                    new_id,
+                    mode,
+                    forward,
+                    reverse,
+                });
+                continue;
             }
             // `index` lines and other headers are dropped: git recomputes them.
         }
@@ -214,8 +348,13 @@ pub fn parse_diff(text: &str) -> Result<Vec<FileDiff>, DiffError> {
         if f.old_path.is_none() && f.new_path.is_none() {
             return err("file diff without paths");
         }
-        if f.hunks.is_empty() {
+        if f.hunks.is_empty() && f.binary.is_none() {
             return err(format!("no hunks for {}", f.path()));
+        }
+    }
+    for (n, f) in files.iter().enumerate() {
+        if files[..n].iter().any(|g| g.path() == f.path()) {
+            return err(format!("{} appears twice", f.path()));
         }
     }
     Ok(files)
@@ -254,6 +393,23 @@ pub fn format_diff(files: &[FileDiff]) -> String {
                 f.deleted_mode.as_deref().unwrap_or("100644")
             ));
         }
+        if let Some(bin) = &f.binary {
+            let mode = bin
+                .mode
+                .as_ref()
+                .map(|m| format!(" {m}"))
+                .unwrap_or_default();
+            out.push_str(&format!("index {}..{}{mode}\n", bin.old_id, bin.new_id));
+            out.push_str("GIT binary patch\n");
+            for chunk in std::iter::once(&bin.forward).chain(&bin.reverse) {
+                for l in chunk {
+                    out.push_str(l);
+                    out.push('\n');
+                }
+                out.push('\n');
+            }
+            continue;
+        }
         match &f.old_path {
             Some(p) => out.push_str(&format!("--- a/{p}\n")),
             None => out.push_str("--- /dev/null\n"),
@@ -287,6 +443,8 @@ pub struct DiffStats {
     pub files: Vec<String>,
     pub added: u32,
     pub removed: u32,
+    /// Binary files changed; their content is not in `added` or `removed`.
+    pub binary: u32,
 }
 
 pub fn stats(files: &[FileDiff]) -> DiffStats {
@@ -302,6 +460,7 @@ pub fn stats(files: &[FileDiff]) -> DiffStats {
         files: files.iter().map(|f| f.path().to_string()).collect(),
         added,
         removed,
+        binary: files.iter().filter(|f| f.binary.is_some()).count() as u32,
     }
 }
 
@@ -324,10 +483,18 @@ pub struct HunkFingerprint {
 
 /// One fingerprint per hunk: the path plus the changed lines with whitespace
 /// collapsed. Line numbers and context are ignored, so the same edit made
-/// against slightly different bases, or re-indented, still matches.
+/// against slightly different bases, or re-indented, still matches. A
+/// binary file has one fingerprint: its path and the content it ends up with.
 pub fn hunk_fingerprints(files: &[FileDiff]) -> Vec<HunkFingerprint> {
     let mut out = Vec::new();
     for f in files {
+        if let Some(bin) = &f.binary {
+            let fp = sha256_hex(format!("{}\nbinary {}", f.path(), bin.new_id));
+            out.push(HunkFingerprint {
+                path: f.path().to_string(),
+                fingerprint: fp[..32].to_string(),
+            });
+        }
         for h in &f.hunks {
             let changed: Vec<String> = h
                 .lines
@@ -397,6 +564,12 @@ pub fn find_conflict(accepted: &[FileDiff], next: &[FileDiff]) -> Option<Conflic
             continue;
         };
         let path = f.path().to_string();
+        if prev.binary.is_some() || f.binary.is_some() {
+            return Some(Conflict {
+                path,
+                reason: "both change a binary file".into(),
+            });
+        }
         if prev.old_path.is_none() || f.old_path.is_none() {
             return Some(Conflict {
                 path,

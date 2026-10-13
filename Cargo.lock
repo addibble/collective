@@ -143,6 +143,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "collective-runner"
+version = "0.1.0"
+dependencies = [
+ "collective-core",
+ "getrandom",
+ "serde_json",
+ "worker",
+]
+
+[[package]]
 name = "collective-worker"
 version = "0.1.0"
 dependencies = [
