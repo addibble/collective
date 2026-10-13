@@ -9,10 +9,9 @@
 use collective_core::diff::FileDiff;
 use collective_core::proof::{suite_outcome, ProofReport, ProofSpec, RunOutcome};
 use collective_core::review::{
-    changed_lines, credits_duty, duty_owed, duty_required, grade, grade_runs, may_act,
-    median_cpu_ms, next_step, pick_task, run_completes, run_majority, run_required, task_id,
-    task_units, Issue, Location, NextStep, OpenShard, Review, RunClaim, Truth, PARAMS,
-    STANDING_WINDOW,
+    changed_lines, credits_duty, duty_owed, duty_required, grade, grade_runs, median_cpu_ms,
+    next_step, pick_task, run_completes, run_majority, run_required, task_id, task_units, Issue,
+    Location, NextStep, OpenShard, Review, RunClaim, Truth, PARAMS,
 };
 use collective_core::LedgerEntry;
 use serde::Deserialize;
@@ -38,6 +37,7 @@ pub struct ShardRow {
     pub review_units: f64,
     pub run_units: f64,
     pub run_measured: f64,
+    pub contributed: f64,
     pub wanted: f64,
     pub canary: f64,
     pub planted: Option<String>,
@@ -65,6 +65,7 @@ pub async fn create_task(
     files: &[FileDiff],
     planted: Option<&[Location]>,
     expected_run: Option<RunOutcome>,
+    state: &str,
 ) -> ApiResult<String> {
     let lines = changed_lines(files);
     let id = task_id(&patch.id);
@@ -73,8 +74,8 @@ pub async fn create_task(
         estimated_run_units(store, &patch.project_id).await?,
     );
     store.db.run(
-        "INSERT OR IGNORE INTO shards (id, patch_id, idx, path, hunk_start, hunk_end, changed_lines, units, review_units, run_units, author_op, wanted, canary, planted, expected_run, created_at)
-         VALUES (?, ?, 0, '', 0, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT OR IGNORE INTO shards (id, patch_id, idx, path, hunk_start, hunk_end, changed_lines, units, review_units, run_units, author_op, wanted, canary, planted, expected_run, state, created_at)
+         VALUES (?, ?, 0, '', 0, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         args![
             &id,
             &patch.id,
@@ -87,6 +88,7 @@ pub async fn create_task(
             planted.is_some(),
             planted.map(serde_json::to_string).transpose()?,
             expected_run.map(outcome_str),
+            state,
             now(),
         ],
     )
@@ -154,7 +156,8 @@ async fn activity(store: &Store, operator_id: &str) -> ApiResult<(u32, u32, u32)
              WHERE t.operator_id = ? AND t.credited = 1",
             args![operator_id],
         )
-        .await?;
+        .await?
+        + crate::contributions::credited_units(store, operator_id).await?;
     Ok((units, adoptions, credited))
 }
 
@@ -178,14 +181,14 @@ pub async fn require_duty(
 ) -> ApiResult<()> {
     let (mine, adopts, credited) = activity(store, &agent.operator_id).await?;
     let owed = duty_owed(mine + units, adopts + adoptions, credited);
-    if owed > 0
-        && !may_act(
-            owed,
-            work_available(store, &agent.operator_id).await?,
-            recent_failures(store, &agent.operator_id).await?,
-        )
-    {
-        return status(402, format!("review duty: {owed} work unit(s) owed before this action. Call collective_review_next and complete what you are given."));
+    if owed > 0 {
+        if work_available(store, &agent.operator_id).await? {
+            return status(402, format!("review duty: {owed} work unit(s) owed before this action. Call collective_review_next and complete what you are given."));
+        }
+        // Duty can only be paid with work; with none to review, the
+        // operator pays by making some (CANARIES.md, contributed canaries).
+        return status(402, format!("review duty: {owed} work unit(s) owed before this action, and there is no review work for you right now. \
+Pay by contributing a canary (POST /v1/canaries: an upstream fix reverted, with the project's own tests that catch it), or try again later."));
     }
     Ok(())
 }
@@ -207,21 +210,6 @@ async fn work_available(store: &Store, operator_id: &str) -> ApiResult<bool> {
         )
         .await?;
     Ok(n > 0)
-}
-
-/// Failed tasks among the operator's most recent ones: a review graded as
-/// failed, or a run phase that ended, or lapsed, without a completing run.
-async fn recent_failures(store: &Store, operator_id: &str) -> ApiResult<u32> {
-    store
-        .count(
-            "SELECT COUNT(*) AS n FROM (
-               SELECT review_ok, run_ok, phase, expires_at FROM review_tasks
-               WHERE operator_id = ? AND submitted_at IS NOT NULL
-               ORDER BY submitted_at DESC LIMIT ?)
-             WHERE review_ok = 0 OR (phase = 'done' AND run_ok = 0) OR (phase = 'run' AND expires_at < ?)",
-            args![operator_id, STANDING_WINDOW, now()],
-        )
-        .await
 }
 
 fn seed_secret(store: &Store) -> String {
@@ -536,6 +524,14 @@ pub async fn submit_review(
         json!({ "phase": "done" })
     };
 
+    if shard.contributed > 0.0 {
+        let me = Review {
+            reviewer: agent.operator_id.clone(),
+            issues,
+        };
+        crate::contributions::on_review(store, &shard, me).await?;
+        return Ok(json!({ "accepted": true, "next": next }));
+    }
     if shard.canary > 0.0 {
         // Graded at once against the planted problem. A canary without
         // planted lines is a control and grades like a clean patch.

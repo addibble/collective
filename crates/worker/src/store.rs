@@ -698,7 +698,7 @@ impl Store {
                 status: "open",
             })
             .await?;
-        let task = crate::review::create_task(self, &row, &files, None, None).await?;
+        let task = crate::review::create_task(self, &row, &files, None, None, "open").await?;
         Ok(
             json!({ "patch": row.public(), "created": true, "intent_reused": intent_reused, "similar": similar, "review_task": task }),
         )

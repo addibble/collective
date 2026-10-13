@@ -1,6 +1,7 @@
 //! Collective's Cloudflare Worker: REST and MCP over the protocol core.
 
 mod challenges;
+mod contributions;
 mod db;
 mod error;
 mod identity;
@@ -319,6 +320,18 @@ async fn route(req: &mut Request, env: &Env) -> ApiResult<Response> {
             with(body(req).await?, "task_id", task),
         )
         .await?),
+        (Method::Post, ["v1", "canaries"]) => {
+            let me = require(&agent)?;
+            let c: contributions::Contribution = serde_json::from_value(body(req).await?)?;
+            Ok(json_response(
+                &contributions::contribute(&store, env, me, c).await?,
+                202,
+            )?)
+        }
+        (Method::Get, ["v1", "canaries", "mine"]) => {
+            let me = require(&agent)?;
+            ok(contributions::list_mine(&store, me).await?)
+        }
         (Method::Post, ["v1", "reviews", task, "run"]) => {
             let me = require(&agent)?;
             let sub: review::RunSubmission = serde_json::from_value(body(req).await?)?;
@@ -468,6 +481,7 @@ async fn create_canary(store: &Store, v: Value) -> ApiResult<Value> {
         &files,
         Some(&input.planted),
         input.expected_run,
+        "open",
     )
     .await?;
     let meta = json!({ "provenance": input.provenance, "verified": input.verified, "planted": input.planted });

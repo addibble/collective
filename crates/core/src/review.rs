@@ -72,6 +72,7 @@ pub struct ReviewParams {
     pub confirmed_hit: f64,
     pub confirmed_miss: f64,
     pub false_positive: f64,
+    pub contributed_canary_catch: f64,
     pub run_canary_correct: f64,
     pub run_canary_misreported: f64,
     pub run_disagreed: f64,
@@ -96,6 +97,7 @@ pub const PARAMS: ReviewParams = ReviewParams {
     confirmed_hit: 10.0,
     confirmed_miss: -10.0,
     false_positive: -3.0,
+    contributed_canary_catch: 10.0,
     run_canary_correct: 2.0,
     run_canary_misreported: -15.0,
     run_disagreed: -5.0,
@@ -119,19 +121,6 @@ pub fn review_cost(units: u32) -> u32 {
 /// an operator has submitted and the adoptions it has reported.
 pub fn duty_required(units: u32, adoptions: u32) -> u32 {
     (review_cost(units) + adoptions * PARAMS.per_adoption).saturating_sub(PARAMS.free_units)
-}
-
-/// Recent tasks looked at for [`may_act`]'s good-standing test.
-pub const STANDING_WINDOW: u32 = 10;
-
-/// Whether an operator owing `owed` units may still submit or adopt.
-/// Normally not: review first, then act. But duty can only be paid while
-/// there is work, and a large project's runs can make even a first patch
-/// cost more work than the queue holds, so an operator in good standing
-/// (no failed task among its last [`STANDING_WINDOW`]) is let through when
-/// nothing is left for it to do. One that skimped stays blocked.
-pub fn may_act(owed: u32, work_available: bool, recent_failures: u32) -> bool {
-    owed == 0 || (!work_available && recent_failures == 0)
 }
 
 /// Work units still owed before the operator may submit or adopt again.
@@ -391,6 +380,11 @@ pub enum Truth {
         confirmed: Vec<Location>,
         rejected: Vec<Location>,
     },
+    /// A canary contributed by a participant, once it has proven fair (see
+    /// [`canary_fairness`]). Catching one pays less than a platform canary,
+    /// and neither catching nor missing one counts towards the canary
+    /// record juries use: its author knows it and could leak it.
+    ContributedCanary { planted: Vec<Location> },
     /// The panel found nothing and nothing was challenged within the window.
     Unchallenged,
 }
@@ -447,6 +441,22 @@ pub fn grade(truth: &Truth, reviews: &[Review]) -> Vec<LedgerEntry> {
                         p.false_positive,
                         "reported a rejected problem",
                     ));
+                }
+            }
+            Truth::ContributedCanary { planted } => {
+                if planted.iter().all(hit) {
+                    out.push(LedgerEntry::new(
+                        &r.reviewer,
+                        p.contributed_canary_catch,
+                        "caught a contributed canary",
+                    ));
+                } else {
+                    out.push(LedgerEntry::new(
+                        &r.reviewer,
+                        p.canary_miss,
+                        "missed a contributed canary",
+                    ));
+                    failed = true;
                 }
             }
             Truth::Unchallenged => {}
@@ -565,4 +575,68 @@ pub fn run_completes(outcome: RunOutcome, entries: &[LedgerEntry], runner: &str)
         && !entries
             .iter()
             .any(|e| e.operator_id == runner && e.reason == "misreported a canary run")
+}
+
+// ---------------------------------------------------------------------------
+// Contributed canaries
+// ---------------------------------------------------------------------------
+//
+// Participants can pay duty by contributing canaries: when there is no
+// review work, an agent builds one (CANARIES.md) instead. A contributed
+// canary goes live only after the platform's sandbox shows its own named
+// tests pass on base and fail with it. A canary that fails verification
+// costs its author like a missed canary. A live one must then prove fair:
+// its reviews are held until enough reviewers catch it, and if proven
+// reviewers keep missing it, it is retired, its author is penalized and its
+// reviewers are graded as if it were clean.
+
+/// Catches that show a contributed canary is fair.
+pub const CANARY_FAIR_CATCHES: u32 = 2;
+/// Misses by proven reviewers that show a contributed canary is unfair.
+pub const CANARY_UNFAIR_MISSES: u32 = 6;
+/// Penalties for a contributed canary's author.
+pub const CANARY_FAILED_VERIFICATION: f64 = -15.0;
+pub const CANARY_UNFAIR: f64 = -15.0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CanaryFairness {
+    Pending,
+    Fair,
+    Unfair,
+}
+
+/// Whether a contributed canary has shown it is fair. Only misses by proven
+/// reviewers count against it, so a run of lazy reviewers can't sink an
+/// honest contributor's canary.
+pub fn canary_fairness(catches: u32, proven_misses: u32) -> CanaryFairness {
+    if catches >= CANARY_FAIR_CATCHES {
+        CanaryFairness::Fair
+    } else if proven_misses >= CANARY_UNFAIR_MISSES {
+        CanaryFairness::Unfair
+    } else {
+        CanaryFairness::Pending
+    }
+}
+
+/// A reviewer whose misses say something about a canary: it has caught at
+/// least 2 platform canaries, at an 80% rate or better.
+pub fn proven_reviewer(caught: u32, missed: u32) -> bool {
+    caught >= 2 && caught as f64 >= 0.8 * (caught + missed) as f64
+}
+
+/// Whether a review caught every planted location.
+pub fn catches(planted: &[Location], review: &Review) -> bool {
+    planted.iter().all(|loc| {
+        review
+            .issues
+            .iter()
+            .any(|i| i.location().overlaps(loc, PARAMS.slack))
+    })
+}
+
+/// Duty credit for a verified contributed canary: the review work it
+/// supplies (`redundancy` reviews of a task its size).
+pub fn canary_credit(units: u32) -> u32 {
+    units * PARAMS.redundancy as u32
 }

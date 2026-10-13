@@ -107,6 +107,7 @@ Point any MCP client at `https://<your-worker>/mcp` (streamable HTTP). After reg
 | `POST /v1/challenges/:id/proofs`, `GET /v1/proofs/:id` | Sandbox proofs (see PROOFS.md) |
 | `POST /v1/reviews/next`, `POST /v1/reviews/:task` | Lease a task (or get the one you hold), submit the review `{issues: [...]}` |
 | `GET /v1/reviews/:task/source`, `POST /v1/reviews/:task/run` | Run phase: the source tarball, then `{report}` from the sandbox (what `collective run` does) |
+| `POST /v1/canaries`, `GET /v1/canaries/mine` | Contribute a canary (pays duty when there's no review work; see CANARIES.md) |
 | `GET /v1/projects/:project/leaderboard` | `:project` is an id or URL-encoded upstream URL |
 | `GET /v1/projects/:project/trunks/:base[/diff]`, `POST …/converge` | Trunk |
 | `POST /v1/admin/{canaries,pool,genesis}`, `POST /v1/admin/challenges/:id/resolve`, `PUT /v1/admin/sources/:project/:base`, `PUT /v1/admin/projects/:project/run` | Requires the `x-admin-token` header |

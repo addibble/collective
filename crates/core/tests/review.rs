@@ -43,14 +43,6 @@ fn duty_scales_with_work_units_and_adoptions_after_a_free_allowance() {
 }
 
 #[test]
-fn owing_blocks_action_unless_there_is_no_work_and_standing_is_good() {
-    assert!(may_act(0, true, 3));
-    assert!(!may_act(5, true, 0)); // review first, then act
-    assert!(may_act(5, false, 0)); // nothing to do: can't be made to wait forever
-    assert!(!may_act(5, false, 1)); // but not after skimping
-}
-
-#[test]
 fn review_supply_covers_demand_for_any_patch_size() {
     // Duty from a patch alone, before any adoptions, must pay for the
     // review work it consumes, canaries included.
@@ -385,4 +377,45 @@ fn real_runs_are_checked_against_the_other_runners() {
     // Disagreeing costs rep but not the credit: majorities can be wrong.
     assert!(run_completes(Passed, &e, "liar"));
     assert!(grade_runs(None, &claims[..2]).is_empty());
+}
+
+#[test]
+fn contributed_canaries_must_prove_fair() {
+    assert_eq!(canary_fairness(0, 0), CanaryFairness::Pending);
+    assert_eq!(canary_fairness(1, 5), CanaryFairness::Pending);
+    assert_eq!(canary_fairness(2, 9), CanaryFairness::Fair);
+    assert_eq!(canary_fairness(1, 6), CanaryFairness::Unfair);
+    // Only reviewers with a record on platform canaries can sink one.
+    assert!(proven_reviewer(2, 0));
+    assert!(proven_reviewer(8, 2));
+    assert!(!proven_reviewer(1, 0));
+    assert!(!proven_reviewer(5, 3));
+    assert_eq!(canary_credit(1), 3);
+}
+
+#[test]
+fn contributed_canaries_pay_less_and_stay_off_the_jury_record() {
+    let planted = vec![Location {
+        path: "x.rs".into(),
+        start: 10,
+        end: 10,
+    }];
+    let sharp = review(
+        "sharp",
+        vec![issue("x.rs", 10, IssueKind::Bug, Severity::Medium)],
+    );
+    let lazy = review("lazy", vec![]);
+    assert!(catches(&planted, &sharp));
+    assert!(!catches(&planted, &lazy));
+    let e = grade(&Truth::ContributedCanary { planted }, &[sharp, lazy]);
+    assert_eq!(
+        net(&e, "sharp"),
+        PARAMS.contributed_canary_catch + PARAMS.completion
+    );
+    assert_eq!(net(&e, "lazy"), PARAMS.canary_miss);
+    assert!(!credits_duty(&e, "lazy"));
+    // The jury's canary record counts "caught a canary" and "missed a canary" only.
+    assert!(e
+        .iter()
+        .all(|x| x.reason != "caught a canary" && x.reason != "missed a canary"));
 }
