@@ -265,6 +265,8 @@ fn suite_runs_show_what_a_patch_does_to_the_projects_tests() {
         RunOutcome::Regressed,
         "{report:#?}"
     );
+    // What the run cost, for pricing it in work units.
+    assert!(report.cpu_ms.is_some(), "{report:#?}");
     let harmless = r.diff(&[("add.sh", Some(format!("{ADD}# comment\n")))]);
     let report = prove(&suite, &tarball(&r), &harmless, &opts());
     assert_eq!(

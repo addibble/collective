@@ -23,7 +23,7 @@ Regression proofs are the only automatic ones, so they get the strictest input. 
 
 A demonstrated proof is still a large step: a juror judges a ten-line test whose behavior has been verified, instead of auditing a whole patch.
 
-A fourth kind, `suite`, is not a challenge proof: it's the run phase of a review task (REVIEWS.md). It runs the project's whole test suite (the ecosystem's standard runner with no selectors, or the project's own test script) on base and with the patch, in the same sandbox. `suite_outcome` reads the report as `passed`, `regressed`, `base_fails`, `flaky` or `inconclusive`, failing closed like `assess`. Runners use the prover as a library through `collective run` on their own machines; submitting a `suite` spec as a challenge proof is refused.
+A fourth kind, `suite`, is not a challenge proof: it's the run phase of a review task (REVIEWS.md). It runs the project's whole test suite (the ecosystem's standard runner with no selectors, or the project's own test script) on base and with the patch, in the same sandbox. `suite_outcome` reads the report as `passed`, `regressed`, `base_fails`, `flaky` or `inconclusive`, failing closed like `assess`. Runners use the prover as a library through `collective run` on their own machines; submitting a `suite` spec as a challenge proof is refused. Every report carries `cpu_ms`: the CPU time (user + system) of everything the prover ran, which prices a review task's run (REVIEWS.md).
 
 ## Verdicts
 

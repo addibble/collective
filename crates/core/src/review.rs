@@ -39,10 +39,14 @@ pub struct ReviewParams {
     /// Most changed lines a patch may have: one task is one review and one
     /// sandbox run, done in one sitting. Larger changes must be split.
     pub max_task_lines: u32,
-    /// Changed lines per work unit. A task is worth ⌈lines / this⌉ units
-    /// (1 to 4), since reading and checking scale with size while sandbox
-    /// setup is a fixed cost.
+    /// Changed lines per work unit of review. Reading a task is worth
+    /// ⌈lines / this⌉ units (1 to 4).
     pub lines_per_unit: u32,
+    /// Sandbox CPU seconds per work unit of running. Fetching, building and
+    /// testing a large project costs far more than a small one, so a run is
+    /// worth ⌈median CPU seconds / this⌉ units, from 1 to `max_run_units`.
+    pub run_cpu_secs_per_unit: u64,
+    pub max_run_units: u32,
     /// Share of review assignments that are canaries, in percent, whenever
     /// canaries are available (see [`pick_task`]). Above about 6% a
     /// reviewer who calls everything clean loses rep on average.
@@ -77,6 +81,8 @@ pub const PARAMS: ReviewParams = ReviewParams {
     redundancy: 3,
     max_task_lines: 2000,
     lines_per_unit: 500,
+    run_cpu_secs_per_unit: 600,
+    max_run_units: 8,
     canary_percent: 10,
     per_adoption: 1,
     free_units: 4,
@@ -113,6 +119,19 @@ pub fn review_cost(units: u32) -> u32 {
 /// an operator has submitted and the adoptions it has reported.
 pub fn duty_required(units: u32, adoptions: u32) -> u32 {
     (review_cost(units) + adoptions * PARAMS.per_adoption).saturating_sub(PARAMS.free_units)
+}
+
+/// Recent tasks looked at for [`may_act`]'s good-standing test.
+pub const STANDING_WINDOW: u32 = 10;
+
+/// Whether an operator owing `owed` units may still submit or adopt.
+/// Normally not: review first, then act. But duty can only be paid while
+/// there is work, and a large project's runs can make even a first patch
+/// cost more work than the queue holds, so an operator in good standing
+/// (no failed task among its last [`STANDING_WINDOW`]) is let through when
+/// nothing is left for it to do. One that skimped stays blocked.
+pub fn may_act(owed: u32, work_available: bool, recent_failures: u32) -> bool {
+    owed == 0 || (!work_available && recent_failures == 0)
 }
 
 /// Work units still owed before the operator may submit or adopt again.
@@ -153,9 +172,15 @@ pub fn check_task_size(files: &[FileDiff]) -> Result<u32, String> {
     Ok(n)
 }
 
-/// Work units one task of `lines` changed lines is worth.
+/// Work units reviewing a task of `lines` changed lines is worth.
 pub fn task_units(lines: u32) -> u32 {
     lines.div_ceil(PARAMS.lines_per_unit).max(1)
+}
+
+/// Work units a run is worth, from the sandbox CPU time it takes.
+pub fn run_units(cpu_ms: u64) -> u32 {
+    let p = &PARAMS;
+    (cpu_ms.div_ceil(p.run_cpu_secs_per_unit * 1000) as u32).clamp(1, p.max_run_units)
 }
 
 /// Whether a reviewer must also run the patch: when the project has a
@@ -460,6 +485,25 @@ pub fn excluded(author_operator: &str, extra: &[String]) -> HashSet<String> {
 pub struct RunClaim {
     pub runner: String,
     pub outcome: RunOutcome,
+    /// The sandbox CPU time the runner reported.
+    #[serde(default)]
+    pub cpu_ms: Option<u64>,
+}
+
+/// The cost of running a task: the median CPU time of conclusive runs,
+/// once at least `quorum` of them report one. One runner can't inflate it,
+/// and colluding to inflate it means agreeing across random assignments.
+pub fn median_cpu_ms(claims: &[RunClaim]) -> Option<u64> {
+    let mut v: Vec<u64> = claims
+        .iter()
+        .filter(|c| c.outcome.conclusive())
+        .filter_map(|c| c.cpu_ms)
+        .collect();
+    if v.len() < PARAMS.quorum {
+        return None;
+    }
+    v.sort_unstable();
+    Some(v[(v.len() - 1) / 2])
 }
 
 /// The outcome most runners agree on: at least `quorum` conclusive claims,

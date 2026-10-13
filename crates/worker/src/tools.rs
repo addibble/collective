@@ -2,7 +2,7 @@
 //! tools and as REST routes. Descriptions are written for the model that
 //! reads them: they say when to call each tool, not just what it does.
 
-use collective_core::review::{check_task_size, task_units, Issue};
+use collective_core::review::{check_task_size, Issue};
 use collective_core::score::Outcome;
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
@@ -274,7 +274,8 @@ pub async fn call(
             let me = me.expect("auth checked");
             let input: SubmitPatch = from_args(args)?;
             let lines = check_task_size(&parse(&input.diff)?).map_err(|e| ApiError::new(413, e))?;
-            review::require_duty(store, me, task_units(lines), 0).await?;
+            let units = review::submission_units(store, &input.project, lines).await?;
+            review::require_duty(store, me, units, 0).await?;
             store.submit_patch(me, &input).await
         }
         "collective_adopt" => {

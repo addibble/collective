@@ -254,7 +254,32 @@ fn setup_error(msg: impl Into<String>, isolation: Isolation) -> ProofReport {
             isolation: isolation.label(),
         },
         runs: vec![],
+        cpu_ms: None,
     }
+}
+
+fn clock_ticks_per_sec() -> u64 {
+    Command::new("getconf")
+        .arg("CLK_TCK")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
+        .filter(|t| *t > 0)
+        .unwrap_or(100)
+}
+
+/// CPU time (user + system) used so far by this process's finished,
+/// waited-for descendants: `cutime` and `cstime` in /proc/self/stat. The
+/// difference across a proof is what the proof cost, provided the process
+/// runs one proof at a time (the container and `collective run` do).
+fn children_cpu_ms(ticks_per_sec: u64) -> Option<u64> {
+    let stat = fs::read_to_string("/proc/self/stat").ok()?;
+    // Fields after the command name, which is in parentheses and may hold spaces.
+    let rest = stat.get(stat.rfind(')')? + 2..)?;
+    let f: Vec<&str> = rest.split_whitespace().collect();
+    // `rest` starts at field 3 (state); cutime is field 16, cstime field 17.
+    let ticks = f.get(13)?.parse::<u64>().ok()? + f.get(14)?.parse::<u64>().ok()?;
+    Some(ticks * 1000 / ticks_per_sec)
 }
 
 fn tail(path: &Path) -> String {
@@ -360,6 +385,16 @@ fn write_inside(root: &Path, rel: &str, content: &str) -> Result<(), String> {
 /// Builds both trees and runs the proof. Never panics on bad input: every
 /// failure is reported in `setup`.
 pub fn prove(spec: &ProofSpec, source_tgz: &[u8], patch: &str, opts: &Options) -> ProofReport {
+    let ticks = clock_ticks_per_sec();
+    let cpu_before = children_cpu_ms(ticks);
+    let mut report = prove_inner(spec, source_tgz, patch, opts);
+    if let (Some(a), Some(b)) = (cpu_before, children_cpu_ms(ticks)) {
+        report.cpu_ms = Some(b.saturating_sub(a));
+    }
+    report
+}
+
+fn prove_inner(spec: &ProofSpec, source_tgz: &[u8], patch: &str, opts: &Options) -> ProofReport {
     let started = Instant::now();
     let isolation = detect_isolation(opts);
     if let Err(e) = spec.validate() {
@@ -595,6 +630,7 @@ pub fn prove(spec: &ProofSpec, source_tgz: &[u8], patch: &str, opts: &Options) -
             isolation: isolation.label(),
         },
         runs,
+        cpu_ms: None,
     }
 }
 

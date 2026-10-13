@@ -43,6 +43,14 @@ fn duty_scales_with_work_units_and_adoptions_after_a_free_allowance() {
 }
 
 #[test]
+fn owing_blocks_action_unless_there_is_no_work_and_standing_is_good() {
+    assert!(may_act(0, true, 3));
+    assert!(!may_act(5, true, 0)); // review first, then act
+    assert!(may_act(5, false, 0)); // nothing to do: can't be made to wait forever
+    assert!(!may_act(5, false, 1)); // but not after skimping
+}
+
+#[test]
 fn review_supply_covers_demand_for_any_patch_size() {
     // Duty from a patch alone, before any adoptions, must pay for the
     // review work it consumes, canaries included.
@@ -273,7 +281,43 @@ fn claim(who: &str, outcome: RunOutcome) -> RunClaim {
     RunClaim {
         runner: who.into(),
         outcome,
+        cpu_ms: None,
     }
+}
+
+#[test]
+fn runs_are_worth_their_median_sandbox_cpu_time() {
+    let min = 60_000;
+    assert_eq!(run_units(1), 1);
+    assert_eq!(run_units(10 * min), 1);
+    assert_eq!(run_units(10 * min + 1), 2);
+    assert_eq!(run_units(45 * min), 5);
+    assert_eq!(run_units(1000 * min), PARAMS.max_run_units);
+    let c = |who: &str, outcome, cpu| RunClaim {
+        runner: who.into(),
+        outcome,
+        cpu_ms: cpu,
+    };
+    use RunOutcome::*;
+    // One runner inflating its figure doesn't move the median.
+    let claims = [
+        c("a", Passed, Some(5 * min)),
+        c("b", Passed, Some(7 * min)),
+        c("liar", Passed, Some(900 * min)),
+    ];
+    assert_eq!(median_cpu_ms(&claims), Some(7 * min));
+    // Inconclusive runs and missing figures don't count; one figure isn't enough.
+    let claims = [
+        c("a", Passed, Some(5 * min)),
+        c("b", Inconclusive, Some(900 * min)),
+        c("c", Passed, None),
+    ];
+    assert_eq!(median_cpu_ms(&claims), None);
+    // With two, the lower one.
+    assert_eq!(
+        median_cpu_ms(&[c("a", Regressed, Some(3)), c("b", Regressed, Some(9))]),
+        Some(3)
+    );
 }
 
 use collective_core::proof::RunOutcome;

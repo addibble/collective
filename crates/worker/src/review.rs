@@ -9,9 +9,10 @@
 use collective_core::diff::FileDiff;
 use collective_core::proof::{suite_outcome, ProofReport, ProofSpec, RunOutcome};
 use collective_core::review::{
-    changed_lines, credits_duty, duty_owed, duty_required, grade, grade_runs, next_step, pick_task,
-    run_completes, run_majority, run_required, task_id, task_units, Issue, Location, NextStep,
-    OpenShard, Review, RunClaim, Truth, PARAMS,
+    changed_lines, credits_duty, duty_owed, duty_required, grade, grade_runs, may_act,
+    median_cpu_ms, next_step, pick_task, run_completes, run_majority, run_required, task_id,
+    task_units, Issue, Location, NextStep, OpenShard, Review, RunClaim, Truth, PARAMS,
+    STANDING_WINDOW,
 };
 use collective_core::LedgerEntry;
 use serde::Deserialize;
@@ -34,7 +35,9 @@ pub struct ShardRow {
     pub id: String,
     pub patch_id: String,
     pub changed_lines: f64,
-    pub units: f64,
+    pub review_units: f64,
+    pub run_units: f64,
+    pub run_measured: f64,
     pub wanted: f64,
     pub canary: f64,
     pub planted: Option<String>,
@@ -65,14 +68,20 @@ pub async fn create_task(
 ) -> ApiResult<String> {
     let lines = changed_lines(files);
     let id = task_id(&patch.id);
+    let (review, run) = (
+        task_units(lines),
+        estimated_run_units(store, &patch.project_id).await?,
+    );
     store.db.run(
-        "INSERT OR IGNORE INTO shards (id, patch_id, idx, path, hunk_start, hunk_end, changed_lines, units, author_op, wanted, canary, planted, expected_run, created_at)
-         VALUES (?, ?, 0, '', 0, 0, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT OR IGNORE INTO shards (id, patch_id, idx, path, hunk_start, hunk_end, changed_lines, units, review_units, run_units, author_op, wanted, canary, planted, expected_run, created_at)
+         VALUES (?, ?, 0, '', 0, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         args![
             &id,
             &patch.id,
             lines,
-            task_units(lines),
+            review + run,
+            review,
+            run,
             &patch.author_op,
             PARAMS.redundancy,
             planted.is_some(),
@@ -83,6 +92,38 @@ pub async fn create_task(
     )
     .await?;
     Ok(id)
+}
+
+/// What running a new task of this project will likely cost, in work
+/// units: the project's last measured median, 1 before any measurement,
+/// and 0 for projects without a test suite.
+pub async fn estimated_run_units(store: &Store, project_id: &str) -> ApiResult<u32> {
+    #[derive(Deserialize)]
+    struct R {
+        run_spec: Option<String>,
+        run_units: Option<f64>,
+    }
+    let row = store
+        .db
+        .first::<R>(
+            "SELECT run_spec, run_units FROM projects WHERE id = ?",
+            args![project_id],
+        )
+        .await?;
+    Ok(match row {
+        Some(r) if r.run_spec.is_some() => r.run_units.map_or(1, |u| u as u32),
+        _ => 0,
+    })
+}
+
+/// Work units a new submission of `lines` changed lines to `project` is
+/// worth, for the duty check before it is accepted.
+pub async fn submission_units(store: &Store, project: &str, lines: u32) -> ApiResult<u32> {
+    let run = match store.project(project, false).await? {
+        Some(p) => estimated_run_units(store, &p.id).await?,
+        None => 0,
+    };
+    Ok(task_units(lines) + run)
 }
 
 pub struct Duty {
@@ -108,7 +149,8 @@ async fn activity(store: &Store, operator_id: &str) -> ApiResult<(u32, u32, u32)
         .await?;
     let credited = store
         .count(
-            "SELECT COALESCE(SUM(s.units), 0) AS n FROM review_tasks t JOIN shards s ON s.id = t.shard_id
+            "SELECT COALESCE(SUM(s.review_units + CASE WHEN t.run_outcome IS NOT NULL THEN s.run_units ELSE 0 END), 0) AS n
+             FROM review_tasks t JOIN shards s ON s.id = t.shard_id
              WHERE t.operator_id = ? AND t.credited = 1",
             args![operator_id],
         )
@@ -136,10 +178,50 @@ pub async fn require_duty(
 ) -> ApiResult<()> {
     let (mine, adopts, credited) = activity(store, &agent.operator_id).await?;
     let owed = duty_owed(mine + units, adopts + adoptions, credited);
-    if owed > 0 {
+    if owed > 0
+        && !may_act(
+            owed,
+            work_available(store, &agent.operator_id).await?,
+            recent_failures(store, &agent.operator_id).await?,
+        )
+    {
         return status(402, format!("review duty: {owed} work unit(s) owed before this action. Call collective_review_next and complete what you are given."));
     }
     Ok(())
+}
+
+/// Whether the operator holds a task or could be given one now.
+async fn work_available(store: &Store, operator_id: &str) -> ApiResult<bool> {
+    let t = now();
+    let n = store
+        .count(
+            "SELECT COUNT(*) AS n FROM (
+               SELECT 1 FROM review_tasks WHERE operator_id = ? AND phase IN ('review','run') AND expires_at > ?
+               UNION ALL
+               SELECT 1 FROM shards s JOIN patches p ON p.id = s.patch_id
+               WHERE s.state = 'open' AND s.author_op != ? AND p.status NOT IN ('withdrawn','rejected')
+                 AND NOT EXISTS (SELECT 1 FROM review_tasks r WHERE r.shard_id = s.id AND r.operator_id = ?)
+                 AND (SELECT COUNT(*) FROM review_tasks r WHERE r.shard_id = s.id AND (r.submitted_at IS NOT NULL OR r.expires_at > ?)) < s.wanted
+               LIMIT 1)",
+            args![operator_id, t, operator_id, operator_id, t],
+        )
+        .await?;
+    Ok(n > 0)
+}
+
+/// Failed tasks among the operator's most recent ones: a review graded as
+/// failed, or a run phase that ended, or lapsed, without a completing run.
+async fn recent_failures(store: &Store, operator_id: &str) -> ApiResult<u32> {
+    store
+        .count(
+            "SELECT COUNT(*) AS n FROM (
+               SELECT review_ok, run_ok, phase, expires_at FROM review_tasks
+               WHERE operator_id = ? AND submitted_at IS NOT NULL
+               ORDER BY submitted_at DESC LIMIT ?)
+             WHERE review_ok = 0 OR (phase = 'done' AND run_ok = 0) OR (phase = 'run' AND expires_at < ?)",
+            args![operator_id, STANDING_WINDOW, now()],
+        )
+        .await
 }
 
 fn seed_secret(store: &Store) -> String {
@@ -318,7 +400,11 @@ Reviews are graded: missing a planted or confirmed problem costs rep, and so doe
             "base_commit": patch.base_commit,
             "intent": ctx.map(|c| c.text),
             "changed_lines": shard.changed_lines as u32,
-            "units": shard.units as u32,
+            "units": {
+                "review": shard.review_units as u32,
+                "run": shard.run_units as u32,
+                "run_measured": shard.run_measured > 0.0,
+            },
             "diff": store.diff_text(&patch.id).await?,
             "run": run,
             "source": format!("/v1/reviews/{}/source", shard.id),
@@ -583,6 +669,7 @@ pub async fn submit_run(
     let me = RunClaim {
         runner: agent.operator_id.clone(),
         outcome,
+        cpu_ms: sub.report.cpu_ms,
     };
 
     // Canaries have a known outcome; real tasks are checked against the
@@ -608,8 +695,8 @@ pub async fn submit_run(
     }
     let ok = run_completes(outcome, &entries, &me.runner);
     store.db.run(
-        "UPDATE review_tasks SET phase = 'done', run_outcome = ?, run_report = ?, run_submitted_at = ?, run_ok = ?, credited = review_ok * ? WHERE shard_id = ? AND operator_id = ?",
-        args![outcome_str(outcome), report_json, now(), ok, ok, shard_id, &agent.operator_id],
+        "UPDATE review_tasks SET phase = 'done', run_outcome = ?, run_report = ?, run_submitted_at = ?, run_cpu_ms = ?, run_ok = ?, credited = review_ok * ? WHERE shard_id = ? AND operator_id = ?",
+        args![outcome_str(outcome), report_json, now(), sub.report.cpu_ms.map(|c| c as f64), ok, ok, shard_id, &agent.operator_id],
     )
     .await?;
     store.credit(&entries, &format!("run:{shard_id}")).await?;
@@ -632,6 +719,25 @@ pub async fn submit_run(
                 store
                     .credit(&grade_runs(None, &claims), &format!("run:{shard_id}"))
                     .await?;
+                // Price the run by what it actually took: the task's units
+                // (what its author owes, and what each runner is credited)
+                // and the project's estimate for its next tasks.
+                if let Some(cpu) = median_cpu_ms(&claims) {
+                    let units = collective_core::review::run_units(cpu);
+                    store
+                        .db
+                        .batch(vec![
+                            store.db.stmt(
+                                "UPDATE shards SET run_units = ?, units = review_units + ?, run_measured = 1 WHERE id = ?",
+                                args![units, units, shard_id],
+                            )?,
+                            store.db.stmt(
+                                "UPDATE projects SET run_units = ? WHERE id = ?",
+                                args![units, &patch.project_id],
+                            )?,
+                        ])
+                        .await?;
+                }
                 if majority == Some(RunOutcome::Regressed) {
                     let first = claims
                         .iter()
@@ -653,11 +759,12 @@ async fn run_claims(store: &Store, shard_id: &str) -> ApiResult<Vec<RunClaim>> {
     struct R {
         operator_id: String,
         run_outcome: String,
+        run_cpu_ms: Option<f64>,
     }
     let rows: Vec<R> = store
         .db
         .all(
-            "SELECT operator_id, run_outcome FROM review_tasks WHERE shard_id = ? AND run_outcome IS NOT NULL ORDER BY run_submitted_at, operator_id",
+            "SELECT operator_id, run_outcome, run_cpu_ms FROM review_tasks WHERE shard_id = ? AND run_outcome IS NOT NULL ORDER BY run_submitted_at, operator_id",
             args![shard_id],
         )
         .await?;
@@ -667,6 +774,7 @@ async fn run_claims(store: &Store, shard_id: &str) -> ApiResult<Vec<RunClaim>> {
             Some(RunClaim {
                 outcome: parse_outcome(&r.run_outcome)?,
                 runner: r.operator_id,
+                cpu_ms: r.run_cpu_ms.map(|c| c as u64),
             })
         })
         .collect())

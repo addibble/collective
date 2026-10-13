@@ -48,6 +48,7 @@ fn report(base: &[RunStatus], patched: &[RunStatus]) -> ProofReport {
             .map(|r| run(Tree::Base, r))
             .chain(patched.iter().enumerate().map(|r| run(Tree::Patched, r)))
             .collect(),
+        cpu_ms: None,
     }
 }
 

@@ -429,6 +429,11 @@ pub struct ProofReport {
     pub prover_version: String,
     pub setup: SetupResult,
     pub runs: Vec<RunResult>,
+    /// CPU time (user + system) of everything the prover ran: dependency
+    /// fetch, builds and runs. Measured by whoever ran the prover, so a
+    /// runner's figure is a claim (see `review::median_cpu_ms`).
+    #[serde(default)]
+    pub cpu_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
