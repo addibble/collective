@@ -1,7 +1,7 @@
 [package]
 name = "collective-core"
 version = "0.1.0"
-description = "Collective's protocol: diffs, duplicate detection, usage scoring, convergence, challenges, juries and review duty."
+description = "Collective's protocol: diffs, duplicate detection, usage scoring, convergence, challenges, juries, review duty and git hosting."
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -10,6 +10,8 @@ rust-version.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+sha1.workspace = true
+miniz_oxide.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

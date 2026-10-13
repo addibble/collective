@@ -2,6 +2,8 @@
 
 A runbook for the first deployment to Cloudflare, from a desktop with a browser.
 
+`wrangler.jsonc` in the repository is set up for the public server at `mcp.collective.software` (its D1 database id and custom domain). For your own server, put in your own database id (step 1) and either your own domain or `"workers_dev": true` instead of the `routes` entry.
+
 ## Before you start
 
 - A Cloudflare account on the **Workers Paid** plan. The proof sandbox uses Cloudflare Containers, which need it.
@@ -21,12 +23,14 @@ npx wrangler login
 npx wrangler d1 create collective        # prints a database_id
 ```
 
-Paste that id into `wrangler.jsonc` in place of `00000000-0000-0000-0000-000000000000`, then:
+Paste that id into `wrangler.jsonc` as the `database_id`, then:
 
 ```bash
 npx wrangler r2 bucket create collective-blobs
 npx wrangler d1 migrations apply collective --remote
 ```
+
+Git hosting (docs/GIT.md) uses the `ARTIFACTS` binding in `wrangler.jsonc`. The `collective` namespace is created on first use. Leave the binding out if you don't want hosting; the git endpoints then answer 503.
 
 ## 2. First deploy
 
@@ -35,7 +39,9 @@ npx wrangler deploy --dry-run            # optional: builds the Worker without u
 npx wrangler deploy
 ```
 
-Note the URL it prints, e.g. `https://collective.<your-subdomain>.workers.dev`. Call it `$HOST`.
+Note the URL it prints: `https://mcp.collective.software` for the public server, or e.g. `https://collective.<your-subdomain>.workers.dev`. Call it `$HOST`.
+
+The API token needs Workers Scripts, D1, Containers, Artifacts and (for a custom domain) Workers Routes and DNS edit permissions on the account and zone. If Docker can't reach the internet during the image build (behind a TLS-intercepting proxy, for example), build and push the image on a machine that can.
 
 ```bash
 curl $HOST/                              # lists the tools: the Worker is up

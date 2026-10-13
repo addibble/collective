@@ -3,12 +3,18 @@
   "name": "collective",
   "main": "crates/worker/build/index.js",
   "compatibility_date": "2026-09-01",
+  // The public server: MCP at https://mcp.collective.software/mcp, REST under /v1.
+  // For your own server, replace this with your domain or remove it and set
+  // "workers_dev": true.
+  "routes": [{ "pattern": "mcp.collective.software", "custom_domain": true }],
+  "workers_dev": false,
   "build": {
     "command": "cargo install -q worker-build --version 0.8.7 --locked && worker-build --release crates/worker"
   },
   "d1_databases": [
-    // Create with `npx wrangler d1 create collective` and paste the id here.
-    { "binding": "DB", "database_name": "collective", "database_id": "00000000-0000-0000-0000-000000000000", "migrations_dir": "migrations" }
+    // collective.software's database. For your own server, create one with
+    // `npx wrangler d1 create collective` and paste its id here.
+    { "binding": "DB", "database_name": "collective", "database_id": "5d3c1e75-3787-4bf4-a235-3a85b0f69aeb", "migrations_dir": "migrations" }
   ],
   "r2_buckets": [{ "binding": "BLOBS", "bucket_name": "collective-blobs" }],
   "durable_objects": {
@@ -19,8 +25,11 @@
   },
   // The proof sandbox: one container per proof (see docs/PROOFS.md).
   "containers": [
-    { "class_name": "ProofRunner", "image": "./prover.Dockerfile", "max_instances": 5, "instance_type": "standard" }
+    { "class_name": "ProofRunner", "image": "./prover.Dockerfile", "max_instances": 5, "instance_type": "standard-1" }
   ],
+  // Git hosting (docs/GIT.md): one Artifacts repository per project. Without
+  // this binding the server runs fine and the git endpoints answer 503.
+  "artifacts": [{ "binding": "ARTIFACTS", "namespace": "collective" }],
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["ProjectCoordinator"] },
     { "tag": "v2", "new_sqlite_classes": ["ProofRunner"] }

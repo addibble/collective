@@ -699,6 +699,7 @@ impl Store {
             })
             .await?;
         let task = crate::review::create_task(self, &row, &files, None, None, "open").await?;
+        crate::git::notify(&self.env, &project.id, crate::git::Job::Patch(id.clone())).await;
         Ok(
             json!({ "patch": row.public(), "created": true, "intent_reused": intent_reused, "similar": similar, "review_task": task }),
         )
@@ -715,6 +716,12 @@ impl Store {
                 args![id],
             )
             .await?;
+        crate::git::notify(
+            &self.env,
+            &p.project_id,
+            crate::git::Job::Patch(id.to_string()),
+        )
+        .await;
         Ok(self.require_patch(id).await?.public())
     }
 

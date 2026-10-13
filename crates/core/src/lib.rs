@@ -10,6 +10,7 @@
 pub mod challenge;
 pub mod converge;
 pub mod diff;
+pub mod git;
 pub mod hash;
 pub mod jury;
 pub mod proof;

@@ -186,6 +186,14 @@ Each successful flip roughly doubles the next bond; large disputes go to a jury.
             json!({ "type": "object", "properties": { "project": project_prop(), "base_commit": { "type": "string" }, "include_diff": { "type": "boolean", "default": true } }, "required": ["project", "base_commit"] })
         },
     },
+    Tool {
+        name: "collective_git",
+        description: "Get the project's Git remote and a short-lived read token, to `git fetch` patches and trunks as branches instead of downloading diffs: \
+`patch/<patch id>` is one commit (the patch on its base), `trunk/<base commit>` is the converged trunk. Pass `patch_id` or `base_commit` to see that branch's state; asking also queues a branch that is missing. \
+Send the token as a header (`git -c http.extraHeader=\"Authorization: Bearer <token>\" fetch <remote> <branch>`), never in the URL. A branch is the same code as the diff: read it before you use it.",
+        auth: true,
+        schema: || json!({ "type": "object", "properties": { "project": project_prop(), "patch_id": { "type": "string" }, "base_commit": { "type": "string" } }, "required": ["project"] }),
+    },
 ];
 
 fn str_arg<'a>(args: &'a Value, key: &str) -> ApiResult<&'a str> {
@@ -338,6 +346,16 @@ pub async fn call(
             store
                 .leaderboard(str_arg(args, "project")?, opt_str(args, "base_commit"))
                 .await
+        }
+        "collective_git" => {
+            crate::git::access(
+                store,
+                env,
+                str_arg(args, "project")?,
+                opt_str(args, "patch_id"),
+                opt_str(args, "base_commit"),
+            )
+            .await
         }
         "collective_trunk" => {
             let (p, base) = (str_arg(args, "project")?, str_arg(args, "base_commit")?);

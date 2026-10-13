@@ -92,7 +92,12 @@ async fn sync_quarantine(store: &Store, patch_id: &str) -> ApiResult<()> {
     store
         .db
         .run("UPDATE patches SET status = ? WHERE id = ? AND status IN ('open','converged','quarantined','rejected')", args![status, patch_id])
-        .await
+        .await?;
+    // A patch under challenge loses its branch until it is cleared.
+    if let Some(p) = store.patch_row(patch_id).await? {
+        crate::git::notify(&store.env, &p.project_id, crate::git::Job::Patch(p.id)).await;
+    }
+    Ok(())
 }
 
 async fn insert(
@@ -445,6 +450,18 @@ async fn finalize(store: &Store, c: &Challenge, row: &Row) -> ApiResult<Value> {
 /// and sends their shards back for review.
 pub async fn ban(store: &Store, operator_id: &str, reason: &str) -> ApiResult<()> {
     let t = now();
+    #[derive(Deserialize)]
+    struct P {
+        id: String,
+        project_id: String,
+    }
+    let quarantined: Vec<P> = store
+        .db
+        .all(
+            "SELECT id, project_id FROM patches WHERE author_op = ? AND status IN ('open','converged')",
+            args![operator_id],
+        )
+        .await?;
     store
         .db
         .batch(vec![
@@ -456,7 +473,11 @@ pub async fn ban(store: &Store, operator_id: &str, reason: &str) -> ApiResult<()
                 args![collective_core::review::PARAMS.redundancy, operator_id],
             )?,
         ])
-        .await
+        .await?;
+    for p in quarantined {
+        crate::git::notify(&store.env, &p.project_id, crate::git::Job::Patch(p.id)).await;
+    }
+    Ok(())
 }
 
 pub async fn list_for_patch(store: &Store, patch_id: &str) -> ApiResult<Value> {

@@ -4,6 +4,7 @@ mod challenges;
 mod contributions;
 mod db;
 mod error;
+mod git;
 mod identity;
 mod project;
 mod proofs;
@@ -357,6 +358,11 @@ async fn route(req: &mut Request, env: &Env) -> ApiResult<Response> {
         (Method::Get, ["v1", "projects", p, "trunks", base, "diff"]) => {
             Ok(diff_response(store.trunk_diff(p, base).await?)?)
         }
+        (Method::Get, ["v1", "projects", p, "git"]) => {
+            let mut q = query(req)?;
+            q["project"] = json!(p);
+            ok(call("collective_git", q).await?)
+        }
         (Method::Post, ["v1", "projects", p, "trunks", base, "converge"]) => {
             require(&agent)?;
             let project = store.require_project(p, false).await?;
@@ -397,6 +403,30 @@ async fn route(req: &mut Request, env: &Env) -> ApiResult<Response> {
                 )
                 .await?;
             ok(json!({ "pool": store.balance(POOL).await? }))
+        }
+        (Method::Post, ["v1", "admin", "projects"]) => {
+            // Registers a project before its first patch and starts its
+            // repository import, e.g. to host Collective itself.
+            require_admin(req, env)?;
+            let upstream = body(req).await?["upstream"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            let project = store.require_project(&upstream, true).await?;
+            // Asking again retries a repository whose import failed.
+            store
+                .db
+                .run(
+                    "DELETE FROM git_repos WHERE project_id = ? AND status = 'failed'",
+                    args![&project.id],
+                )
+                .await?;
+            git::notify(env, &project.id, git::Job::Repo).await;
+            ok(json!({ "project": project, "git": git::enabled(env) }))
+        }
+        (Method::Post, ["v1", "admin", "projects", p, "git", "sync"]) => {
+            require_admin(req, env)?;
+            ok(git::sync_all(&store, env, p).await?)
         }
         (Method::Put, ["v1", "admin", "projects", p, "run"]) => {
             require_admin(req, env)?;
