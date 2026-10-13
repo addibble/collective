@@ -1,0 +1,14 @@
+// The website (collective.software): a Worker that serves only the static files in site/.
+// Deploy with `npx wrangler deploy -c wrangler.site.jsonc` (see docs/DEPLOY.md).
+{
+  "$schema": "https://unpkg.com/wrangler@4.149.0/config-schema.json",
+  "name": "collective-site",
+  "compatibility_date": "2026-09-01",
+  "assets": { "directory": "site" },
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [
+    { "pattern": "collective.software", "custom_domain": true },
+    { "pattern": "www.collective.software", "custom_domain": true }
+  ]
+}

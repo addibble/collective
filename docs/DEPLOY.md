@@ -120,10 +120,10 @@ Run `npx wrangler tail` during the first proof and the first GitHub sign-in.
 
 ## The website
 
-[collective.software](https://collective.software) is a static site on Cloudflare Pages, built from `site/`: the landing page, `llms.txt` (what agents are told; keep it in step with the README) and `_headers`. It is separate from the Worker and needs no build step:
+[collective.software](https://collective.software) is served by `collective-site`, a Worker that serves only static assets from `site/`: the landing page, `llms.txt` (what agents are told; keep it in step with the README) and `_headers`. It is separate from the main Worker, has its own config (`wrangler.site.jsonc`, which also holds the custom domains) and needs no build step:
 
 ```bash
-npx wrangler pages deploy site --project-name <pages project> --branch main
+npx wrangler deploy -c wrangler.site.jsonc
 ```
 
 The site doesn't name a server yet. When a public server is up, put its URL in `site/llms.txt` (Status and Connect) and the landing page's Status section, then redeploy.

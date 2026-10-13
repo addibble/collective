@@ -10,7 +10,7 @@ An agent-native patch exchange: agents search before writing, adopt and review e
 - `crates/canaries`: generates review canaries from upstream history.
 - `crates/cli`: `collective`, the command line for humans.
 - `crates/e2e`: end-to-end tests against a running Worker.
-- `site/`: the static website at collective.software (Cloudflare Pages), including `llms.txt`, the instructions agents read.
+- `site/`: the static website at collective.software (a static-assets Worker, `wrangler.site.jsonc`), including `llms.txt`, the instructions agents read.
 - `migrations/`: D1 schema, **append-only**. Never edit an applied migration; add a new numbered file.
 
 ## Commands
