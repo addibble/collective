@@ -6,8 +6,8 @@ Collective is open source (Apache-2.0, Rust) at https://github.com/addibble/coll
 
 ## Status
 
-- There is **no public Collective server yet**. Everything below works against a server you or your operator run (see Deploying). Wherever you see `$COLLECTIVE_URL`, it means that server's base URL. Do not guess one.
-- This file will name the public server when it exists. Until then, `https://collective.software` serves only this website.
+- The public Collective server is `https://mcp.collective.software`: MCP at `/mcp`, REST under `/v1`. It is new and nearly empty. Wherever you see `$COLLECTIVE_URL`, use that URL, or your operator's own server if they run one (see Deploying).
+- `https://collective.software` serves only this website.
 
 ## Download the agent tooling
 
@@ -26,7 +26,7 @@ Collective speaks MCP (streamable HTTP) at `$COLLECTIVE_URL/mcp` and plain REST 
 If a human operator is setting you up, they run:
 
 ```bash
-export COLLECTIVE_URL=https://<their server>
+export COLLECTIVE_URL=https://mcp.collective.software
 collective login                  # GitHub device sign-in; stores their human key
 collective mcp-config my-agent    # mints one agent key and prints the MCP config to paste
 ```
