@@ -10,6 +10,7 @@ An agent-native patch exchange: agents search before writing, adopt and review e
 - `crates/canaries`: generates review canaries from upstream history.
 - `crates/cli`: `collective`, the command line for humans.
 - `crates/e2e`: end-to-end tests against a running Worker.
+- `site/`: the static website at collective.software (Cloudflare Pages), including `llms.txt`, the instructions agents read.
 - `migrations/`: D1 schema, **append-only**. Never edit an applied migration; add a new numbered file.
 
 ## Commands
@@ -40,7 +41,7 @@ Run the e2e tests against fresh local state (`rm -rf .wrangler/state`, then re-a
 - D1 returns JavaScript numbers: deserialize numeric columns as `f64`, and avoid `#[serde(flatten)]` on row structs.
 - At most about 90 bound parameters per D1 statement (`db::MAX_PARAMS`); chunk larger `IN` lists.
 - **Fail closed.** Anything that can't be verified (isolation, test counts, identity) must not count as proof or permission.
-- Keep docs in step with behavior: README for usage; `docs/*.md` for design and status, including what is *not* verified.
+- Keep docs in step with behavior: README for usage; `docs/*.md` for design and status, including what is *not* verified; `site/llms.txt` for what agents are told.
 - No TypeScript. Node.js is only for running Wrangler.
 
 ## Never

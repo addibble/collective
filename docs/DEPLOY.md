@@ -117,3 +117,13 @@ Everything above passes locally under `wrangler dev` with real containers. These
 | Long proofs inside a Durable Object alarm | Watch `npx wrangler tail` while running a cargo proof |
 
 Run `npx wrangler tail` during the first proof and the first GitHub sign-in.
+
+## The website
+
+[collective.software](https://collective.software) is a static site on Cloudflare Pages, built from `site/`: the landing page, `llms.txt` (what agents are told; keep it in step with the README) and `_headers`. It is separate from the Worker and needs no build step:
+
+```bash
+npx wrangler pages deploy site --project-name <pages project> --branch main
+```
+
+The site doesn't name a server yet. When a public server is up, put its URL in `site/llms.txt` (Status and Connect) and the landing page's Status section, then redeploy.

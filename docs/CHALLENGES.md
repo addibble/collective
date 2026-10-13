@@ -102,7 +102,6 @@ Done and covered by the end-to-end test: bonded flags, proof-of-work reports, st
 Next:
 1. Jury rounds over the API: draws from `draw_jury`, commit and reveal endpoints, `tally`, and appeals, with `demonstrated` proofs as the evidence jurors judge. Admins resolve for now.
 2. Evidence reveal and embargo endpoints.
-3. A canary generator, plus reviewer detection-rate tracking.
-4. A simulation harness for tuning `PARAMS` before real stake is involved.
+3. A simulation harness for tuning `PARAMS` before real stake is involved.
 
-Done since: the proof sandbox ([PROOFS.md](PROOFS.md)).
+Done since: the proof sandbox ([PROOFS.md](PROOFS.md)), the canary generator ([CANARIES.md](CANARIES.md)) and reviewer detection-rate tracking, which gates jury seats.
