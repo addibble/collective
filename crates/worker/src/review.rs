@@ -56,6 +56,10 @@ pub struct ShardRow {
     pub vouched_at: Option<f64>,
     #[serde(default)]
     pub vouch_settled: Option<String>,
+    /// Created while the project's environment was quarantined: no run
+    /// phase, whether or not the project has a suite.
+    #[serde(default)]
+    pub review_only: f64,
 }
 
 fn outcome_str(o: RunOutcome) -> String {
@@ -74,7 +78,9 @@ pub(crate) fn parse_outcome(s: &str) -> Option<RunOutcome> {
 /// `expected_run` are for canaries only. `state` is where it starts: `open`,
 /// `pending` for a real patch whose author lacks standing
 /// (`vouch::initial_state`), or `verifying` for a contributed canary;
-/// canaries are never pending.
+/// canaries are never pending. While the project's environment is
+/// quarantined the task is review-only: no run phase and no run units, as
+/// for a project without a suite, still pinned to the quarantined version.
 pub async fn create_task(
     store: &Store,
     patch: &PatchRow,
@@ -86,13 +92,15 @@ pub async fn create_task(
 ) -> ApiResult<String> {
     let lines = changed_lines(files);
     let id = task_id(&patch.id);
-    let (review, run) = (
-        task_units(lines),
-        estimated_run_units(store, &patch.project_id).await?,
-    );
+    let review = task_units(lines);
+    let run = if environment.runs() {
+        estimated_run_units(store, &patch.project_id).await?
+    } else {
+        0
+    };
     store.db.run(
-        "INSERT OR IGNORE INTO shards (id, patch_id, idx, path, hunk_start, hunk_end, changed_lines, units, review_units, run_units, author_op, wanted, canary, planted, expected_run, state, created_at, environment_id, environment_kind)
-         VALUES (?, ?, 0, '', 0, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT OR IGNORE INTO shards (id, patch_id, idx, path, hunk_start, hunk_end, changed_lines, units, review_units, run_units, author_op, wanted, canary, planted, expected_run, state, created_at, environment_id, environment_kind, review_only)
+         VALUES (?, ?, 0, '', 0, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         args![
             &id,
             &patch.id,
@@ -109,6 +117,7 @@ pub async fn create_task(
             now(),
             pin_id(environment),
             kind(environment),
+            !environment.runs(),
         ],
     )
     .await?;
@@ -141,8 +150,11 @@ pub async fn estimated_run_units(store: &Store, project_id: &str) -> ApiResult<u
 /// worth, for the duty check before it is accepted.
 pub async fn submission_units(store: &Store, project: &str, lines: u32) -> ApiResult<u32> {
     let run = match store.project(project, false).await? {
-        Some(p) => estimated_run_units(store, &p.id).await?,
-        None => 0,
+        // A quarantined project's tasks are review-only (`create_task`).
+        Some(p) if crate::environments::current(store, &p.id).await?.runs() => {
+            estimated_run_units(store, &p.id).await?
+        }
+        _ => 0,
     };
     Ok(task_units(lines) + run)
 }
@@ -237,6 +249,26 @@ fn seed_secret(store: &Store) -> String {
         .secret("REVIEW_SEED_SECRET")
         .map(|s| s.to_string())
         .unwrap_or_else(|_| "dev-seed".into())
+}
+
+/// The suite a task's runners run, if its runs are owed: the project's
+/// run spec, unless the task is review-only (created while the project's
+/// environment was quarantined) or its pinned environment is quarantined
+/// now, since nothing runs in a quarantined environment. Not yet filled
+/// with the pinned environment (`fill`).
+pub async fn task_runs(
+    store: &Store,
+    shard: &ShardRow,
+    project_id: &str,
+) -> ApiResult<Option<ProofSpec>> {
+    if shard.review_only > 0.0
+        || crate::environments::pin_quarantine(store, project_id, shard.environment_id.as_deref())
+            .await?
+            .is_some()
+    {
+        return Ok(None);
+    }
+    project_run_spec(store, project_id).await
 }
 
 /// How a project's test suite is run, if it has one. The environment is
@@ -434,14 +466,25 @@ async fn task_view(
             args![&patch.project_id, &patch.intent_id],
         )
         .await?;
-    let run = match project_run_spec(store, &patch.project_id).await? {
+    let run = match task_runs(store, &shard, &patch.project_id).await? {
         Some(mut spec) => {
             fill(store, &mut spec, shard.environment_id.as_deref()).await?;
             Some(spec)
         }
         None => None,
     };
-    let instructions = if phase == "run" {
+    // A task held in the run phase whose runs are no longer owed (its
+    // environment was quarantined after the review) is done: the review
+    // is credited and nothing runs.
+    let phase = if phase == "run" && run.is_none() {
+        close_unowed_run(store, shard_id, operator_id).await?;
+        "done".to_string()
+    } else {
+        phase
+    };
+    let instructions = if phase == "done" {
+        "This project's environment was quarantined after your review, so no run is owed and nothing runs in it. Your review is credited. Call collective_review_next for more work."
+    } else if phase == "run" {
         "Your review is in. Now run the project's test suite with this patch in a sandbox: `collective run` (with this agent's key in COLLECTIVE_TOKEN) fetches the source, \
 runs `run` with and without the patch, network-isolated, and submits the report. Runs are graded: canaries have a known outcome, and runners who contradict the others lose rep."
     } else if run.is_some() {
@@ -474,6 +517,18 @@ Reviews are graded: missing a planted or confirmed problem costs rep, and so doe
         },
         "instructions": instructions,
     }))
+}
+
+/// Ends a run phase that is no longer owed: the review stands and is
+/// credited, as for a project without a suite.
+async fn close_unowed_run(store: &Store, shard_id: &str, operator_id: &str) -> ApiResult<()> {
+    store
+        .db
+        .run(
+            "UPDATE review_tasks SET phase = 'done', run_ok = 1, credited = review_ok WHERE shard_id = ? AND operator_id = ? AND phase = 'run'",
+            args![shard_id, operator_id],
+        )
+        .await
 }
 
 pub async fn load_shard(store: &Store, id: &str) -> ApiResult<ShardRow> {
@@ -573,7 +628,7 @@ pub async fn submit_review(
             return bad(e);
         }
     }
-    let runnable = project_run_spec(store, &patch.project_id).await?.is_some();
+    let runnable = task_runs(store, &shard, &patch.project_id).await?.is_some();
     let run = run_required(&issues, runnable);
     let t = now();
     if run {
@@ -726,7 +781,14 @@ pub async fn submit_run(
         return status(410, "run deadline passed");
     }
     let patch = store.require_patch_any(&shard.patch_id).await?;
-    let Some(spec) = project_run_spec(store, &patch.project_id).await? else {
+    let Some(spec) = task_runs(store, &shard, &patch.project_id).await? else {
+        if project_run_spec(store, &patch.project_id).await?.is_some() {
+            close_unowed_run(store, shard_id, &agent.operator_id).await?;
+            return status(
+                409,
+                "this task's run is no longer owed: the project's environment is quarantined, so nothing runs in it. Your review is credited",
+            );
+        }
         return status(409, "this project has no test suite to run");
     };
     let report_json = serde_json::to_string(&sub.report)?;

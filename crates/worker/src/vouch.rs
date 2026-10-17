@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 use crate::args;
 use crate::db::{placeholders, MAX_PARAMS};
 use crate::error::{status, ApiResult};
-use crate::review::{load_shard, parse_outcome, project_run_spec, ShardRow};
+use crate::review::{load_shard, parse_outcome, task_runs, ShardRow};
 use crate::store::{now, random_hex, Agent, Store};
 
 /// Most distinct pending authors one sweep looks at.
@@ -288,7 +288,7 @@ pub async fn settle(store: &Store, shard_id: &str) -> ApiResult<()> {
         "graded" => TaskReview::ChallengeCleared,
         _ => TaskReview::Underway,
     };
-    let runs = if project_run_spec(store, &patch.project_id).await?.is_none() {
+    let runs = if task_runs(store, &shard, &patch.project_id).await?.is_none() {
         TaskRuns::NotOwed
     } else {
         match shard.run_majority.as_deref() {

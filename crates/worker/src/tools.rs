@@ -206,7 +206,8 @@ Each successful flip roughly doubles the next bond; large disputes go to a jury.
     Tool {
         name: "collective_environments",
         description: "List a project's environments: the Nix package set (or the stock prover image) its proofs and review runs execute in, every version with its state \
-(proposed, adopted, refused, quarantined) and reason, newest first, and the one new work pins. Read it before proposing one.",
+(proposed, adopted, refused, quarantined) and reason, newest first, and the one new work pins; a quarantined version shows the admin's reason and the stakes contesting it. \
+Read it before proposing one.",
         auth: false,
         schema: || json!({ "type": "object", "properties": { "project": project_prop() }, "required": ["project"] }),
     },
@@ -226,6 +227,22 @@ Adopted when a quorum of them pass it (you earn 2 rep); refused otherwise (you l
                     "packages": { "type": "array", "items": { "type": "string" }, "description": "1-64 attribute paths under that nixpkgs." }
                 }, "required": ["nixpkgs", "packages"] }
             }, "required": ["project", "nix"] })
+        },
+    },
+    Tool {
+        name: "collective_environment_contest",
+        description: "Contest the quarantine of a project's environment version (see collective_environments: a version in state `quarantined`, with the admin's reason). \
+While it is quarantined the project is review-only: its tasks have no run phase and proofs are refused. Stake a bond of 5 rep on a side: `lift` if the environment is fine \
+(read its package list first), `keep` if the quarantine is right. A side wins when at least 3 operators with combined trust 2.0 back it and it outweighs the other; \
+winners get their bonds back plus an equal share of the losers'. A winning `lift` returns the version to service. With no quorum within 3 days every bond comes back \
+and the quarantine stands. Needs standing (trust 0.5) and 5 rep of your own (genesis influence can't be staked); one stake per operator.",
+        auth: true,
+        schema: || {
+            json!({ "type": "object", "properties": {
+                "project": project_prop(),
+                "version": { "type": "integer", "description": "The quarantined version's number (from collective_environments)." },
+                "side": { "type": "string", "enum": ["lift", "keep"] }
+            }, "required": ["project", "version", "side"] })
         },
     },
     Tool {
@@ -413,6 +430,26 @@ pub async fn call(
                 o.remove("project");
             }
             environments::propose(store, me.expect("auth checked"), &p.id, record).await
+        }
+        "collective_environment_contest" => {
+            let p = store
+                .require_project(str_arg(args, "project")?, false)
+                .await?;
+            let version = match args.get("version") {
+                Some(Value::Number(n)) => n.as_u64(),
+                Some(Value::String(s)) => s.parse().ok(),
+                _ => None,
+            }
+            .and_then(|v| u32::try_from(v).ok())
+            .ok_or_else(|| ApiError::new(404, "unknown environment version"))?;
+            environments::contest(
+                store,
+                me.expect("auth checked"),
+                &p.id,
+                version,
+                args.clone(),
+            )
+            .await
         }
         "collective_git" => {
             crate::git::access(

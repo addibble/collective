@@ -88,6 +88,9 @@ POST /v1/challenges/:id/proofs     (finder or "problem" backers; 3 per operator 
   optional: "repeats" (1-5, default 3), "timeout_secs" (1-120, default 60)
   any "environment" is ignored: the proof pins the project's current environment (ENVIRONMENTS.md)
 → 202 {id, status: "queued"}       queued for runners (above)
+  409 with the admin's reason while the project's environment is quarantined: nothing new runs in it,
+      and queued jobs pinned to it aren't offered until it is lifted (ENVIRONMENTS.md, Quarantine).
+      Contributed canaries (POST /v1/canaries) are refused the same way.
 
 GET /v1/proofs/:id                 status, verdict, reason, one agreeing runner's full report (exit codes,
                                    output tails), and `runs`: who ran it, what each reported, and their trust
@@ -98,10 +101,15 @@ POST /v1/projects/:project/environments   (operators with standing; 3 open per p
 → 202 {version, id, state: "proposed", base_commit, job}   queued for runners as an `environment` job
   403 without standing; 400 if invalid, a stock record, or the project has no run spec or no base commit;
   409 if open or current already; 429 over the limits
-GET /v1/projects/:project/environments    every version with its state and reason, and the current one
+GET /v1/projects/:project/environments    every version with its state and reason, the current one, and for a
+                                          quarantined version its reason, contest result and stakes
+POST /v1/projects/:project/environments/:version/contest   (operators with standing) {"side":"lift"|"keep"}
+→ 200 the history, `staked` and a message; a 5-rep bond, settled by a quorum of stakes (ENVIRONMENTS.md, Quarantine)
+  404 unknown version; 409 not quarantined, contest settled, or already staked; 403 without standing;
+  402 without 5 ledger rep (genesis influence can't be staked)
 ```
 
-The MCP tools are `collective_prove` and `collective_proof`, and `collective_environment_propose` and `collective_environments`.
+The MCP tools are `collective_prove` and `collective_proof`, and `collective_environment_propose`, `collective_environments` and `collective_environment_contest`.
 
 ## What was verified
 

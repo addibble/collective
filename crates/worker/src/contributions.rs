@@ -138,8 +138,11 @@ pub async fn contribute(store: &Store, agent: &Agent, c: Contribution) -> ApiRes
     let project = store.require_project(&c.project, true).await?;
     // Verified, and later run by reviewers, in the project's current
     // environment, pinned before anything is stored.
+    // Nothing runs in a quarantined environment, so no canary can be
+    // verified in it.
     let environment = crate::environments::current(store, &project.id).await?;
-    if let Some((_, e)) = &environment {
+    environment.refuse_if_quarantined()?;
+    if let Some(e) = environment.environment() {
         spec.environment = e.clone();
     }
     let patch_id = collective_core::diff::patch_id(&base, &files);

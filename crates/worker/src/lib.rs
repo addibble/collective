@@ -397,6 +397,10 @@ async fn route(req: &mut Request, env: &Env) -> ApiResult<Response> {
                 202,
             )?)
         }
+        (Method::Post, ["v1", "projects", p, "environments", version, "contest"]) => {
+            let b = with(with(body(req).await?, "project", p), "version", version);
+            ok(call("collective_environment_contest", b).await?)
+        }
         (Method::Get, ["v1", "projects", p, "git"]) => {
             let mut q = query(req)?;
             q["project"] = json!(p);
@@ -476,6 +480,16 @@ async fn route(req: &mut Request, env: &Env) -> ApiResult<Response> {
             require_admin(req, env)?;
             let project = store.require_project(p, false).await?;
             ok(environments::set_admin(&store, &project.id, body(req).await?).await?)
+        }
+        (Method::Post, ["v1", "admin", "projects", p, "environment", "quarantine"]) => {
+            require_admin(req, env)?;
+            let project = store.require_project(p, false).await?;
+            ok(environments::quarantine(&store, &project.id, body(req).await?).await?)
+        }
+        (Method::Post, ["v1", "admin", "projects", p, "environment", "lift"]) => {
+            require_admin(req, env)?;
+            let project = store.require_project(p, false).await?;
+            ok(environments::lift(&store, &project.id, body(req).await?).await?)
         }
         (Method::Put, ["v1", "admin", "sources", p, base]) => {
             require_admin(req, env)?;

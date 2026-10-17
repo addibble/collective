@@ -2105,3 +2105,343 @@ fn newcomers_wait_for_standing_or_a_vouch() {
     assert!(v.get("review_note").is_none(), "{v}");
     assert_eq!(review_state(&p4), "open");
 }
+
+/// Quarantine (ENVIRONMENTS.md): an admin quarantines a project's current
+/// environment and the project becomes review-only: patches are accepted
+/// with review-only tasks and proofs are refused. Operators with standing
+/// contest it with bonds; a quorum of stakes settles it, and the losers'
+/// bonds go to the winners. An admin can also lift it directly.
+#[test]
+#[ignore = "needs a running Worker; see module docs"]
+fn environments_are_quarantined_and_contested() {
+    let api = Api::new();
+    let run = format!(
+        "z{:x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+    );
+    let upstream = format!("https://github.com/e2e/quarantine-{run}");
+    let project_path = upstream.replace("https://", "").replace('/', "%2F");
+    let add = "#!/bin/sh\necho $(($1 + $2))\n";
+    let test = "#!/bin/sh\n[ \"$(sh add.sh 2 3)\" = 5 ] || exit 1\n";
+    let repo = Repo::new(&[("add.sh", add), ("test.sh", test)]);
+    let base = repo.base.clone();
+    let deltas = |token: &str, reason: &str| -> Vec<f64> {
+        api.me(token)["recent"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["reason"] == reason)
+            .map(|e| (e["delta"].as_f64().unwrap() * 100.0).round() / 100.0)
+            .collect()
+    };
+    let envs = || {
+        api.call(
+            "GET",
+            &format!("/v1/projects/{project_path}/environments"),
+            None,
+            None,
+        )
+        .1
+    };
+    let contest = |token: &str, version: u64, side: &str| {
+        api.call(
+            "POST",
+            &format!("/v1/projects/{project_path}/environments/{version}/contest"),
+            Some(token),
+            Some(json!({ "side": side })),
+        )
+    };
+    let admin = |action: &str, body: Value| {
+        api.call(
+            "POST",
+            &format!("/v1/admin/projects/{project_path}/environment/{action}"),
+            None,
+            Some(body),
+        )
+    };
+    // Registered from a documentation-range address of their own
+    // (Cloudflare sets this header at the edge; local dev honors it), as
+    // identity.rs does, so this test doesn't spend the other tests' share
+    // of the per-network registration limit.
+    let register = |operator: &str| -> String {
+        let r = ureq::post(&format!("{}/v1/register", api.base))
+            .set("cf-connecting-ip", "203.0.113.77")
+            .send_json(json!({ "operator": operator, "agent_name": "bot" }));
+        let v: Value = match r {
+            Ok(r) => r.into_json().unwrap(),
+            Err(e) => panic!("register {operator}: {e}"),
+        };
+        v["token"].as_str().unwrap().to_string()
+    };
+    let founder = |name: &str| {
+        let token = register(&format!("{name}-{run}"));
+        api.genesis(&format!("{name}-{run}"));
+        token
+    };
+
+    // A project with a suite and an adopted Nix environment.
+    let author = founder("author");
+    // Each submission owes review duty, so each patch has its own author.
+    let submit = |token: &str, intent: &str, line: &str| {
+        let (s, v) = api.call(
+            "POST",
+            "/v1/patches",
+            Some(token),
+            Some(json!({ "project": upstream, "intent": format!("{intent} ({run})"), "base_commit": base,
+                "diff": repo.diff(&[("add.sh", Some(format!("{add}{line}\n")))]) })),
+        );
+        assert_eq!(s, 201, "{v}");
+        v
+    };
+    submit(&author, "Comment the adder", "# adds");
+    let (s, v) = api.call(
+        "PUT",
+        &format!("/v1/admin/projects/{project_path}/run"),
+        None,
+        Some(
+            json!({ "ecosystem": "none", "tests": ["test.sh"], "repeats": 1, "timeout_secs": 60 }),
+        ),
+    );
+    assert_eq!(s, 200, "{v}");
+    let record = json!({ "nix": { "nixpkgs": "0123456789abcdef0123456789abcdef01234567", "packages": ["hello", "jq"] } });
+    let (s, v) = api.call(
+        "PUT",
+        &format!("/v1/admin/projects/{project_path}/environment"),
+        None,
+        Some(record.clone()),
+    );
+    assert_eq!(s, 200, "{v}");
+    let env_id = v["current"]["id"].as_str().unwrap().to_string();
+    let version = v["versions"][0]["version"].as_u64().unwrap();
+
+    // Only an admin quarantines, and only with a reason.
+    let (s, _) = api.call(
+        "POST",
+        &format!("/v1/projects/{project_path}/environments/{version}/contest"),
+        Some(&author),
+        Some(json!({ "side": "lift" })),
+    );
+    assert_eq!(s, 409, "nothing to contest before a quarantine");
+    let (s, v) = admin("quarantine", json!({}));
+    assert_eq!(s, 400, "{v}");
+    let reason = format!("hello pins a suspicious build ({run})");
+    let (s, v) = admin("quarantine", json!({ "reason": reason }));
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["current"]["state"], "quarantined", "{v}");
+    assert_eq!(v["current"]["quarantine_reason"], json!(reason), "{v}");
+    assert_eq!(
+        v["versions"][0]["quarantine"]["reason"],
+        json!(reason),
+        "{v}"
+    );
+    assert_eq!(
+        v["versions"][0]["quarantine"]["contest_settled"],
+        Value::Null,
+        "{v}"
+    );
+    let (s, v) = admin("quarantine", json!({ "reason": "again" }));
+    assert_eq!(s, 409, "{v}");
+
+    // Patches are still accepted; their tasks are review-only.
+    let keeper = founder("keeper");
+    let lifters: Vec<String> = (0..3).map(|i| founder(&format!("lifter{i}"))).collect();
+    let v = submit(&keeper, "Document the adder", "# returns the sum");
+    let patch = v["patch"]["id"].as_str().unwrap().to_string();
+    let task = v["review_task"].as_str().unwrap().to_string();
+    assert!(
+        v["review_only"].as_str().unwrap().contains(&reason),
+        "the author is told why: {v}"
+    );
+
+    // Proofs are refused, with the reason.
+    let newcomer = register(&format!("newcomer-{run}"));
+    let challenge = api.report(&newcomer, &patch);
+    let (s, v) = api.call(
+        "POST",
+        &format!("/v1/challenges/{challenge}/proofs"),
+        Some(&newcomer),
+        Some(json!({ "kind": "regression", "tests": ["test.sh"] })),
+    );
+    assert_eq!(s, 409, "{v}");
+    assert!(
+        v["error"].as_str().unwrap().contains(&reason),
+        "the refusal gives the reason: {v}"
+    );
+
+    // Contesting needs standing, and a bond from ledger rep.
+    let (s, v) = contest(&newcomer, version, "lift");
+    assert_eq!(s, 403, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("standing"), "{v}");
+    let (s, v) = contest(&keeper, version, "keep");
+    assert_eq!(s, 402, "genesis influence can't be staked: {v}");
+    let (s, _) = contest(&keeper, 999, "keep");
+    assert_eq!(s, 404);
+    let (s, v) = contest(&keeper, version, "maybe");
+    assert_eq!(s, 400, "{v}");
+
+    // The stakers earn rep by catching canaries; while draining with Nix
+    // they also see the quarantined project's task, which has no run phase.
+    let src = lines(40, "x");
+    let decoy = Repo::new(&[("app.py", &src)]);
+    let mut saw_task = false;
+    let mut drain = |token: &str| {
+        for _ in 0..100 {
+            let (s, v) = api.call(
+                "POST",
+                "/v1/reviews/next?capabilities=nix",
+                Some(token),
+                None,
+            );
+            assert_eq!(s, 200, "{v}");
+            let Some(t) = v["task"].as_object() else {
+                break;
+            };
+            let id = t["task_id"].as_str().unwrap().to_string();
+            if t["phase"] == "run" {
+                let (s, v) = api.call(
+                    "POST",
+                    &format!("/v1/reviews/{id}/run"),
+                    Some(token),
+                    Some(json!({ "report": suite_report(true, true, 60_000) })),
+                );
+                assert_eq!(s, 200, "{v}");
+                continue;
+            }
+            let issues: Value = marker_issues(t["diff"].as_str().unwrap()).into();
+            let (s, v) = api.call(
+                "POST",
+                &format!("/v1/reviews/{id}"),
+                Some(token),
+                Some(json!({ "issues": issues })),
+            );
+            assert_eq!(s, 200, "{v}");
+            if id == task {
+                assert!(t["run"].is_null(), "review-only: no run spec: {t:?}");
+                assert_eq!(t["units"]["run"], 0, "{t:?}");
+                assert_eq!(v["next"]["phase"], "done", "no run phase: {v}");
+                saw_task = true;
+            }
+        }
+    };
+    let stakers: Vec<&String> = std::iter::once(&keeper).chain(lifters.iter()).collect();
+    for (i, token) in stakers.iter().enumerate() {
+        let line = 10 + i;
+        let (s, v) = api.call(
+            "POST",
+            "/v1/admin/canaries",
+            None,
+            Some(json!({ "project": format!("{upstream}-decoy"), "base_commit": decoy.base, "intent": "Add a debug helper",
+                "diff": decoy.diff(&[("app.py", Some(src.replace(&format!("x {line}\n"), &format!("x {line}\n{MARKER}\n"))))]),
+                "planted": [{ "path": "app.py", "start": line + 1, "end": line + 1 }] })),
+        );
+        assert_eq!(s, 200, "{v}");
+        drain(token);
+        assert!(
+            ledger_has(&api.me(token), "caught a canary"),
+            "staker {i} earned rep"
+        );
+    }
+    assert!(saw_task, "a staker reviewed the review-only task");
+
+    // A keeper and three lifters stake; the third lift settles it.
+    let (s, v) = contest(&keeper, version, "keep");
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["staked"]["settled"], Value::Null, "{v}");
+    assert_eq!(deltas(&keeper, "contest_bond"), vec![-5.0]);
+    // One stake per operator (here through MCP, which shares the route).
+    let (s, v) = api.call(
+        "POST",
+        "/mcp",
+        Some(&keeper),
+        Some(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "collective_environment_contest", "arguments": { "project": upstream, "version": version, "side": "lift" } } })),
+    );
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["result"]["isError"], true, "{v}");
+    assert!(
+        v["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("already staked"),
+        "{v}"
+    );
+    for l in &lifters[..2] {
+        let (s, v) = contest(l, version, "lift");
+        assert_eq!(s, 200, "{v}");
+        assert_eq!(v["staked"]["settled"], Value::Null, "{v}");
+    }
+    assert_eq!(envs()["current"]["state"], "quarantined");
+    let (s, v) = contest(&lifters[2], version, "lift");
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["staked"]["settled"], "lift", "{v}");
+    let v = envs();
+    assert_eq!(v["current"]["id"], json!(env_id), "{v}");
+    assert_eq!(v["current"]["state"], "adopted", "runs resume: {v}");
+    let q = &v["versions"][0]["quarantine"];
+    assert_eq!(q["contest_settled"], "lift", "{v}");
+    assert_eq!(q["lifted_by"], "contest", "{v}");
+    assert_eq!(q["reason"], json!(reason), "kept as history: {v}");
+    assert_eq!(q["stakes"].as_array().unwrap().len(), 4, "{v}");
+    for l in &lifters {
+        assert_eq!(deltas(l, "contest_bond"), vec![-5.0]);
+        assert_eq!(
+            deltas(l, "contest_won"),
+            vec![6.67],
+            "bond back plus a third of the keeper's"
+        );
+    }
+    assert!(
+        deltas(&keeper, "contest_won").is_empty() && deltas(&keeper, "contest_returned").is_empty(),
+        "the keeper's bond is forfeited"
+    );
+    let (s, v) = contest(&keeper, version, "keep");
+    assert_eq!(s, 409, "no longer quarantined: {v}");
+
+    // Quarantined again: a new contest, which a quorum settles `keep`.
+    // After that the contest is closed, and only an admin can lift it.
+    let (s, v) = admin("quarantine", json!({ "reason": "jq too" }));
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(
+        v["versions"][0]["quarantine"]["stakes"],
+        json!([]),
+        "a new quarantine starts a new contest: {v}"
+    );
+    for l in &lifters {
+        let (s, v) = contest(l, version, "keep");
+        assert_eq!(s, 200, "{v}");
+    }
+    let v = envs();
+    assert_eq!(v["current"]["state"], "quarantined", "{v}");
+    assert_eq!(v["versions"][0]["quarantine"]["contest_settled"], "keep");
+    for l in &lifters {
+        assert_eq!(
+            deltas(l, "contest_won"),
+            vec![5.0, 6.67],
+            "no losers: bonds back"
+        );
+    }
+    let (s, v) = contest(&keeper, version, "lift");
+    assert_eq!(s, 409, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("settled"), "{v}");
+    let (s, v) = admin("lift", json!({}));
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["current"]["state"], "adopted", "{v}");
+    assert_eq!(v["versions"][0]["quarantine"]["lifted_by"], "admin", "{v}");
+    assert_eq!(v["versions"][0]["quarantine"]["contest_settled"], "keep");
+    let (s, _) = admin("lift", json!({}));
+    assert_eq!(s, 409, "nothing left to lift");
+
+    // An admin's lift before any quorum returns the stakes in full.
+    let (s, v) = admin("quarantine", json!({ "reason": "one more look" }));
+    assert_eq!(s, 200, "{v}");
+    let (s, v) = contest(&keeper, version, "keep");
+    assert_eq!(s, 200, "{v}");
+    let (s, v) = admin("lift", json!({}));
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["versions"][0]["quarantine"]["contest_settled"], "admin");
+    assert_eq!(deltas(&keeper, "contest_returned"), vec![5.0]);
+    assert_eq!(deltas(&keeper, "contest_bond"), vec![-5.0, -5.0]);
+}

@@ -681,7 +681,7 @@ pub fn proof_quorum(claims: &[ProofClaim]) -> Quorum {
 /// candidate settles with [`MIN_RUNNERS`] votes, [`QUORUM_TRUST`] combined
 /// trust and more trust than every other vote combined; [`MAX_RUNNERS`]
 /// votes without that is a split.
-fn quorum_of<V: Copy + PartialEq>(votes: &[(f64, V)], candidates: &[V]) -> Quorum<V> {
+pub(crate) fn quorum_of<V: Copy + PartialEq>(votes: &[(f64, V)], candidates: &[V]) -> Quorum<V> {
     let total: f64 = votes.iter().map(|(t, _)| t.max(0.0)).sum();
     for v in candidates {
         let agreeing: Vec<f64> = votes

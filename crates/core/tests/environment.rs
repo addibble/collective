@@ -466,3 +466,167 @@ fn proposal_limits_are_small() {
     assert_eq!(MAX_OPEN_PROPOSALS_PER_PROJECT, 3);
     assert_eq!(MAX_PROPOSALS_PER_OPERATOR_PER_DAY, 3);
 }
+
+// -- quarantine and contests --------------------------------------------------
+
+use collective_core::proof::{MIN_RUNNERS, QUORUM_TRUST};
+use collective_core::{net, LedgerEntry};
+
+fn stake(op: &str, trust: f64, side: ContestSide) -> ContestClaim {
+    ContestClaim {
+        operator: op.into(),
+        trust,
+        side,
+        bond: CONTEST_BOND_REP,
+    }
+}
+
+#[test]
+fn contests_need_standing_and_ledger_rep() {
+    assert!(!may_contest(0.25), "a newcomer can't stake");
+    assert!(may_contest(MIN_PROPOSER_TRUST));
+    assert!(!may_contest(f64::NAN), "fails closed");
+    assert!(may_post_bond(CONTEST_BOND_REP));
+    assert!(!may_post_bond(CONTEST_BOND_REP - 0.01));
+    assert!(!may_post_bond(f64::NAN), "fails closed");
+    assert_eq!(
+        contest_bond_entry("a"),
+        LedgerEntry::new("a", -CONTEST_BOND_REP, CONTEST_BOND)
+    );
+    assert_eq!(CONTEST_BOND_REP, 5.0);
+    assert_eq!(CONTEST_DAYS, 3);
+}
+
+#[test]
+fn a_contest_settles_by_the_proof_quorum_thresholds() {
+    use ContestSide::*;
+    assert_eq!(MIN_RUNNERS, 3);
+    assert_eq!(QUORUM_TRUST, 2.0);
+    assert_eq!(contest_quorum(&[]), Quorum::Pending);
+    // Two trusted stakes are not enough operators.
+    let two = [stake("a", 1.0, Lift), stake("b", 1.0, Lift)];
+    assert_eq!(contest_quorum(&two), Quorum::Pending);
+    // Three with enough trust settle.
+    let three = [
+        stake("a", 0.7, Lift),
+        stake("b", 0.7, Lift),
+        stake("c", 0.7, Lift),
+    ];
+    assert_eq!(contest_quorum(&three), Quorum::Settled(Lift));
+    // Three newcomers' worth of trust is not enough.
+    let weak = [
+        stake("a", 0.5, Keep),
+        stake("b", 0.5, Keep),
+        stake("c", 0.5, Keep),
+    ];
+    assert_eq!(contest_quorum(&weak), Quorum::Pending);
+    // A side must outweigh the other.
+    let mut close = three.to_vec();
+    close.extend([
+        stake("d", 0.8, Keep),
+        stake("e", 0.8, Keep),
+        stake("f", 0.8, Keep),
+    ]);
+    assert_eq!(
+        contest_quorum(&close),
+        Quorum::Settled(Keep),
+        "keep has 2.4 against 2.1"
+    );
+    let mut tied = three.to_vec();
+    tied.extend([
+        stake("d", 0.7, Keep),
+        stake("e", 0.7, Keep),
+        stake("f", 0.7, Keep),
+    ]);
+    assert_eq!(
+        contest_quorum(&tied),
+        Quorum::Pending,
+        "a tie settles nothing"
+    );
+    // One stake per operator: a repeat doesn't count twice.
+    let repeat = [
+        stake("a", 1.0, Lift),
+        stake("a", 1.0, Lift),
+        stake("b", 1.0, Lift),
+    ];
+    assert_eq!(contest_quorum(&repeat), Quorum::Pending);
+}
+
+#[test]
+fn winners_share_the_losers_bonds() {
+    use ContestSide::*;
+    let claims = [
+        stake("keeper", 0.9, Keep),
+        stake("a", 0.8, Lift),
+        stake("b", 0.8, Lift),
+        stake("c", 0.8, Lift),
+    ];
+    let entries = contest_entries(Some(Lift), &claims);
+    assert_eq!(entries.len(), 4);
+    for w in ["a", "b", "c"] {
+        let e = entries.iter().find(|e| e.operator_id == w).unwrap();
+        assert_eq!(e.reason, CONTEST_WON);
+        assert!((e.delta - (5.0 + 5.0 / 3.0)).abs() < 0.01, "{e:?}");
+    }
+    let lost = entries.iter().find(|e| e.operator_id == "keeper").unwrap();
+    assert_eq!(lost.reason, CONTEST_LOST);
+    assert_eq!(
+        lost.delta, 0.0,
+        "the bond debited at stake time is the loss"
+    );
+    // With the stake debits, rep is conserved (up to rounding).
+    let mut all: Vec<LedgerEntry> = claims
+        .iter()
+        .map(|c| contest_bond_entry(&c.operator))
+        .collect();
+    all.extend(entries);
+    let total: f64 = ["keeper", "a", "b", "c"].iter().map(|o| net(&all, o)).sum();
+    assert!(total.abs() < 0.05, "{total}");
+    assert_eq!(net(&all, "keeper"), -CONTEST_BOND_REP);
+
+    // No losers: winners just get their bonds back.
+    let entries = contest_entries(Some(Lift), &claims[1..]);
+    assert!(entries
+        .iter()
+        .all(|e| e.delta == CONTEST_BOND_REP && e.reason == CONTEST_WON));
+}
+
+#[test]
+fn a_timeout_returns_every_bond() {
+    use ContestSide::*;
+    let claims = [stake("a", 0.9, Keep), stake("b", 0.6, Lift)];
+    let entries = contest_entries(None, &claims);
+    assert_eq!(
+        entries,
+        vec![
+            LedgerEntry::new("a", CONTEST_BOND_REP, CONTEST_RETURNED),
+            LedgerEntry::new("b", CONTEST_BOND_REP, CONTEST_RETURNED),
+        ]
+    );
+    assert!(contest_entries(None, &[]).is_empty());
+    assert_eq!(contest_settled(None), "timeout");
+    assert_eq!(contest_settled(Some(Lift)), "lift");
+    assert_eq!(contest_settled(Some(Keep)), "keep");
+    assert_eq!(Lift.state(), "adopted");
+    assert_eq!(Keep.state(), "quarantined");
+    assert_eq!(ContestSide::parse("keep"), Some(Keep));
+    assert_eq!(ContestSide::parse("Keep"), None);
+}
+
+#[test]
+fn contests_time_out_after_contest_days() {
+    let day = 86_400_000;
+    let q = 1_000 * day;
+    assert!(!contest_expired(q, q));
+    assert!(!contest_expired(q, q + 3 * day - 1));
+    assert!(contest_expired(q, q + 3 * day));
+    assert!(
+        !contest_expired(q, q - day),
+        "a clock behind the quarantine"
+    );
+    let now = q + 3 * day;
+    assert_eq!(contest_cutoff(now), q, "the sweep's cutoff agrees");
+    assert!(contest_expired(contest_cutoff(now), now));
+    assert!(!contest_expired(contest_cutoff(now) + 1, now));
+    assert_ne!(contest_ref("p", 1, q), contest_ref("p", 1, q + 1));
+}

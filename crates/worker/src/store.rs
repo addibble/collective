@@ -674,7 +674,8 @@ impl Store {
 
         let similar = self.similar_patches(&project.id, &files).await?;
         // Pinned before anything is stored, so a project whose environment
-        // can't be pinned refuses the submission whole.
+        // can't be pinned refuses the submission whole. A quarantined one
+        // is pinned too: the patch is accepted and its task is review-only.
         let environment = crate::environments::current(self, &project.id).await?;
         // A newcomer's task waits for standing or a vouch (REVIEWS.md,
         // Newcomers). Read before anything is stored, once per submission.
@@ -717,6 +718,11 @@ impl Store {
         crate::git::notify(&self.env, &project.id, crate::git::Job::Patch(id.clone())).await;
         let mut out = json!({ "patch": row.public(), "created": true, "intent_reused": intent_reused, "similar": similar, "review_task": task });
         crate::vouch::annotate(&mut out, task_state);
+        if let crate::environments::Current::Quarantined { reason, .. } = &environment {
+            out["review_only"] = json!(format!(
+                "This project's environment is quarantined ({reason}), so its review task has no run phase: nothing runs in it until the quarantine is lifted or replaced."
+            ));
+        }
         Ok(out)
     }
 

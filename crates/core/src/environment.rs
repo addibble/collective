@@ -18,7 +18,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::hash::sha256_hex;
-use crate::proof::{Quorum, RunOutcome};
+use crate::proof::{quorum_of, Quorum, RunOutcome};
 use crate::LedgerEntry;
 
 /// A Nix package set: attribute names under one pinned nixpkgs commit.
@@ -172,6 +172,184 @@ pub fn decide_proposal(q: Quorum<RunOutcome>) -> Option<ProposalDecision> {
         Quorum::Settled(o) => Some(ProposalDecision::Refuse(o)),
         Quorum::Split => Some(ProposalDecision::Lapse),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Quarantine and contests
+// ---------------------------------------------------------------------------
+//
+// An admin can quarantine a project's current environment: while it is
+// quarantined the project is review-only (patches are accepted, their tasks
+// have no run phase, and proofs and canary verifications are refused), so
+// nothing new runs in it. The admin's quarantine is a claim, not a stake.
+// Operators with standing contest it by staking a bond on a side: `lift`
+// (it is fine, return it to service) or `keep` (it stays quarantined). A
+// quorum of stakes settles the contest by the thresholds of
+// `proof::proof_quorum`; losers forfeit their bonds to the winners. With
+// no quorum after [`CONTEST_DAYS`], every bond comes back and the
+// quarantine stands. An admin may lift a quarantine directly at any time.
+
+/// Rep an operator stakes on one side of a quarantine. It is debited when
+/// the stake is made (ledger reason [`CONTEST_BOND`]), from ledger rep
+/// only: genesis influence counts towards standing but can't be staked.
+pub const CONTEST_BOND_REP: f64 = 5.0;
+/// Days a contest stays open, from the quarantine, before it settles as a
+/// timeout.
+pub const CONTEST_DAYS: u32 = 3;
+const DAY_MS: i64 = 86_400_000;
+
+/// Ledger reasons: the bond when staked; a winner's bond and share of the
+/// forfeits; a loser's settlement (the bond debit stands); a bond returned
+/// when the contest timed out or an admin lifted the quarantine first.
+pub const CONTEST_BOND: &str = "contest_bond";
+pub const CONTEST_WON: &str = "contest_won";
+pub const CONTEST_LOST: &str = "contest_lost";
+pub const CONTEST_RETURNED: &str = "contest_returned";
+
+/// A side of a contest over a quarantined environment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContestSide {
+    /// The environment is fine: return it to service.
+    Lift,
+    /// The quarantine is right: it stays.
+    Keep,
+}
+
+impl ContestSide {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ContestSide::Lift => "lift",
+            ContestSide::Keep => "keep",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<ContestSide> {
+        match s {
+            "lift" => Some(ContestSide::Lift),
+            "keep" => Some(ContestSide::Keep),
+            _ => None,
+        }
+    }
+
+    /// The version's state once this side has won.
+    pub fn state(self) -> &'static str {
+        match self {
+            ContestSide::Lift => "adopted",
+            ContestSide::Keep => "quarantined",
+        }
+    }
+}
+
+/// How a contest settled, as recorded: the winning side, or `timeout`.
+pub fn contest_settled(winner: Option<ContestSide>) -> &'static str {
+    winner.map_or("timeout", ContestSide::as_str)
+}
+
+/// One operator's stake on a quarantine.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContestClaim {
+    pub operator: String,
+    /// The operator's trust when it staked.
+    pub trust: f64,
+    pub side: ContestSide,
+    /// Rep it staked (debited when it staked).
+    pub bond: f64,
+}
+
+/// Whether an operator with this trust may stake on a quarantine: the
+/// same standing as proposing an environment. Fails closed on NaN.
+pub fn may_contest(trust: f64) -> bool {
+    may_propose(trust)
+}
+
+/// Whether an operator has the ledger rep to post a contest bond. Fails
+/// closed on NaN.
+pub fn may_post_bond(available_rep: f64) -> bool {
+    available_rep >= CONTEST_BOND_REP
+}
+
+/// The debit for a stake.
+pub fn contest_bond_entry(operator: &str) -> LedgerEntry {
+    LedgerEntry::new(operator, -CONTEST_BOND_REP, CONTEST_BOND)
+}
+
+/// One stake per operator, its first: the store's key enforces it, and
+/// the rules don't count a repeat either.
+fn first_per_operator(claims: &[ContestClaim]) -> Vec<&ContestClaim> {
+    let mut seen = std::collections::HashSet::new();
+    claims
+        .iter()
+        .filter(|c| seen.insert(c.operator.as_str()))
+        .collect()
+}
+
+/// What the stakes on a quarantine establish, by the thresholds of
+/// [`crate::proof::proof_quorum`]: a side wins when at least 3 operators
+/// back it, their trust adds up to 2.0, and it outweighs the other side.
+/// `Split` (many stakes, no winner) settles nothing: the contest stays open
+/// until a side wins or it times out.
+pub fn contest_quorum(claims: &[ContestClaim]) -> Quorum<ContestSide> {
+    let votes: Vec<(f64, ContestSide)> = first_per_operator(claims)
+        .into_iter()
+        .map(|c| (c.trust, c.side))
+        .collect();
+    quorum_of(&votes, &[ContestSide::Lift, ContestSide::Keep])
+}
+
+/// The ledger entries that settle a contest. With a winner: each winner
+/// gets its bond back plus an equal share of the losers' bonds
+/// ([`CONTEST_WON`]); each loser forfeits its bond, which was debited when
+/// it staked, so its [`CONTEST_LOST`] entry is zero and only records the
+/// outcome. On a timeout (`None`) every bond comes back
+/// ([`CONTEST_RETURNED`]): nobody was shown wrong.
+pub fn contest_entries(winner: Option<ContestSide>, claims: &[ContestClaim]) -> Vec<LedgerEntry> {
+    let claims = first_per_operator(claims);
+    let Some(winner) = winner else {
+        return claims
+            .into_iter()
+            .map(|c| LedgerEntry::new(&c.operator, c.bond, CONTEST_RETURNED))
+            .collect();
+    };
+    let winners = claims.iter().filter(|c| c.side == winner).count();
+    let forfeits: f64 = claims
+        .iter()
+        .filter(|c| c.side != winner)
+        .map(|c| c.bond.max(0.0))
+        .sum();
+    let share = if winners > 0 {
+        forfeits / winners as f64
+    } else {
+        0.0
+    };
+    claims
+        .into_iter()
+        .map(|c| {
+            if c.side == winner {
+                LedgerEntry::new(&c.operator, crate::round2(c.bond + share), CONTEST_WON)
+            } else {
+                LedgerEntry::new(&c.operator, 0.0, CONTEST_LOST)
+            }
+        })
+        .collect()
+}
+
+/// Whether a contest opened by a quarantine at `quarantined_at` has run
+/// out of time at `now` (both in milliseconds).
+pub fn contest_expired(quarantined_at: i64, now: i64) -> bool {
+    now.saturating_sub(quarantined_at) >= CONTEST_DAYS as i64 * DAY_MS
+}
+
+/// The newest quarantine time that has run out at `now`: contests opened
+/// at or before it settle as a timeout.
+pub fn contest_cutoff(now: i64) -> i64 {
+    now - CONTEST_DAYS as i64 * DAY_MS
+}
+
+/// The ledger reference of one quarantine's contest. The quarantine time
+/// is part of it, so a version quarantined again starts a new contest.
+pub fn contest_ref(project_id: &str, version: u32, quarantined_at: i64) -> String {
+    format!("contest:{project_id}:{version}:{quarantined_at}")
 }
 
 fn valid_rev(s: &str) -> bool {

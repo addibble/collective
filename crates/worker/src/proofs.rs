@@ -188,8 +188,11 @@ pub async fn submit(
         );
     }
     let project_id = store.require_patch_any(&c.patch_id).await?.project_id;
+    // Nothing runs in a quarantined environment: no new proofs while the
+    // project is review-only.
     let environment = environments::current(store, &project_id).await?;
-    if let Some((_, e)) = &environment {
+    environment.refuse_if_quarantined()?;
+    if let Some(e) = environment.environment() {
         spec.environment = e.clone();
     }
     let id = new_id();
@@ -559,6 +562,7 @@ async fn run_view(store: &Store, run: &RunRow) -> ApiResult<Value> {
 /// Jobs in a Nix environment go only to callers with the `nix` capability.
 pub async fn next_job(store: &Store, agent: &Agent, caps: Capabilities) -> ApiResult<Value> {
     sweep_stale(store).await?;
+    environments::sweep_contests(store).await?;
     let t = now();
     // A held run is returned whatever the caller says it can do now: a
     // claim isn't dropped by changing flags.
@@ -694,15 +698,25 @@ async fn job_candidates(
             if needs == Needs::Stock {
                 continue;
             }
-            ("NULL AS environment_id", "1")
+            ("NULL AS environment_id", "1".to_string())
         } else {
+            // Nothing runs in a quarantined environment: a job pinned to
+            // one waits, unoffered, until the quarantine is lifted (or
+            // goes stale like any other job).
+            let quarantined = environments::quarantined_sql(
+                "(SELECT pa.project_id FROM patches pa WHERE pa.id = j.patch_id)",
+                "j.environment_id",
+            );
             (
                 "j.environment_id",
-                match needs {
-                    Needs::Any => "1",
-                    Needs::Stock => "j.environment_id IS NULL",
-                    Needs::Nix => "j.environment_id IS NOT NULL",
-                },
+                format!(
+                    "{} AND NOT {quarantined}",
+                    match needs {
+                        Needs::Any => "1",
+                        Needs::Stock => "j.environment_id IS NULL",
+                        Needs::Nix => "j.environment_id IS NOT NULL",
+                    }
+                ),
             )
         };
         let rows: Vec<JobCandidate> = store
