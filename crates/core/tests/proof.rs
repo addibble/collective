@@ -21,6 +21,7 @@ fn spec(kind: ProofKind) -> ProofSpec {
         },
         repeats: 2,
         timeout_secs: 30,
+        environment: Default::default(),
     }
 }
 
@@ -264,6 +265,7 @@ fn suite(ecosystem: Ecosystem, tests: &[&str]) -> ProofSpec {
         files: vec![],
         repeats: 1,
         timeout_secs: 900,
+        environment: Default::default(),
     }
 }
 

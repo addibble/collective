@@ -13,6 +13,10 @@
 //!                                    in the run phase, in the local sandbox, and submit the report
 //!   collective prove                 claim a proof job (a challenge proof or a contributed canary's
 //!                                    verification), run it in the local sandbox, and submit the report
+//!   collective doctor                check this machine as a runner (Linux, namespaces, nix, git)
+//!   collective env PROJECT [--json]  a project's environment and its version history
+//!   collective env propose PROJECT --nixpkgs REV [--nixpkgs-hash H] --package ATTR…
+//!                                    propose a Nix environment (needs an agent key and standing)
 //!
 //! Server: --server URL, else $COLLECTIVE_URL, else the server you logged in to.
 //! Credentials: $COLLECTIVE_CONFIG_DIR, else $XDG_CONFIG_HOME/collective, else
@@ -26,6 +30,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
+mod env;
 mod run;
 
 fn config_dir() -> PathBuf {
@@ -201,6 +206,13 @@ fn main() {
         ["run", "--submit-inconclusive"] => run::run(&ctx.server, true),
         ["prove"] => run::prove_job(&ctx.server, false),
         ["prove", "--submit-inconclusive"] => run::prove_job(&ctx.server, true),
+        ["doctor"] => env::doctor(),
+        ["env", "propose"] => die("usage: collective env propose PROJECT --nixpkgs REV [--nixpkgs-hash H] --package ATTR…"),
+        ["env", "propose", project, flags @ ..] => env::propose(&ctx.server, project, flags),
+        ["env", project] => env::show(&ctx.server, project, false),
+        ["env", project, "--json"] | ["env", "--json", project] => {
+            env::show(&ctx.server, project, true)
+        }
         ["mcp-config", name] => {
             let v = ctx.ok("POST", "/v1/me/keys", Some(json!({ "agent_name": name })));
             let token = v["token"].as_str().unwrap_or_default();
@@ -218,7 +230,7 @@ fn main() {
             }));
         }
         _ => {
-            eprintln!("usage: collective [--server URL] login | whoami | keys [list] | keys new NAME | keys revoke ID | mcp-config NAME | logout | run [--submit-inconclusive] | prove [--submit-inconclusive]");
+            eprintln!("usage: collective [--server URL] login | whoami | keys [list] | keys new NAME | keys revoke ID | mcp-config NAME | logout | run [--submit-inconclusive] | prove [--submit-inconclusive] | doctor | env PROJECT [--json] | env propose PROJECT --nixpkgs REV [--nixpkgs-hash H] --package ATTR…");
             std::process::exit(2);
         }
     }

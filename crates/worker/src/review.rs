@@ -7,6 +7,7 @@
 //! whole-patch tasks; migrations are append-only).
 
 use collective_core::diff::FileDiff;
+use collective_core::environment::Environment;
 use collective_core::proof::{suite_outcome, ProofReport, ProofSpec, RunOutcome};
 use collective_core::review::{
     changed_lines, check_issue_location, credits_duty, duty_owed, duty_required, grade, grade_runs,
@@ -18,6 +19,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::args;
+use crate::environments::{fill, kind, pin_id, Capabilities, Current};
 use crate::error::{bad, status, ApiResult};
 use crate::store::{now, parse, Agent, PatchRow, Store};
 
@@ -44,6 +46,16 @@ pub struct ShardRow {
     pub expected_run: Option<String>,
     pub run_majority: Option<String>,
     pub state: String,
+    /// The environment pinned at creation (NULL: stock).
+    pub environment_id: Option<String>,
+    /// The operator that vouched for the task (`vouch`), when, and how its
+    /// loan settled (`returned` or `lost`; NULL while out).
+    #[serde(default)]
+    pub vouched_by: Option<String>,
+    #[serde(default)]
+    pub vouched_at: Option<f64>,
+    #[serde(default)]
+    pub vouch_settled: Option<String>,
 }
 
 fn outcome_str(o: RunOutcome) -> String {
@@ -53,12 +65,16 @@ fn outcome_str(o: RunOutcome) -> String {
         .unwrap_or_default()
 }
 
-fn parse_outcome(s: &str) -> Option<RunOutcome> {
+pub(crate) fn parse_outcome(s: &str) -> Option<RunOutcome> {
     serde_json::from_value(json!(s)).ok()
 }
 
-/// Creates the review task for a patch. `planted` and `expected_run` are
-/// for canaries only.
+/// Creates the review task for a patch, pinned to `environment` (the
+/// project's current one, read before the patch was stored). `planted` and
+/// `expected_run` are for canaries only. `state` is where it starts: `open`,
+/// `pending` for a real patch whose author lacks standing
+/// (`vouch::initial_state`), or `verifying` for a contributed canary;
+/// canaries are never pending.
 pub async fn create_task(
     store: &Store,
     patch: &PatchRow,
@@ -66,6 +82,7 @@ pub async fn create_task(
     planted: Option<&[Location]>,
     expected_run: Option<RunOutcome>,
     state: &str,
+    environment: &Current,
 ) -> ApiResult<String> {
     let lines = changed_lines(files);
     let id = task_id(&patch.id);
@@ -74,8 +91,8 @@ pub async fn create_task(
         estimated_run_units(store, &patch.project_id).await?,
     );
     store.db.run(
-        "INSERT OR IGNORE INTO shards (id, patch_id, idx, path, hunk_start, hunk_end, changed_lines, units, review_units, run_units, author_op, wanted, canary, planted, expected_run, state, created_at)
-         VALUES (?, ?, 0, '', 0, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT OR IGNORE INTO shards (id, patch_id, idx, path, hunk_start, hunk_end, changed_lines, units, review_units, run_units, author_op, wanted, canary, planted, expected_run, state, created_at, environment_id, environment_kind)
+         VALUES (?, ?, 0, '', 0, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         args![
             &id,
             &patch.id,
@@ -90,6 +107,8 @@ pub async fn create_task(
             expected_run.map(outcome_str),
             state,
             now(),
+            pin_id(environment),
+            kind(environment),
         ],
     )
     .await?;
@@ -202,11 +221,11 @@ async fn work_available(store: &Store, operator_id: &str) -> ApiResult<bool> {
                SELECT 1 FROM review_tasks WHERE operator_id = ? AND phase IN ('review','run') AND expires_at > ?
                UNION ALL
                SELECT 1 FROM shards s JOIN patches p ON p.id = s.patch_id
-               WHERE s.state = 'open' AND s.author_op != ? AND p.status NOT IN ('withdrawn','rejected')
+               WHERE s.state = 'open' AND s.author_op != ? AND s.vouched_by IS NOT ? AND p.status NOT IN ('withdrawn','rejected')
                  AND NOT EXISTS (SELECT 1 FROM review_tasks r WHERE r.shard_id = s.id AND r.operator_id = ?)
                  AND (SELECT COUNT(*) FROM review_tasks r WHERE r.shard_id = s.id AND (r.submitted_at IS NOT NULL OR r.expires_at > ?)) < s.wanted
                LIMIT 1)",
-            args![operator_id, t, operator_id, operator_id, t],
+            args![operator_id, t, operator_id, operator_id, operator_id, t],
         )
         .await?;
     Ok(n > 0)
@@ -220,7 +239,9 @@ fn seed_secret(store: &Store) -> String {
         .unwrap_or_else(|_| "dev-seed".into())
 }
 
-/// How a project's test suite is run, if it has one.
+/// How a project's test suite is run, if it has one. The environment is
+/// not part of it: a task's run spec gets the task's pinned environment
+/// when it is handed out (`task_view`).
 pub async fn project_run_spec(store: &Store, project_id: &str) -> ApiResult<Option<ProofSpec>> {
     #[derive(Deserialize)]
     struct R {
@@ -235,18 +256,25 @@ pub async fn project_run_spec(store: &Store, project_id: &str) -> ApiResult<Opti
         .await?;
     Ok(row
         .and_then(|r| r.run_spec)
-        .and_then(|s| serde_json::from_str(&s).ok()))
+        .and_then(|s| serde_json::from_str::<ProofSpec>(&s).ok())
+        .map(|mut s| {
+            s.environment = Environment::Stock;
+            s
+        }))
 }
 
 /// Sets how a project's test suite runs (admin). `spec` must be a valid
-/// suite spec; `null` makes the project's tasks review-only.
+/// suite spec; `null` makes the project's tasks review-only. Any
+/// `environment` in it is dropped: that is set with
+/// `PUT /v1/admin/projects/:project/environment` and pinned per task.
 pub async fn set_run_spec(store: &Store, project_id: &str, spec: Value) -> ApiResult<Value> {
     let stored = if spec.is_null() {
         None
     } else {
         let mut v = spec;
         v["kind"] = json!("suite");
-        let spec: ProofSpec = serde_json::from_value(v)?;
+        let mut spec: ProofSpec = serde_json::from_value(v)?;
+        spec.environment = Environment::Stock;
         if let Err(e) = spec.validate() {
             return bad(e);
         }
@@ -270,8 +298,10 @@ struct Lease {
 
 /// Leases a review task, or returns the one the operator already holds. The
 /// reviewer cannot choose which task it gets.
-pub async fn next_task(store: &Store, agent: &Agent) -> ApiResult<Value> {
+pub async fn next_task(store: &Store, agent: &Agent, caps: Capabilities) -> ApiResult<Value> {
     let t = now();
+    // A held task is returned whatever the caller says it can do now: a
+    // claim isn't dropped by changing flags.
     let held = store
         .db
         .first::<Lease>(
@@ -282,6 +312,10 @@ pub async fn next_task(store: &Store, agent: &Agent) -> ApiResult<Value> {
     let (shard_id, expires_at) = match held {
         Some(l) => (l.shard_id, l.expires_at as i64),
         None => {
+            // Authors who have earned standing since they submitted get
+            // their pending tasks opened before anything is picked. Bounded
+            // and cheap; see `open_by_standing`.
+            crate::vouch::open_by_standing(store).await?;
             #[derive(Deserialize)]
             struct C {
                 id: String,
@@ -289,40 +323,58 @@ pub async fn next_task(store: &Store, agent: &Agent) -> ApiResult<Value> {
                 wanted: f64,
                 taken: f64,
                 canary: f64,
+                vouched_by: Option<String>,
             }
             // Canaries and real tasks are fetched separately so a deep
             // queue of real work can't hide the canaries from the draw.
             // An operator that ran a contributed canary's verification
             // knows what it is, so it is never offered it to review.
-            let mut cands: Vec<C> = Vec::new();
-            for (canary, limit) in [(false, 200u32), (true, 50)] {
-                cands.extend(
-                    store
-                        .db
-                        .all::<C>(
-                            "SELECT s.id, s.author_op, s.wanted, s.canary,
-                               (SELECT COUNT(*) FROM review_tasks r WHERE r.shard_id = s.id AND (r.submitted_at IS NOT NULL OR r.expires_at > ?)) AS taken
-                             FROM shards s JOIN patches p ON p.id = s.patch_id
-                             WHERE s.state = 'open' AND s.canary = ? AND s.author_op != ? AND p.status NOT IN ('withdrawn','rejected')
-                               AND NOT EXISTS (SELECT 1 FROM review_tasks r WHERE r.shard_id = s.id AND r.operator_id = ?)
-                               AND NOT EXISTS (SELECT 1 FROM canary_contributions c JOIN proof_runs v ON v.job_kind = 'canary' AND v.job_id = c.id
-                                               WHERE c.task_id = s.id AND v.operator_id = ?)
-                             ORDER BY s.created_at LIMIT ?",
-                            args![t, canary, &agent.operator_id, &agent.operator_id, &agent.operator_id, limit],
-                        )
-                        .await?,
-                );
-            }
-            let open: Vec<OpenShard> = cands
-                .into_iter()
-                .map(|c| OpenShard {
-                    id: c.id,
-                    author_operator: c.author_op,
-                    assigned: vec![String::new(); c.taken as usize],
-                    wanted: c.wanted as usize,
-                    canary: c.canary > 0.0,
-                })
-                .collect();
+            //
+            // The run phase follows the review, so a task pinned to
+            // anything but the stock image (a NULL kind included) goes only
+            // to a reviewer that can run it, filtered here so Nix tasks
+            // can't crowd stock ones out of the candidates.
+            let candidates = |env: &'static str| async move {
+                let mut cands: Vec<C> = Vec::new();
+                for (canary, limit) in [(false, 200u32), (true, 50)] {
+                    cands.extend(
+                        store
+                            .db
+                            .all::<C>(
+                                &format!("SELECT s.id, s.author_op, s.wanted, s.canary, s.vouched_by,
+                                   (SELECT COUNT(*) FROM review_tasks r WHERE r.shard_id = s.id AND (r.submitted_at IS NOT NULL OR r.expires_at > ?)) AS taken
+                                 FROM shards s JOIN patches p ON p.id = s.patch_id
+                                 WHERE s.state = 'open' AND s.canary = ? AND s.author_op != ? AND p.status NOT IN ('withdrawn','rejected')
+                                   AND {env}
+                                   AND NOT EXISTS (SELECT 1 FROM review_tasks r WHERE r.shard_id = s.id AND r.operator_id = ?)
+                                   AND NOT EXISTS (SELECT 1 FROM canary_contributions c JOIN proof_runs v ON v.job_kind = 'canary' AND v.job_id = c.id
+                                                   WHERE c.task_id = s.id AND v.operator_id = ?)
+                                 ORDER BY s.created_at LIMIT ?"),
+                                args![t, canary, &agent.operator_id, &agent.operator_id, &agent.operator_id, limit],
+                            )
+                            .await?,
+                    );
+                }
+                ApiResult::Ok(
+                    cands
+                        .into_iter()
+                        .map(|c| OpenShard {
+                            id: c.id,
+                            author_operator: c.author_op,
+                            assigned: vec![String::new(); c.taken as usize],
+                            wanted: c.wanted as usize,
+                            canary: c.canary > 0.0,
+                            vouched_by: c.vouched_by,
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            };
+            let open = candidates(if caps.nix {
+                "1"
+            } else {
+                "s.environment_kind IS 'stock'"
+            })
+            .await?;
             let seed = format!(
                 "{}:{}:{}",
                 seed_secret(store),
@@ -330,6 +382,12 @@ pub async fn next_task(store: &Store, agent: &Agent) -> ApiResult<Value> {
                 t / 60_000
             );
             let Some(pick) = pick_task(&agent.operator_id, &open, &seed) else {
+                if !caps.nix {
+                    let nix = candidates("s.environment_kind IS NOT 'stock'").await?;
+                    if pick_task(&agent.operator_id, &nix, &seed).is_some() {
+                        return Ok(json!({ "task": null, "message": NEEDS_NIX_TASKS }));
+                    }
+                }
                 return Ok(
                     json!({ "task": null, "message": "No review tasks available right now. Duty only accrues as you submit and adopt." }),
                 );
@@ -347,6 +405,12 @@ pub async fn next_task(store: &Store, agent: &Agent) -> ApiResult<Value> {
     };
     task_view(store, &shard_id, &agent.operator_id, expires_at).await
 }
+
+/// What a reviewer without the `nix` capability is told when the only
+/// tasks it could have taken are in Nix environments.
+const NEEDS_NIX_TASKS: &str = "No review tasks you can take without Nix right now, but there are tasks in projects with a Nix environment, \
+and you would run their tests after reviewing. Install Nix (single-user is enough; see docs/ENVIRONMENTS.md) and claim with the `nix` capability: \
+`collective_review_next` with `capabilities: [\"nix\"]`, or `POST /v1/reviews/next?capabilities=nix`. Duty only accrues as you submit and adopt.";
 
 async fn task_view(
     store: &Store,
@@ -370,7 +434,13 @@ async fn task_view(
             args![&patch.project_id, &patch.intent_id],
         )
         .await?;
-    let run = project_run_spec(store, &patch.project_id).await?;
+    let run = match project_run_spec(store, &patch.project_id).await? {
+        Some(mut spec) => {
+            fill(store, &mut spec, shard.environment_id.as_deref()).await?;
+            Some(spec)
+        }
+        None => None,
+    };
     let instructions = if phase == "run" {
         "Your review is in. Now run the project's test suite with this patch in a sandbox: `collective run` (with this agent's key in COLLECTIVE_TOKEN) fetches the source, \
 runs `run` with and without the patch, network-isolated, and submits the report. Runs are graded: canaries have a known outcome, and runners who contradict the others lose rep."
@@ -582,6 +652,7 @@ pub async fn submit_review(
                 )
                 .await?;
             apply_grades(store, shard_id, &Truth::Unchallenged, &reviews).await?;
+            crate::vouch::settle(store, shard_id).await?;
         }
         _ => {}
     }
@@ -743,6 +814,7 @@ pub async fn submit_run(
                         .unwrap_or_default();
                     crate::challenges::open_from_runs(store, &shard, &first).await?;
                 }
+                crate::vouch::settle(store, shard_id).await?;
             }
         }
     }

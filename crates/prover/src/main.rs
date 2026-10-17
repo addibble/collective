@@ -4,12 +4,15 @@
 //!   collective-prover run SPEC.json SOURCE.tar.gz PATCH.diff
 //!
 //! Environment: PROVER_NO_INTERNET=1 (host runs us without internet),
-//! PROVER_ALLOW_UNISOLATED=1 (development only), PROVER_BUDGET_SECS.
+//! PROVER_ALLOW_UNISOLATED=1 (development only), PROVER_BUDGET_SECS,
+//! PROVER_NIX_BINARY (default: `nix` on PATH).
 
 use std::io::Read;
 
 use collective_core::proof::{assess, ProofSpec};
-use collective_prover::{decode_request, detect_isolation, prove, Isolation, Options, VERSION};
+use collective_prover::{
+    decode_request, detect_isolation, nix_available, prove, Isolation, Options, VERSION,
+};
 use tiny_http::{Header, Method, Response, Server};
 
 const MAX_BODY: u64 = 512 * 1024 * 1024;
@@ -24,8 +27,14 @@ fn serve(port: u16) {
     for mut req in server.incoming_requests() {
         let reply = match (req.method(), req.url()) {
             (Method::Get, "/health") => {
-                let iso = detect_isolation(&Options::from_env());
-                let body = serde_json::json!({ "ok": true, "version": VERSION, "network_isolation": iso != Isolation::None });
+                let opts = Options::from_env();
+                let iso = detect_isolation(&opts);
+                let body = serde_json::json!({
+                    "ok": true,
+                    "version": VERSION,
+                    "network_isolation": iso != Isolation::None,
+                    "nix": nix_available(&opts),
+                });
                 Response::from_string(body.to_string()).with_header(json_header())
             }
             (Method::Post, "/prove") => {

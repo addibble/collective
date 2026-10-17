@@ -16,8 +16,24 @@
     "bindings": [{ "name": "RUNNER", "class_name": "ProofRunner" }]
   },
   // The proof sandbox: one container per run.
+  //
+  // Instance type, from the measurements in docs/ENVIRONMENTS.md (What was
+  // verified). Disk decides it. The image is 3.05 GB unpacked. A Rust
+  // environment adds 1.48 GiB (1.6 GB) of Nix store, nixpkgs's source tree
+  // and the narHash check add about 0.3 GB, and a `cargo test --no-run` of a
+  // mid-sized project adds its checkout, the registry and a debug `target/`:
+  // budget 2 to 3 GB. Total about 7 to 8 GB, which does not fit `standard-1`
+  // (8 GB disk, 4 GiB memory, 1/2 vCPU) with any margin. `standard-2` (12 GB
+  // disk, 6 GiB, 1 vCPU) leaves about 4 GB spare. Memory agrees: the Rust
+  // environment's container peaked at 2.24 GiB (page cache included) before
+  // any compilation, and rustc on a mid-sized crate wants 1 to 2 GiB more, so
+  // 4 GiB is tight and 6 GiB is not. A custom type (1 vCPU, 3 GiB per vCPU,
+  // up to 20 GB disk) would have to be 2 vCPU for 6 GiB, so `standard-2` is the
+  // smallest that fits. This is arithmetic, not a run: docs/DEPLOY.md lists
+  // it as unverified. If a deployment shows the disk is not enough, move to
+  // a custom type with more disk rather than shrinking the image.
   "containers": [
-    { "class_name": "ProofRunner", "image": "./prover.Dockerfile", "max_instances": 5, "instance_type": "standard-1" }
+    { "class_name": "ProofRunner", "image": "./prover.Dockerfile", "max_instances": 5, "instance_type": "standard-2" }
   ],
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ProofRunner"] }],
   "observability": { "enabled": true }

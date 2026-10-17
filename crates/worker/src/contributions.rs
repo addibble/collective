@@ -97,7 +97,7 @@ pub async fn contribute(store: &Store, agent: &Agent, c: Contribution) -> ApiRes
             l.path, l.start, l.end
         ));
     }
-    let spec = ProofSpec {
+    let mut spec = ProofSpec {
         kind: ProofKind::Regression,
         ecosystem: c.ecosystem,
         tests: c.tests,
@@ -105,6 +105,7 @@ pub async fn contribute(store: &Store, agent: &Agent, c: Contribution) -> ApiRes
         files: vec![],
         repeats: 2,
         timeout_secs: 120,
+        environment: Default::default(),
     };
     spec.validate().map_err(|e| ApiError::new(400, e))?;
 
@@ -135,6 +136,12 @@ pub async fn contribute(store: &Store, agent: &Agent, c: Contribution) -> ApiRes
     }
 
     let project = store.require_project(&c.project, true).await?;
+    // Verified, and later run by reviewers, in the project's current
+    // environment, pinned before anything is stored.
+    let environment = crate::environments::current(store, &project.id).await?;
+    if let Some((_, e)) = &environment {
+        spec.environment = e.clone();
+    }
     let patch_id = collective_core::diff::patch_id(&base, &files);
     if store.patch_row(&patch_id).await?.is_some() {
         return status(409, "this diff is already known");
@@ -161,7 +168,16 @@ pub async fn contribute(store: &Store, agent: &Agent, c: Contribution) -> ApiRes
         })
         .await?;
     // Not offered to anyone until verified.
-    let task = create_task(store, &row, &files, Some(&c.planted), None, "verifying").await?;
+    let task = create_task(
+        store,
+        &row,
+        &files,
+        Some(&c.planted),
+        None,
+        "verifying",
+        &environment,
+    )
+    .await?;
     let id = new_id();
     store
         .db
@@ -171,8 +187,8 @@ pub async fn contribute(store: &Store, agent: &Agent, c: Contribution) -> ApiRes
                 args![MAX_REVIEWERS, &task],
             )?,
             store.db.stmt(
-                "INSERT INTO canary_contributions (id, operator_id, agent_id, patch_id, task_id, spec, planted, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                args![&id, &agent.operator_id, &agent.id, &patch_id, &task, serde_json::to_string(&spec)?, serde_json::to_string(&c.planted)?, now()],
+                "INSERT INTO canary_contributions (id, operator_id, agent_id, patch_id, task_id, spec, planted, created_at, environment_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                args![&id, &agent.operator_id, &agent.id, &patch_id, &task, serde_json::to_string(&spec)?, serde_json::to_string(&c.planted)?, now(), crate::environments::pin_id(&environment)],
             )?,
         ])
         .await?;
@@ -196,13 +212,15 @@ pub struct JobRow {
     pub spec: String,
     pub state: String,
     pub verdict: Option<String>,
+    /// The environment pinned at creation (NULL: stock).
+    pub environment_id: Option<String>,
 }
 
 pub async fn job(store: &Store, id: &str) -> ApiResult<JobRow> {
     match store
         .db
         .first::<JobRow>(
-            "SELECT operator_id, patch_id, spec, state, verdict FROM canary_contributions WHERE id = ?",
+            "SELECT operator_id, patch_id, spec, state, verdict, environment_id FROM canary_contributions WHERE id = ?",
             args![id],
         )
         .await?

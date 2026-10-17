@@ -158,6 +158,7 @@ fn task_picking_never_gives_authors_their_own_patch() {
             assigned: vec![],
             wanted: 3,
             canary: false,
+            vouched_by: None,
         },
         OpenShard {
             id: "done".into(),
@@ -165,6 +166,7 @@ fn task_picking_never_gives_authors_their_own_patch() {
             assigned: vec!["a".into(), "b".into(), "c".into()],
             wanted: 3,
             canary: false,
+            vouched_by: None,
         },
         OpenShard {
             id: "seen".into(),
@@ -172,6 +174,7 @@ fn task_picking_never_gives_authors_their_own_patch() {
             assigned: vec!["me".into()],
             wanted: 3,
             canary: false,
+            vouched_by: None,
         },
         OpenShard {
             id: "ok".into(),
@@ -179,6 +182,7 @@ fn task_picking_never_gives_authors_their_own_patch() {
             assigned: vec![],
             wanted: 3,
             canary: false,
+            vouched_by: None,
         },
     ];
     for i in 0..20 {
@@ -194,6 +198,7 @@ fn shard(id: &str, canary: bool) -> OpenShard {
         assigned: vec![],
         wanted: 3,
         canary,
+        vouched_by: None,
     }
 }
 
@@ -468,4 +473,134 @@ fn contributed_canaries_pay_less_and_stay_off_the_jury_record() {
     assert!(e
         .iter()
         .all(|x| x.reason != "caught a canary" && x.reason != "missed a canary"));
+}
+
+// ---------------------------------------------------------------------------
+// Newcomers: pending tasks and vouching
+// ---------------------------------------------------------------------------
+
+use collective_core::proof::RunOutcome as Run;
+use collective_core::vouch::*;
+
+#[test]
+fn a_task_opens_only_for_an_author_with_standing() {
+    assert_eq!(
+        MIN_AUTHOR_TRUST,
+        collective_core::environment::MIN_PROPOSER_TRUST
+    );
+    let newcomer = collective_core::score::trust(0.0);
+    assert!(!task_opens(newcomer), "a newcomer's task waits");
+    assert!(!task_opens(0.49));
+    assert!(task_opens(MIN_AUTHOR_TRUST));
+    assert!(task_opens(1.0));
+    assert!(!task_opens(f64::NAN), "fails closed");
+}
+
+#[test]
+fn vouching_needs_standing_after_the_loan_and_spendable_rep() {
+    assert!(may_vouch(0.8, 25.0));
+    assert!(may_vouch(MIN_AUTHOR_TRUST, VOUCH_LOAN_REP));
+    assert!(!may_vouch(0.49, 100.0), "no standing once the loan is out");
+    assert!(
+        !may_vouch(0.9, VOUCH_LOAN_REP - 0.01),
+        "genesis-only standing can't be lent"
+    );
+    assert!(!may_vouch(f64::NAN, 100.0));
+    assert!(!may_vouch(0.9, f64::NAN));
+    assert!(!may_vouch_for("op", "op"), "never for your own operator");
+    assert!(may_vouch_for("founder", "newcomer"));
+}
+
+#[test]
+fn a_loan_is_debited_returned_or_lost_and_never_earns() {
+    let made = vouch_entries(VouchEvent::Made, "f");
+    assert_eq!(
+        made,
+        vec![collective_core::LedgerEntry::new(
+            "f",
+            -VOUCH_LOAN_REP,
+            VOUCH_LOAN
+        )]
+    );
+    let back = vouch_entries(VouchEvent::Returned, "f");
+    assert_eq!(back[0].reason, VOUCH_RETURNED);
+    // Made then returned nets exactly zero: vouching is a favour, not income.
+    assert_eq!(net(&[made.clone(), back].concat(), "f"), 0.0);
+    // Made then lost: the debit stands.
+    let lost = vouch_entries(VouchEvent::Lost, "f");
+    assert!(lost.is_empty());
+    assert_eq!(net(&[made, lost].concat(), "f"), -VOUCH_LOAN_REP);
+    assert_eq!(vouch_ref("abc"), "vouch:abc");
+}
+
+#[test]
+fn a_voucher_is_an_interested_party_and_never_reviews_the_task() {
+    let i = interested("author", Some("founder"));
+    assert!(i.contains("author") && i.contains("founder") && i.len() == 2);
+    assert_eq!(interested("author", None).len(), 1);
+
+    let open = vec![
+        OpenShard {
+            id: "vouched".into(),
+            author_operator: "newcomer".into(),
+            assigned: vec![],
+            wanted: 3,
+            canary: false,
+            vouched_by: Some("founder".into()),
+        },
+        OpenShard {
+            id: "other".into(),
+            author_operator: "x".into(),
+            assigned: vec![],
+            wanted: 3,
+            canary: false,
+            vouched_by: None,
+        },
+    ];
+    for i in 0..20 {
+        let seed = format!("s{i}");
+        assert_eq!(pick_task("founder", &open, &seed).unwrap().id, "other");
+    }
+    assert!(pick_task("founder", &open[..1], "s").is_none());
+    assert!((0..20).any(|i| pick_task("r", &open, &format!("s{i}")).unwrap().id == "vouched"));
+}
+
+#[test]
+fn a_loan_settles_when_the_task_resolves() {
+    let facts = |found_bad, challenge_open, review, runs| VouchFacts {
+        found_bad,
+        challenge_open,
+        review,
+        runs,
+    };
+    use TaskReview::*;
+    use TaskRuns::*;
+    // Found bad by any challenge: lost, whatever else is going on.
+    for review in [Underway, Clean, ChallengeCleared] {
+        assert_eq!(
+            settle_vouch(&facts(true, true, review, Pending)),
+            Some(VouchEvent::Lost)
+        );
+    }
+    // Waits while anything is undecided.
+    assert_eq!(settle_vouch(&facts(false, false, Underway, NotOwed)), None);
+    assert_eq!(settle_vouch(&facts(false, true, Clean, NotOwed)), None);
+    assert_eq!(settle_vouch(&facts(false, false, Clean, Pending)), None);
+    assert_eq!(
+        settle_vouch(&facts(false, false, Clean, Settled(Some(Run::Regressed)))),
+        None,
+        "a regression majority's challenge decides it"
+    );
+    // Resolved without the patch being found bad: returned.
+    for runs in [NotOwed, Settled(Some(Run::Passed)), Settled(None)] {
+        assert_eq!(
+            settle_vouch(&facts(false, false, Clean, runs)),
+            Some(VouchEvent::Returned)
+        );
+    }
+    assert_eq!(
+        settle_vouch(&facts(false, false, ChallengeCleared, Pending)),
+        Some(VouchEvent::Returned),
+        "a cleared challenge was adjudicated"
+    );
 }

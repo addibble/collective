@@ -15,9 +15,10 @@
 //! - **a fresh copy of the tree** per run, so one run cannot prepare the
 //!   next.
 //!
-//! Dependency fetches are the only step with network, and they are fixed
-//! commands that download without executing project code (see
-//! `collective_core::proof::Ecosystem`).
+//! Dependency fetches and, for a project with a Nix environment, its
+//! realisation are the only steps with network, and they are fixed commands
+//! that download without executing project code (see
+//! `collective_core::proof::Ecosystem` and `collective_core::environment`).
 //!
 //! The prover reports what happened; `collective_core::proof::assess`
 //! decides what it means, and fails closed.
@@ -30,6 +31,9 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use collective_core::environment::{
+    compose_env, Environment, NixEnvironment, StorePath, REALISE_TIMEOUT_SECS,
+};
 use collective_core::proof::{
     count_tests, Ecosystem, ProofKind, ProofReport, ProofSpec, RunResult, RunStatus, SetupResult,
     Tree, BUILD_TIMEOUT_SECS,
@@ -49,9 +53,13 @@ pub struct Options {
     pub allow_unisolated: bool,
     /// Wall-clock budget for the whole proof.
     pub budget: Duration,
-    /// Extra environment for the networked dependency fetch only (e.g. an
-    /// egress proxy and its CA). Never passed to builds or runs.
+    /// Extra environment for the networked steps only, the dependency fetch
+    /// and the environment's realisation (e.g. an egress proxy and its CA).
+    /// Never passed to builds or runs.
     pub setup_env: Vec<(String, String)>,
+    /// The `nix` binary that realises Nix environments. `None` looks it up
+    /// on the prover's own `PATH`.
+    pub nix_binary: Option<PathBuf>,
 }
 
 impl Options {
@@ -74,6 +82,7 @@ impl Options {
                 .filter(|k| !k.is_empty())
                 .filter_map(|k| std::env::var(k).ok().map(|v| (k.to_string(), v)))
                 .collect(),
+            nix_binary: std::env::var_os("PROVER_NIX_BINARY").map(PathBuf::from),
         }
     }
 }
@@ -302,13 +311,30 @@ fn run_command<S: AsRef<std::ffi::OsStr>>(
     timeout: Duration,
     log: &Path,
 ) -> std::io::Result<(RunStatus, Option<i32>, String)> {
+    run_command_to(argv, cwd, env, timeout, log, None)
+}
+
+/// As [`run_command`], but with stdout written to `stdout` when given (the
+/// log, and the returned tail, then hold stderr only).
+fn run_command_to<S: AsRef<std::ffi::OsStr>>(
+    argv: &[S],
+    cwd: &Path,
+    env: &[(&str, String)],
+    timeout: Duration,
+    log: &Path,
+    stdout: Option<&Path>,
+) -> std::io::Result<(RunStatus, Option<i32>, String)> {
     let out = fs::File::create(log)?;
+    let stdout = match stdout {
+        Some(p) => fs::File::create(p)?,
+        None => out.try_clone()?,
+    };
     let mut cmd = Command::new("setsid");
     cmd.args(argv)
         .current_dir(cwd)
         .env_clear()
         .stdin(Stdio::null())
-        .stdout(out.try_clone()?)
+        .stdout(stdout)
         .stderr(out);
     for (k, v) in env {
         cmd.env(k, v);
@@ -348,6 +374,138 @@ fn base_env(home: &Path) -> Vec<(&'static str, String)> {
         // Never let git discover a repository above the tree.
         ("GIT_CEILING_DIRECTORIES", home.parent().unwrap_or(home).display().to_string()),
     ]
+}
+
+/// Variables passed from the prover's own environment to `nix`, so it finds
+/// its CA bundle and configuration (the image sets `NIX_SSL_CERT_FILE`).
+const NIX_PASSTHROUGH: &[&str] = &["NIX_SSL_CERT_FILE", "SSL_CERT_FILE", "NIX_CONF_DIR"];
+
+/// The `nix` binary: the one the options name, or the first on the
+/// prover's own `PATH`.
+fn find_nix(opts: &Options) -> Result<PathBuf, String> {
+    if let Some(p) = &opts.nix_binary {
+        return if p.is_file() {
+            Ok(p.clone())
+        } else {
+            Err(format!(
+                "nix is not installed: {} does not exist",
+                p.display()
+            ))
+        };
+    }
+    std::env::var_os("PATH")
+        .iter()
+        .flat_map(std::env::split_paths)
+        .map(|d| d.join("nix"))
+        .find(|p| p.is_file())
+        .ok_or_else(|| "nix is not installed: no `nix` on PATH".to_string())
+}
+
+/// Whether this prover can realise Nix environments (`nix --version` runs).
+pub fn nix_available(opts: &Options) -> bool {
+    find_nix(opts).is_ok_and(|nix| {
+        Command::new(nix)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    })
+}
+
+/// A path `nix build --print-out-paths` may print: a top-level entry of
+/// `/nix/store`, nothing else.
+fn is_store_path(p: &str) -> bool {
+    p.strip_prefix("/nix/store/").is_some_and(|name| {
+        !name.is_empty()
+            && !name.starts_with('.')
+            && !name.contains('/')
+            && !name.chars().any(char::is_whitespace)
+    })
+}
+
+/// Realises a Nix environment by substitution only and returns the
+/// variables it adds to every later step (`collective_core::environment::compose_env`).
+/// Runs as the prover's own user, with network, with `HOME` inside the
+/// workdir so Nix's per-user caches are discarded with it.
+fn realise(
+    nix_env: &NixEnvironment,
+    opts: &Options,
+    work: &Path,
+) -> Result<Vec<(String, String)>, String> {
+    let nix = find_nix(opts)?;
+    let refs = nix_env.flake_refs();
+    let mut argv: Vec<std::ffi::OsString> = vec![nix.into()];
+    argv.extend(nix_env.realise_argv().into_iter().skip(1).map(Into::into));
+    let home = work.join("home-nix");
+    fs::create_dir_all(&home).map_err(|e| format!("home: {e}"))?;
+    let passthrough: Vec<(String, String)> = NIX_PASSTHROUGH
+        .iter()
+        .filter_map(|k| std::env::var(k).ok().map(|v| (k.to_string(), v)))
+        .collect();
+    let mut env: Vec<(&str, String)> = base_env(&home);
+    env.extend(passthrough.iter().map(|(k, v)| (k.as_str(), v.clone())));
+    env.extend(opts.setup_env.iter().map(|(k, v)| (k.as_str(), v.clone())));
+    let (log, out) = (work.join("environment.log"), work.join("environment.out"));
+    let timeout = Duration::from_secs(REALISE_TIMEOUT_SECS as u64);
+    match run_command_to(&argv, work, &env, timeout, &log, Some(&out)) {
+        Ok((RunStatus::Passed, ..)) => {}
+        Ok((st, _, tail)) => return Err(format!("nix build {st:?}: {}", tail.trim())),
+        Err(e) => return Err(format!("could not run nix: {e}")),
+    }
+    let printed = fs::read_to_string(&out).map_err(|e| format!("nix output: {e}"))?;
+    let paths: Vec<&str> = printed
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    // A package prints one path per output it installs (`openssl` prints its
+    // `bin` and `man`), so there may be more paths than packages, never fewer.
+    if paths.len() < refs.len() {
+        return Err(format!(
+            "nix build printed {} store paths for {} packages: {}",
+            paths.len(),
+            refs.len(),
+            printed.trim()
+        ));
+    }
+    let mut store = Vec::with_capacity(paths.len());
+    for p in paths {
+        if !is_store_path(p) {
+            return Err(format!("nix build printed a path outside /nix/store/: {p}"));
+        }
+        let dir = Path::new(p);
+        if fs::symlink_metadata(dir).is_err() {
+            return Err(format!("{p} does not exist after realisation"));
+        }
+        let has = |sub: &str| dir.join(sub).is_dir();
+        store.push(StorePath {
+            path: p.to_string(),
+            has_bin: has("bin"),
+            has_lib: has("lib"),
+            has_include: has("include"),
+            has_lib_pkgconfig: has("lib/pkgconfig"),
+            has_share_pkgconfig: has("share/pkgconfig"),
+        });
+    }
+    Ok(compose_env(&store))
+}
+
+/// Adds the realised environment's variables to a step's: `PATH` gets the
+/// environment's directories ahead of its own, the rest are added as given.
+fn with_environment<'a>(
+    mut env: Vec<(&'a str, String)>,
+    extra: &'a [(String, String)],
+) -> Vec<(&'a str, String)> {
+    for (k, v) in extra {
+        match env.iter_mut().find(|(ek, _)| *ek == k.as_str()) {
+            Some((_, ev)) if k == "PATH" => *ev = format!("{v}:{ev}"),
+            Some((_, ev)) => *ev = v.clone(),
+            None => env.push((k.as_str(), v.clone())),
+        }
+    }
+    env
 }
 
 fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
@@ -463,26 +621,31 @@ fn prove_inner(spec: &ProofSpec, source_tgz: &[u8], patch: &str, opts: &Options)
     let home = work.0.join("home");
     let _ = fs::create_dir_all(&home);
     let log = work.0.join("setup.log");
-    match run_command(
-        &[
-            "git",
-            "apply",
-            "--whitespace=nowarn",
-            patch_file.to_str().unwrap_or_default(),
-        ],
-        &patched,
-        &base_env(&home),
-        Duration::from_secs(60),
-        &log,
-    ) {
-        Ok((RunStatus::Passed, ..)) => {}
-        Ok((_, _, out)) => {
-            return setup_error(
-                format!("patch does not apply to the base commit: {}", out.trim()),
-                isolation,
-            )
+    // An empty patch means both trees are the base: an environment
+    // proposal's job runs the suite that way (docs/ENVIRONMENTS.md). `git
+    // apply` refuses empty input, so it is skipped rather than asked.
+    if !patch.trim().is_empty() {
+        match run_command(
+            &[
+                "git",
+                "apply",
+                "--whitespace=nowarn",
+                patch_file.to_str().unwrap_or_default(),
+            ],
+            &patched,
+            &base_env(&home),
+            Duration::from_secs(60),
+            &log,
+        ) {
+            Ok((RunStatus::Passed, ..)) => {}
+            Ok((_, _, out)) => {
+                return setup_error(
+                    format!("patch does not apply to the base commit: {}", out.trim()),
+                    isolation,
+                )
+            }
+            Err(e) => return setup_error(format!("git apply: {e}"), isolation),
         }
-        Err(e) => return setup_error(format!("git apply: {e}"), isolation),
     }
 
     // 3. The finder's files go into both trees.
@@ -505,12 +668,24 @@ fn prove_inner(spec: &ProofSpec, source_tgz: &[u8], patch: &str, opts: &Options)
         );
     }
 
-    // 4. Dependency fetch: fixed commands, with network, no project code.
+    // 4. Environment: realise the project's Nix package set by substitution
+    //    only, with network, as the prover's user. Its variables apply to
+    //    every later step. Anything that fails makes the run inconclusive,
+    //    never "the stock environment instead".
+    let env_extra = match &spec.environment {
+        Environment::Stock => vec![],
+        Environment::Nix(n) => match realise(n, opts, &work.0) {
+            Ok(v) => v,
+            Err(e) => return setup_error(format!("environment: {e}"), isolation),
+        },
+    };
+
+    // 5. Dependency fetch: fixed commands, with network, no project code.
     if let Some(setup) = spec.ecosystem.setup_command() {
         for tree in [&base, &patched] {
             let mut env = base_env(&home);
             env.extend(tree_env(tree));
-            let mut env: Vec<(&str, String)> = env;
+            let mut env = with_environment(env, &env_extra);
             env.extend(opts.setup_env.iter().map(|(k, v)| (k.as_str(), v.clone())));
             match run_command(&["sh", "-c", setup], tree, &env, SETUP_TIMEOUT, &log) {
                 Ok((RunStatus::Passed, ..)) => {}
@@ -525,7 +700,7 @@ fn prove_inner(spec: &ProofSpec, source_tgz: &[u8], patch: &str, opts: &Options)
         }
     }
 
-    // 5. Build once per tree: offline, isolated and unprivileged, because
+    // 6. Build once per tree: offline, isolated and unprivileged, because
     //    build scripts and macros are project code too. A base that does
     //    not build makes the proof inconclusive; a patched tree that does
     //    not build simply fails its runs.
@@ -538,6 +713,7 @@ fn prove_inner(spec: &ProofSpec, source_tgz: &[u8], patch: &str, opts: &Options)
             }
             let mut env = base_env(&build_home);
             env.extend(tree_env(dir));
+            let mut env = with_environment(env, &env_extra);
             env.extend(
                 spec.ecosystem
                     .offline_env()
@@ -562,7 +738,7 @@ fn prove_inner(spec: &ProofSpec, source_tgz: &[u8], patch: &str, opts: &Options)
         }
     }
 
-    // 6. Runs, interleaved so a slow or flaky moment hits both trees.
+    // 7. Runs, interleaved so a slow or flaky moment hits both trees.
     let timeout = Duration::from_secs(spec.timeout_secs as u64);
     let mut runs = Vec::new();
     for attempt in 0..spec.repeats {
@@ -590,6 +766,7 @@ fn prove_inner(spec: &ProofSpec, source_tgz: &[u8], patch: &str, opts: &Options)
             }
             let mut env = base_env(&run_home);
             env.extend(tree_env(&run_dir));
+            let mut env = with_environment(env, &env_extra);
             env.extend(
                 spec.ecosystem
                     .offline_env()

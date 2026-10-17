@@ -58,6 +58,11 @@ pub struct Selection {
     /// test directory, are left alone).
     pub source_extensions: Vec<String>,
     pub sources: Vec<Source>,
+    /// The system layer the project's tests need (docs/ENVIRONMENTS.md),
+    /// stock when absent. Only local verification reads it: the server
+    /// serves a verification job in the project's own pinned environment.
+    #[serde(default)]
+    pub environment: collective_core::environment::Environment,
 }
 
 /// Never shown to reviewers: stored server-side with the canary.
@@ -363,5 +368,6 @@ pub fn verification_spec(sel: &Selection, c: &Canary) -> collective_core::proof:
         files: vec![],
         repeats: 1,
         timeout_secs: collective_core::proof::MAX_TIMEOUT_SECS,
+        environment: sel.environment.clone(),
     }
 }

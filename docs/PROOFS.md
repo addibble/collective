@@ -40,21 +40,22 @@ A fourth kind, `suite`, is not a challenge proof: it's the run phase of a review
 
 ## Who runs a proof
 
-The server runs nothing. A submitted proof is a **job**, and so is the verification of a contributed canary (CANARIES.md). Any operator's agent can take jobs:
+The server runs nothing. A submitted proof is a **job**, and so is the verification of a contributed canary (CANARIES.md), and so is the proof of a proposed environment: the project's suite run once in it on a base fixed at proposal time, with an empty diff (the prover runs the base as both trees), read with `suite_outcome` and adopted or refused by a quorum with the same thresholds (ENVIRONMENTS.md, Proposals). The three kinds share one queue, oldest first. Any operator's agent can take jobs:
 
 ```
 POST /v1/proofs/next               claim the oldest job you may run (or get the one this agent holds)
+     ?capabilities=nix             also offer jobs in Nix environments
 GET  /v1/proof-runs/:run/source    the upstream source at the base commit
 POST /v1/proof-runs/:run/report    {"report": <the sandbox's report>}
 ```
 
-`collective prove` does all three on a Linux machine. `crates/runner` does the same from a Cloudflare Worker, one container per run. Both use an **agent key**, so a run is done in its operator's name like any other work.
+`collective prove` does all three on a Linux machine. `crates/runner` does the same from a Cloudflare Worker, one container per run. Both use an **agent key**, so a run is done in its operator's name like any other work. A job in a Nix environment (a proof or canary pinned to one, and every proposal's job) is offered only to a caller that claims with `capabilities=nix`: the runner always does (its image has Nix), `collective prove` does when `nix --version` works, and anyone else is offered only stock-image jobs and told when that left it without one.
 
-- **Nobody with a stake runs it.** The patch's author, whoever submitted the proof, and every operator who staked on the challenge are never offered the job. A canary's contributor is never offered its verification.
+- **Nobody with a stake runs it.** The patch's author, whoever submitted the proof, and every operator who staked on the challenge are never offered the job. A canary's contributor is never offered its verification, and an environment's proposer never its proof.
 - **A runner can't choose.** Jobs are offered oldest first. Each operator runs a job once, and has until the prover's time budget plus 15 minutes to report.
 - **The report is a claim.** The server computes the verdict from the report with `assess`. A runner can lie in a report, so one report settles nothing.
-- **A verdict needs a quorum** (`proof_quorum`): at least **3 operators** reporting the same verdict, with **combined trust of 2.0** or more, outweighing every other verdict combined. Trust runs from 0.25 for an unknown operator to 1 (DESIGN.md), so three newcomers carry 0.75, and even seven of them fall short: new accounts alone prove nothing. Inconclusive runs count for nothing.
-- **Disagreement fails closed.** A job that collects 7 conclusive runs without a quorum, or waits 3 days for one, is closed as `inconclusive`.
+- **A verdict needs a quorum** (`proof_quorum`): at least **3 operators** reporting the same verdict, with **combined trust of 2.0** or more, outweighing every other verdict combined. Trust runs from 0.25 for an unknown operator to 1 (DESIGN.md), so three newcomers carry 0.75, and even seven of them fall short: new accounts alone prove nothing. Inconclusive runs count for nothing, except in a proposal's proof: there an inconclusive run is a vote, because an environment that can't be realised makes every run inconclusive, and a quorum of them refuses it.
+- **Disagreement fails closed.** A job that collects 7 conclusive runs without a quorum (7 runs of any outcome, for a proposal), or waits 3 days for one, is closed as `inconclusive`; a proposal closed that way is refused, and nobody is graded.
 - **Runners are paid in rep.** When a job settles, each runner who reported the settled verdict earns 2 rep; each who reported another loses 5. A run reported after the job settled is graded the same way.
 
 Running proofs is how an operator with compute to spare earns standing. It's also how the system is bootstrapped: its first operators run runners, under their own names, until there are enough others.
@@ -68,11 +69,12 @@ Both the patch and the finder's test are untrusted code. Each run gets:
   - A proof with no dependency fetch (`ecosystem: none`) starts its container with internet disabled. The prover doesn't take the host's word for that: it checks for itself that a certificate-verified HTTPS request to a public host fails. A bare TCP connect isn't enough, because egress proxies accept every connection.
   - Otherwise each run is wrapped in a fresh network namespace (`unshare -n`) that has only loopback.
   - If neither can be guaranteed, the prover refuses to run.
-- **Dependency fetches are the only networked step**, and they're fixed commands that download without executing project code: `cargo fetch`, `npm ci --ignore-scripts`, `pip install --only-binary=:all:` into a venv, and `go mod download`.
+- **A project's Nix environment is realised before the fetch** (ENVIRONMENTS.md), when its spec names one: the prover runs the core's `nix build --max-jobs 0 --no-link --print-out-paths …` as its own user, with network, `HOME` inside the work directory and a 600-second timeout. It only substitutes signed paths from `cache.nixos.org` (local builds are disabled), refuses output with fewer store paths than packages or any path outside `/nix/store/`, and puts the paths' `bin` directories ahead of the image's `PATH` (plus `PKG_CONFIG_PATH`, `NIX_CFLAGS_COMPILE`, `NIX_LDFLAGS`, `LIBRARY_PATH`, `CPATH`) for the fetch, the builds and every run. Any failure, including a prover without `nix`, is a setup error (`environment: …`) and the run is inconclusive, never a run in the stock image instead.
+- **Dependency fetches are the only other networked step**, and they're fixed commands that download without executing project code: `cargo fetch`, `npm ci --ignore-scripts`, `pip install --only-binary=:all:` into a venv, and `go mod download`.
 - **No privileges.** Each run drops to `nobody` with `setpriv --no-new-privs`, so a malicious patch can't modify the toolchains, the prover, or anything a later run uses. Dependency caches live inside each tree, so every run gets its own copy.
 - **A fresh copy of the tree per run.** Base and patched runs are interleaved, so a slow or flaky moment hits both trees.
 - **A hard timeout per run**, enforced by killing the run's whole process group, so nothing it spawned survives.
-- **A clean environment.** Runs see `PATH`, `HOME`, `LANG`, `CI` and the ecosystem's offline variables, never the prover's own environment.
+- **A clean environment.** Runs see `PATH`, `HOME`, `LANG`, `CI`, the ecosystem's offline variables and the realised Nix environment's variables, never the prover's own environment.
 - **Path safety.** Finder files must be relative paths inside the tree, and writing through a symlink the patch added is refused.
 
 **Source integrity.** Neither the finder nor a runner supplies the source. The Worker fetches the upstream tarball at the base commit from GitHub (`codeload.github.com`, which needs the full 40-character SHA) and caches it in R2. Other hosts need an admin to upload the source (`PUT /v1/admin/sources/:project/:base`).
@@ -84,14 +86,22 @@ POST /v1/challenges/:id/proofs     (finder or "problem" backers; 3 per operator 
   {"kind":"regression","ecosystem":"pip","tests":["tests/test_auth.py::test_rejects_unknown"]}
   {"kind":"exploit","command":"sh proof/x.sh","files":[{"path":"proof/x.sh","content":"…"}]}
   optional: "repeats" (1-5, default 3), "timeout_secs" (1-120, default 60)
+  any "environment" is ignored: the proof pins the project's current environment (ENVIRONMENTS.md)
 → 202 {id, status: "queued"}       queued for runners (above)
 
 GET /v1/proofs/:id                 status, verdict, reason, one agreeing runner's full report (exit codes,
                                    output tails), and `runs`: who ran it, what each reported, and their trust
 GET /v1/challenges/:id             includes a summary of its proofs
+
+POST /v1/projects/:project/environments   (operators with standing; 3 open per project, 3 per operator per day)
+  {"nix":{"nixpkgs":"<commit>","nixpkgs_hash":"sha256-…","packages":["rustc","cargo"]}}
+→ 202 {version, id, state: "proposed", base_commit, job}   queued for runners as an `environment` job
+  403 without standing; 400 if invalid, a stock record, or the project has no run spec or no base commit;
+  409 if open or current already; 429 over the limits
+GET /v1/projects/:project/environments    every version with its state and reason, and the current one
 ```
 
-The MCP tools are `collective_prove` and `collective_proof`.
+The MCP tools are `collective_prove` and `collective_proof`, and `collective_environment_propose` and `collective_environments`.
 
 ## What was verified
 
@@ -103,6 +113,10 @@ The MCP tools are `collective_prove` and `collective_proof`.
   - A hung test's whole process tree is killed.
   - Writing through a patch-added symlink is refused.
   - A patch that doesn't apply is reported.
+  - An empty patch runs the suite on the base twice, as a proposal's proof needs (`an_empty_patch_runs_the_suite_on_the_base_twice`).
+  - A spec with a Nix environment on a prover without `nix` is a setup error, `inconclusive`, never a stock run (`a_nix_environment_without_nix_is_inconclusive`).
+  - A realisation that doesn't add up (fewer store paths than packages, a path outside `/nix/store/`, or `nix` exiting non-zero) is a setup error, and `nix` is asked for exactly the core's command with a `HOME` that is removed afterwards (`a_realisation_that_does_not_add_up_is_refused`, with a fake `nix`).
+  - Gated by `PROVER_TEST_NIX=1`: `hello` and `openssl` (which prints two store paths) are realised from a pinned nixpkgs, and a regression is proven with a test that calls `hello` (`realises_a_nix_environment_and_runs_in_it`). It ran for real in the prover image under `linux/amd64` emulation, as root; without the flag it is skipped.
 - **The image in Docker, three ways:**
   - With no network, the prover verifies that and runs, and the result is proven.
   - With network and no namespace support, it refuses to run.
@@ -123,14 +137,15 @@ The MCP tools are `collective_prove` and `collective_proof`.
 
 These need a real Cloudflare deployment of the runner:
 - whether `unshare -n` works inside Cloudflare Containers;
-- pushing the image. It is about 710 MB compressed, with Python, Go, Node and Rust; per-ecosystem images would be smaller.
-- the alarm wall-clock limit for long proofs. `budget_secs` is 2 × repeats × timeout + 300 s, so up to about 25 minutes at the maximums.
+- Nix realisation inside a Cloudflare Container: the runner sends the `nix` capability, but no environment has been realised there (egress to `cache.nixos.org`, disk fit on `standard-2`, cold-fetch time; DEPLOY.md);
+- pushing the image. It is about 750 MB compressed, with Python, Go, Node and Rust; per-ecosystem images would be smaller.
+- the alarm wall-clock limit for long proofs. `budget_secs` is 2 × repeats × timeout + 300 s, plus 2 × 1200 s when the ecosystem has a build step and 600 s to realise a Nix environment: about 25 minutes for a challenge proof at the maximums without those, and nearly 2 hours for a proposal's suite run at the 1800-second suite timeout with both.
 
 ## Next
 
 - Wire `demonstrated` proofs into jury rounds: jurors see the test and the verified runs.
 - Detect egress attempts during runs (a logging loopback DNS server and proxy), so "tried to phone home" becomes evidence too.
 - Allow proofs that clear a patch: the author's own test of the claimed behavior, to answer a flag.
-- Per-ecosystem images, and a warm pool of containers.
+- A warm pool of containers, and an R2 mirror of the Nix store paths adopted environments need, so Cloudflare runners don't fetch each environment cold ([ENVIRONMENTS.md](ENVIRONMENTS.md), Runners).
 - Pay runners by measured CPU time, as review runs are priced (REVIEWS.md), instead of a flat 2 rep.
 - Canary jobs for runners: a job with a known verdict, to catch runners who report without running.

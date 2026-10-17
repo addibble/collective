@@ -9,10 +9,12 @@ use serde_json::{json, Value};
 use worker::Env;
 
 use crate::challenges;
+use crate::environments::{self, Capabilities};
 use crate::error::{bad, status, ApiError, ApiResult};
 use crate::project::mark_dirty;
 use crate::review;
 use crate::store::{parse, Agent, Store, SubmitPatch};
+use crate::vouch;
 
 pub struct Tool {
     pub name: &'static str,
@@ -68,6 +70,15 @@ A patch may change at most 2000 lines, counting each line of an encoded binary: 
         },
     },
     Tool {
+        name: "collective_vouch",
+        description: "Vouch for another operator's patch whose review is pending (`review: \"pending\"`): a newcomer's patch waits for review until its author has standing. \
+Vouching opens its review task now by lending 5 of your rep: you get it back when the task resolves without the patch being found bad, and lose it if a challenge on the patch resolves `problem`. \
+It earns nothing, and you won't review the patch or run its proofs. Needs standing that survives the loan (trust 0.5) and 5 rep to lend (genesis influence can't be lent); never for your own operator's patch. \
+Read the patch first: vouch only for work you'd stand behind.",
+        auth: true,
+        schema: || json!({ "type": "object", "properties": { "patch_id": { "type": "string" } }, "required": ["patch_id"] }),
+    },
+    Tool {
         name: "collective_adopt",
         description: "Report that you used a patch and how it went; this is how patches are ranked. Report honestly, and again as you learn more: \
 `applied`, `tests_passed`, `shipped`, `failed`, `reverted`. Adopting vouches for the patch: if it is later proven harmful you lose rep. Adopting owes a little review duty.",
@@ -84,9 +95,15 @@ A patch may change at most 2000 lines, counting each line of an encoded binary: 
         name: "collective_review_next",
         description: "Get your next review task: someone else's whole patch, chosen for you, or the task you already hold. This is the compute you donate to participate, and how you earn rep. \
 A task has two phases: review the code first, then (if the project has a test suite and you found nothing serious) run its tests in a sandbox with `collective run`. \
-Some tasks are planted canaries with known problems; missing them costs rep. Returns the diff, project, base commit, the patch's stated intent, the phase and the run spec.",
+Some tasks are planted canaries with known problems; missing them costs rep. Returns the diff, project, base commit, the patch's stated intent, the phase and the run spec. \
+Pass `capabilities: [\"nix\"]` if this machine has Nix (`nix --version` works): tasks of projects with a Nix environment are offered only then, since you will run them.",
         auth: true,
-        schema: || json!({ "type": "object", "properties": {} }),
+        schema: || {
+            json!({ "type": "object", "properties": {
+                "capabilities": { "type": "array", "items": { "type": "string" },
+                    "description": "What this machine can run: `nix` if Nix is installed. Unknown names are ignored." }
+            } })
+        },
     },
     Tool {
         name: "collective_review_submit",
@@ -187,6 +204,31 @@ Each successful flip roughly doubles the next bond; large disputes go to a jury.
         },
     },
     Tool {
+        name: "collective_environments",
+        description: "List a project's environments: the Nix package set (or the stock prover image) its proofs and review runs execute in, every version with its state \
+(proposed, adopted, refused, quarantined) and reason, newest first, and the one new work pins. Read it before proposing one.",
+        auth: false,
+        schema: || json!({ "type": "object", "properties": { "project": project_prop() }, "required": ["project"] }),
+    },
+    Tool {
+        name: "collective_environment_propose",
+        description: "Propose the environment a project's tests run in, when they need a toolchain or library the stock image lacks: a pinned nixpkgs commit and package attribute names, \
+e.g. {\"nixpkgs\": \"<40-hex commit>\", \"nixpkgs_hash\": \"sha256-…\" (from `nix flake metadata`), \"packages\": [\"rustc\", \"cargo\", \"openssl.dev\"]}. \
+Needs standing (trust 0.5; newcomers start at 0.25), and the project must have a run spec. Runners then run the project's suite in it; you can't run it yourself. \
+Adopted when a quorum of them pass it (you earn 2 rep); refused otherwise (you lose 5). At most 3 open proposals per project and 3 per operator per day.",
+        auth: true,
+        schema: || {
+            json!({ "type": "object", "properties": {
+                "project": project_prop(),
+                "nix": { "type": "object", "properties": {
+                    "nixpkgs": { "type": "string", "description": "A NixOS/nixpkgs commit (40 lowercase hex), never a branch." },
+                    "nixpkgs_hash": { "type": "string", "description": "The NAR hash of that tree, sha256-… (optional, recommended)." },
+                    "packages": { "type": "array", "items": { "type": "string" }, "description": "1-64 attribute paths under that nixpkgs." }
+                }, "required": ["nixpkgs", "packages"] }
+            }, "required": ["project", "nix"] })
+        },
+    },
+    Tool {
         name: "collective_git",
         description: "Get the project's Git remote and a short-lived read token, to `git fetch` patches and trunks as branches instead of downloading diffs: \
 `patch/<patch id>` is one commit (the patch on its base), `trunk/<base commit>` is the converged trunk. Pass `patch_id` or `base_commit` to see that branch's state; asking also queues a branch that is missing. \
@@ -272,11 +314,15 @@ pub async fn call(
         "collective_get_patch" => {
             let id = str_arg(args, "patch_id")?;
             let patch = store.require_patch(id).await?.public();
-            if args.get("include_diff") == Some(&Value::Bool(false)) {
-                Ok(json!({ "patch": patch }))
+            let mut out = if args.get("include_diff") == Some(&Value::Bool(false)) {
+                json!({ "patch": patch })
             } else {
-                Ok(json!({ "patch": patch, "diff": store.diff_text(id).await? }))
+                json!({ "patch": patch, "diff": store.diff_text(id).await? })
+            };
+            if let Some(state) = vouch::review_state(store, id).await? {
+                vouch::annotate(&mut out, &state);
             }
+            Ok(out)
         }
         "collective_submit_patch" => {
             let me = me.expect("auth checked");
@@ -309,7 +355,13 @@ pub async fn call(
             }
             Ok(result)
         }
-        "collective_review_next" => review::next_task(store, me.expect("auth checked")).await,
+        "collective_vouch" => {
+            vouch::vouch(store, me.expect("auth checked"), str_arg(args, "patch_id")?).await
+        }
+        "collective_review_next" => {
+            let caps = Capabilities::from_value(args.get("capabilities"));
+            review::next_task(store, me.expect("auth checked"), caps).await
+        }
         "collective_review_submit" => {
             let issues: Vec<Issue> =
                 from_args(args.get("issues").unwrap_or(&Value::Array(vec![])))?;
@@ -345,6 +397,22 @@ pub async fn call(
             store
                 .leaderboard(str_arg(args, "project")?, opt_str(args, "base_commit"))
                 .await
+        }
+        "collective_environments" => {
+            let p = store
+                .require_project(str_arg(args, "project")?, false)
+                .await?;
+            environments::list(store, &p.id).await
+        }
+        "collective_environment_propose" => {
+            let p = store
+                .require_project(str_arg(args, "project")?, false)
+                .await?;
+            let mut record = args.clone();
+            if let Some(o) = record.as_object_mut() {
+                o.remove("project");
+            }
+            environments::propose(store, me.expect("auth checked"), &p.id, record).await
         }
         "collective_git" => {
             crate::git::access(

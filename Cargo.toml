@@ -5,7 +5,7 @@ members = ["crates/core", "crates/worker", "crates/runner", "crates/e2e", "crate
 [workspace.package]
 edition = "2021"
 license = "Apache-2.0"
-rust-version = "1.85"
+rust-version = "1.91"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }

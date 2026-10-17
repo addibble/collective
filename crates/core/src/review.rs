@@ -225,9 +225,13 @@ pub struct OpenShard {
     pub assigned: Vec<String>,
     pub wanted: usize,
     pub canary: bool,
+    /// The operator that vouched for this task (`vouch`), if any: it has a
+    /// stake in the patch coming out clean, so it never reviews it.
+    pub vouched_by: Option<String>,
 }
 
-/// Picks a task for `operator` among the shards it may review. The seed
+/// Picks a task for `operator` among the shards it may review: never its
+/// own operator's, nor one it vouched for (`vouch::interested`). The seed
 /// must be unpredictable to the reviewer (e.g. a server secret, the
 /// operator and the current minute) so nobody can steer itself onto a
 /// friend's or rival's patch.
@@ -240,6 +244,7 @@ pub fn pick_task<'a>(operator: &str, open: &'a [OpenShard], seed: &str) -> Optio
         .iter()
         .filter(|s| {
             s.author_operator != operator
+                && s.vouched_by.as_deref() != Some(operator)
                 && !s.assigned.iter().any(|a| a == operator)
                 && s.assigned.len() < s.wanted
         })

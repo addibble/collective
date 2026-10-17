@@ -3,6 +3,7 @@
 mod challenges;
 mod contributions;
 mod db;
+mod environments;
 mod error;
 mod git;
 mod identity;
@@ -12,6 +13,7 @@ mod review;
 mod search;
 mod store;
 mod tools;
+mod vouch;
 
 use collective_core::diff::parse_diff;
 use collective_core::review::{Location, PARAMS as REVIEW};
@@ -19,6 +21,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use worker::*;
 
+use crate::environments::Capabilities;
 use crate::error::{bad, status, ApiError, ApiResult};
 use crate::store::{new_id, Agent, NewPatch, Store, POOL};
 
@@ -287,6 +290,9 @@ async fn route(req: &mut Request, env: &Env) -> ApiResult<Response> {
             let b = with(body(req).await?, "patch_id", id);
             Ok(json_response(&call("collective_adopt", b).await?, 201)?)
         }
+        (Method::Post, ["v1", "patches", id, "vouch"]) => {
+            ok(call("collective_vouch", json!({ "patch_id": id })).await?)
+        }
         (Method::Post, ["v1", "patches", id, "withdraw"]) => {
             ok(json!({ "patch": store.withdraw(require(&agent)?, id).await? }))
         }
@@ -309,7 +315,8 @@ async fn route(req: &mut Request, env: &Env) -> ApiResult<Response> {
         }
         // Proof jobs, for runners (`collective prove`, or a runner Worker).
         (Method::Post, ["v1", "proofs", "next"]) => {
-            ok(proofs::next_job(&store, require(&agent)?).await?)
+            let caps = Capabilities::from_value(query(req)?.get("capabilities"));
+            ok(proofs::next_job(&store, require(&agent)?, caps).await?)
         }
         (Method::Get, ["v1", "proof-runs", run]) => {
             ok(proofs::get_run(&store, require(&agent)?, run).await?)
@@ -331,7 +338,12 @@ async fn route(req: &mut Request, env: &Env) -> ApiResult<Response> {
         )
         .await?),
         (Method::Post, ["v1", "reviews", "next"]) => {
-            ok(call("collective_review_next", json!({})).await?)
+            let caps = query(req)?.get("capabilities").cloned();
+            ok(call(
+                "collective_review_next",
+                json!({ "capabilities": caps.unwrap_or(Value::Null) }),
+            )
+            .await?)
         }
         (Method::Post, ["v1", "reviews", task]) => ok(call(
             "collective_review_submit",
@@ -374,6 +386,16 @@ async fn route(req: &mut Request, env: &Env) -> ApiResult<Response> {
         .await?),
         (Method::Get, ["v1", "projects", p, "trunks", base, "diff"]) => {
             Ok(diff_response(store.trunk_diff(p, base).await?)?)
+        }
+        (Method::Get, ["v1", "projects", p, "environments"]) => {
+            ok(call("collective_environments", json!({ "project": p })).await?)
+        }
+        (Method::Post, ["v1", "projects", p, "environments"]) => {
+            let b = with(body(req).await?, "project", p);
+            Ok(json_response(
+                &call("collective_environment_propose", b).await?,
+                202,
+            )?)
         }
         (Method::Get, ["v1", "projects", p, "git"]) => {
             let mut q = query(req)?;
@@ -450,6 +472,11 @@ async fn route(req: &mut Request, env: &Env) -> ApiResult<Response> {
             let project = store.require_project(p, false).await?;
             ok(review::set_run_spec(&store, &project.id, body(req).await?).await?)
         }
+        (Method::Put, ["v1", "admin", "projects", p, "environment"]) => {
+            require_admin(req, env)?;
+            let project = store.require_project(p, false).await?;
+            ok(environments::set_admin(&store, &project.id, body(req).await?).await?)
+        }
         (Method::Put, ["v1", "admin", "sources", p, base]) => {
             require_admin(req, env)?;
             let bytes = req.bytes().await?;
@@ -499,6 +526,7 @@ async fn create_canary(store: &Store, v: Value) -> ApiResult<Value> {
         parse_diff(&input.diff).map_err(|e| ApiError::new(400, format!("invalid diff: {e}")))?;
     // Canaries obey the same size cap, so they look like any other task.
     collective_core::review::check_task_size(&files).map_err(|e| ApiError::new(413, e))?;
+    let environment = environments::current(store, &project.id).await?;
     let agent = platform_agent(store).await?;
     let intent_id = new_id();
     store
@@ -529,6 +557,7 @@ async fn create_canary(store: &Store, v: Value) -> ApiResult<Value> {
         Some(&input.planted),
         input.expected_run,
         "open",
+        &environment,
     )
     .await?;
     let meta = json!({ "provenance": input.provenance, "verified": input.verified, "planted": input.planted });

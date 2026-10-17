@@ -29,6 +29,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::environment::{Environment, REALISE_TIMEOUT_SECS};
 use crate::LedgerEntry;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -195,6 +196,12 @@ pub struct ProofSpec {
     pub repeats: u8,
     #[serde(default = "default_timeout")]
     pub timeout_secs: u32,
+    /// The system layer the runs execute in (see `environment`). The server
+    /// sets it from the project's pinned environment when it hands out a job
+    /// and overwrites whatever a submitter sent, so a patch never chooses
+    /// its own. Absent means the stock image.
+    #[serde(default)]
+    pub environment: Environment,
 }
 
 fn default_repeats() -> u8 {
@@ -288,6 +295,9 @@ impl ProofSpec {
                 return Err(format!("{} is larger than {MAX_FILE_BYTES} bytes", f.path));
             }
         }
+        self.environment
+            .validate()
+            .map_err(|e| format!("environment: {e}"))?;
         Ok(())
     }
 
@@ -313,14 +323,26 @@ impl ProofSpec {
         }
     }
 
-    /// Wall-clock budget a prover needs, including setup and builds.
+    /// Whether the sandbox needs internet for its setup steps: a dependency
+    /// fetch, or realising a Nix environment. The test runs never get it
+    /// either way; without any setup to do, the container gets none at all.
+    pub fn needs_network(&self) -> bool {
+        self.ecosystem != Ecosystem::None || self.environment != Environment::Stock
+    }
+
+    /// Wall-clock budget a prover needs, including setup and builds (and
+    /// realising the environment, so a lease covers the fetch).
     pub fn budget_secs(&self) -> u32 {
         let build = if self.ecosystem.build_argv().is_some() {
             2 * BUILD_TIMEOUT_SECS
         } else {
             0
         };
-        2 * self.repeats as u32 * self.timeout_secs + 300 + build
+        let realise = match self.environment {
+            Environment::Nix(_) => REALISE_TIMEOUT_SECS,
+            Environment::Stock => 0,
+        };
+        2 * self.repeats as u32 * self.timeout_secs + 300 + build + realise
     }
 }
 
@@ -612,14 +634,16 @@ pub struct ProofClaim {
     pub verdict: Verdict,
 }
 
+/// What the runs of a job establish: a proof's [`Verdict`] or, for an
+/// environment proposal, a suite [`RunOutcome`] ([`outcome_quorum`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Quorum {
+pub enum Quorum<V = Verdict> {
     /// Not enough agreeing runs yet.
     Pending,
     /// Enough independent, trusted runners agree.
-    Settled(Verdict),
-    /// [`MAX_RUNNERS`] conclusive runs came in without a quorum.
+    Settled(V),
+    /// [`MAX_RUNNERS`] counted runs came in without a quorum.
     Split,
 }
 
@@ -638,21 +662,39 @@ fn conclusive_claims(claims: &[ProofClaim]) -> Vec<&ProofClaim> {
 /// Inconclusive runs count for nothing. Fails closed: disagreement leaves
 /// the job pending, and then split.
 pub fn proof_quorum(claims: &[ProofClaim]) -> Quorum {
-    let claims = conclusive_claims(claims);
-    let total: f64 = claims.iter().map(|c| c.trust.max(0.0)).sum();
-    for v in [
-        Verdict::Proven,
-        Verdict::Demonstrated,
-        Verdict::NotReproduced,
-        Verdict::Flaky,
-    ] {
-        let agreeing: Vec<_> = claims.iter().filter(|c| c.verdict == v).collect();
-        let trust: f64 = agreeing.iter().map(|c| c.trust.max(0.0)).sum();
+    let votes: Vec<(f64, Verdict)> = conclusive_claims(claims)
+        .into_iter()
+        .map(|c| (c.trust, c.verdict))
+        .collect();
+    quorum_of(
+        &votes,
+        &[
+            Verdict::Proven,
+            Verdict::Demonstrated,
+            Verdict::NotReproduced,
+            Verdict::Flaky,
+        ],
+    )
+}
+
+/// The quorum rule, over counted votes (one per operator) of any kind: a
+/// candidate settles with [`MIN_RUNNERS`] votes, [`QUORUM_TRUST`] combined
+/// trust and more trust than every other vote combined; [`MAX_RUNNERS`]
+/// votes without that is a split.
+fn quorum_of<V: Copy + PartialEq>(votes: &[(f64, V)], candidates: &[V]) -> Quorum<V> {
+    let total: f64 = votes.iter().map(|(t, _)| t.max(0.0)).sum();
+    for v in candidates {
+        let agreeing: Vec<f64> = votes
+            .iter()
+            .filter(|(_, x)| x == v)
+            .map(|(t, _)| t.max(0.0))
+            .collect();
+        let trust: f64 = agreeing.iter().sum();
         if agreeing.len() >= MIN_RUNNERS && trust >= QUORUM_TRUST && trust > total - trust {
-            return Quorum::Settled(v);
+            return Quorum::Settled(*v);
         }
     }
-    if claims.len() >= MAX_RUNNERS {
+    if votes.len() >= MAX_RUNNERS {
         Quorum::Split
     } else {
         Quorum::Pending
@@ -739,6 +781,70 @@ pub fn suite_outcome(spec: &ProofSpec, report: &ProofReport) -> RunOutcome {
         (_, 0) => RunOutcome::Regressed,
         _ => RunOutcome::Flaky,
     }
+}
+
+/// One runner's suite outcome for a job that proves an environment
+/// (`environment::decide_proposal`), as the server read it with
+/// [`suite_outcome`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OutcomeClaim {
+    pub runner: String,
+    /// The runner's trust when it reported.
+    pub trust: f64,
+    pub outcome: RunOutcome,
+}
+
+/// What the runs of an environment proof establish, by the thresholds of
+/// [`proof_quorum`]. Unlike a proof's, an inconclusive run is a vote here:
+/// an environment that can't be realised or run in makes every run
+/// inconclusive, and that is what the proof is there to find out. So every
+/// outcome can settle, and every first report per operator counts towards
+/// [`MAX_RUNNERS`].
+pub fn outcome_quorum(claims: &[OutcomeClaim]) -> Quorum<RunOutcome> {
+    let mut seen = std::collections::HashSet::new();
+    let votes: Vec<(f64, RunOutcome)> = claims
+        .iter()
+        .filter(|c| seen.insert(c.runner.as_str()))
+        .map(|c| (c.trust, c.outcome))
+        .collect();
+    quorum_of(
+        &votes,
+        &[
+            RunOutcome::Passed,
+            RunOutcome::BaseFails,
+            RunOutcome::Regressed,
+            RunOutcome::Flaky,
+            RunOutcome::Inconclusive,
+        ],
+    )
+}
+
+/// Grades the runs of a settled environment proof as [`grade_proof_runs`]
+/// grades a proof's: agreeing with the settled outcome earns, contradicting
+/// it costs more. Inconclusive runs earn and cost nothing, and when the
+/// settled outcome is itself inconclusive nobody is graded: a runner whose
+/// machine could run it isn't wrong for that.
+pub fn grade_outcome_runs(settled: RunOutcome, claims: &[OutcomeClaim]) -> Vec<LedgerEntry> {
+    if !settled.conclusive() {
+        return vec![];
+    }
+    let mut seen = std::collections::HashSet::new();
+    claims
+        .iter()
+        .filter(|c| seen.insert(c.runner.as_str()))
+        .filter(|c| c.outcome.conclusive())
+        .map(|c| {
+            if c.outcome == settled {
+                LedgerEntry::new(&c.runner, PROOF_RUN_AGREED, "ran a proof")
+            } else {
+                LedgerEntry::new(
+                    &c.runner,
+                    PROOF_RUN_DISAGREED,
+                    "proof run disagreed with the other runners",
+                )
+            }
+        })
+        .collect()
 }
 
 /// What the Worker sends the prover: one line of JSON, then the raw

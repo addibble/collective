@@ -10,6 +10,7 @@
 pub mod challenge;
 pub mod converge;
 pub mod diff;
+pub mod environment;
 pub mod git;
 pub mod hash;
 pub mod jury;
@@ -18,6 +19,7 @@ pub mod review;
 pub mod score;
 pub mod sketch;
 pub mod text;
+pub mod vouch;
 pub mod work;
 
 /// A change to an operator's reputation balance. Settlements and gradings

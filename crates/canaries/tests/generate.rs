@@ -12,6 +12,7 @@ fn selection() -> Selection {
         ecosystem: Ecosystem::Cargo,
         source_extensions: vec!["rs".into()],
         sources: vec![],
+        environment: Default::default(),
     }
 }
 
@@ -123,4 +124,43 @@ fn reverses_a_fix_but_keeps_its_test() {
         200
     )
     .is_err());
+}
+
+#[test]
+fn selections_default_to_stock_and_verification_carries_the_environment() {
+    use collective_core::environment::{Environment, NixEnvironment};
+    let sel: Selection = serde_json::from_str(
+        r#"{"project":"github.com/example/svg","ecosystem":"cargo","source_extensions":["rs"],"sources":[]}"#,
+    )
+    .unwrap();
+    assert_eq!(sel.environment, Environment::Stock);
+
+    let nix = Environment::Nix(NixEnvironment {
+        nixpkgs: "a".repeat(40),
+        nixpkgs_hash: None,
+        packages: vec!["openssl.dev".into(), "pkg-config".into()],
+    });
+    let sel = Selection {
+        environment: nix.clone(),
+        ..selection()
+    };
+    let c = Canary {
+        project: sel.project.clone(),
+        base_commit: "b".repeat(40),
+        intent: "Tidy area computation".into(),
+        diff: String::new(),
+        planted: vec![],
+        tests: vec!["huge_area_does_not_panic".into()],
+        provenance: Provenance {
+            kind: SourceKind::BugFix,
+            source_commit: "c".repeat(40),
+            reference: "example#1".into(),
+            summary: "fix".into(),
+            generator_version: "test".into(),
+        },
+        verified: None,
+    };
+    let spec = verification_spec(&sel, &c);
+    assert_eq!(spec.environment, nix);
+    assert!(spec.validate().is_ok());
 }

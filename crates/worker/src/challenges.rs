@@ -59,6 +59,38 @@ async fn save(store: &Store, c: &Challenge) -> ApiResult<()> {
     sync_quarantine(store, &c.patch_id).await
 }
 
+/// Whether any challenge on a patch is unresolved, and whether any
+/// resolved `problem`.
+pub async fn patch_verdicts(store: &Store, patch_id: &str) -> ApiResult<(bool, bool)> {
+    #[derive(Deserialize)]
+    struct S {
+        state: String,
+    }
+    let rows: Vec<S> = store
+        .db
+        .all(
+            "SELECT state FROM challenges WHERE patch_id = ?",
+            args![patch_id],
+        )
+        .await?;
+    let (mut open, mut problem) = (false, false);
+    for r in rows {
+        // A challenge whose state can't be read holds a loan up rather
+        // than letting it go either way.
+        let Ok(c) = serde_json::from_str::<Challenge>(&r.state) else {
+            open = true;
+            continue;
+        };
+        match &c.resolution {
+            Some(res) if c.phase == Phase::Resolved => {
+                problem |= res.verdict == Verdict::Problem;
+            }
+            _ => open = true,
+        }
+    }
+    Ok((open, problem))
+}
+
 /// A patch is quarantined while any of its challenges says "problem".
 async fn sync_quarantine(store: &Store, patch_id: &str) -> ApiResult<()> {
     #[derive(Deserialize)]
@@ -443,11 +475,15 @@ async fn finalize(store: &Store, c: &Challenge, row: &Row) -> ApiResult<Value> {
         .await?;
     }
     store.rescore(&c.patch_id).await?;
+    // A vouch for the patch's task is lost on a `problem` verdict, and may
+    // come back now that this challenge no longer holds the task up.
+    crate::vouch::settle(store, &collective_core::review::task_id(&c.patch_id)).await?;
     Ok(json!({ "bounty": s.bounty, "bans": s.bans, "entries": s.entries }))
 }
 
 /// Bans an operator: revokes every agent key, quarantines its other patches
-/// and sends their shards back for review.
+/// and sends their shards back for review, pending ones included: a proven
+/// backdoor author's other work is worth the review it was waiting for.
 pub async fn ban(store: &Store, operator_id: &str, reason: &str) -> ApiResult<()> {
     let t = now();
     #[derive(Deserialize)]
@@ -469,7 +505,7 @@ pub async fn ban(store: &Store, operator_id: &str, reason: &str) -> ApiResult<()
             store.db.stmt("UPDATE agents SET revoked_at = ? WHERE operator_id = ? AND revoked_at IS NULL", args![t, operator_id])?,
             store.db.stmt("UPDATE patches SET status = 'quarantined' WHERE author_op = ? AND status IN ('open','converged')", args![operator_id])?,
             store.db.stmt(
-                "UPDATE shards SET state = 'open', wanted = wanted + ? WHERE author_op = ? AND canary = 0 AND state IN ('clean','graded')",
+                "UPDATE shards SET state = 'open', wanted = wanted + ? WHERE author_op = ? AND canary = 0 AND state IN ('clean','graded','pending')",
                 args![collective_core::review::PARAMS.redundancy, operator_id],
             )?,
         ])

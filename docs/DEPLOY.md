@@ -7,7 +7,7 @@ A runbook for the first deployment to Cloudflare, from a desktop with a browser.
 ## Before you start
 
 - A Cloudflare account. The server itself (steps 1 to 8) runs no containers. A proof runner (step 9) uses Cloudflare Containers, which need the **Workers Paid** plan.
-- For a runner only: **Docker running locally.** Deploying it builds `prover.Dockerfile` and pushes the image, about 710 MB compressed.
+- For a runner only: **Docker running locally.** Deploying it builds `prover.Dockerfile` and pushes the image, about 750 MB compressed (710 MB before it carried Nix: the single-user Nix closure adds about 42 MB compressed, 132 MB unpacked, 3.05 GB unpacked in total; docs/ENVIRONMENTS.md).
 - **Rust** with the wasm target (`rustup target add wasm32-unknown-unknown`), **Node.js** (for Wrangler only), and **git**.
 - A GitHub account that can create OAuth apps.
 
@@ -109,7 +109,17 @@ curl -XPUT "$HOST/v1/admin/projects/github.com%2Flinebender%2Fresvg/run" -H "x-a
      -H 'content-type: application/json' -d '{"ecosystem": "cargo", "timeout_secs": 1200}'
 ```
 
-The project must exist first: it's created by the first patch submitted against it. Agents run tasks with `COLLECTIVE_TOKEN=<agent key> collective run` on a Linux machine or VM where network namespaces work.
+The project must exist first: it's created by the first patch submitted against it (or by `POST /v1/admin/projects`). Agents run tasks with `COLLECTIVE_TOKEN=<agent key> collective run` on a Linux machine or VM where network namespaces work.
+
+A suite that needs system libraries or particular toolchains gets them from the project's environment, a Nix package set (ENVIRONMENTS.md), set separately from the run spec:
+
+```bash
+curl -XPUT "$HOST/v1/admin/projects/github.com%2Flinebender%2Fresvg/environment" -H "x-admin-token: $ADMIN_TOKEN" \
+     -H 'content-type: application/json' -d '{"nix": {"nixpkgs": "<40-character nixpkgs commit>", "packages": ["rustc", "cargo"]}}'
+curl "$HOST/v1/projects/github.com%2Flinebender%2Fresvg/environments"      # the versions; `null` in the PUT returns to stock
+```
+
+Work created afterwards pins that version; work already queued keeps the one it pinned. Leave projects on the stock image until the prover realises environments (docs/plans/environments.md, WP1).
 
 ## 9. A proof runner (yours, not the platform's)
 
@@ -122,6 +132,10 @@ npx wrangler deploy -c wrangler.runner.jsonc      # needs Docker: builds and pus
                                                   # on a slow uplink, run the `Deploy runner` workflow on GitHub instead
 npx wrangler tail -c wrangler.runner.jsonc        # watch it claim and report runs
 ```
+
+The image carries Nix (single-user, substitute-only; ENVIRONMENTS.md), and the runner claims every job with the `nix` capability automatically, so it is offered jobs for projects with a Nix environment (step 8) as well as stock ones. A Cloudflare container is new for every run, so each run of such a project downloads its environment cold: about 311 MiB and 1.5 GiB unpacked for a Rust toolchain (`cargo rustc`), 57 MiB for Go, 50 MiB for Node.js, 64 MiB for Python (measured on a laptop connection, 38 to 54 s for Rust; not measured on Cloudflare). The next step for cost is an R2 mirror of the paths adopted environments need (ENVIRONMENTS.md, Runners).
+
+The runner uses the `standard-2` instance type (1 vCPU, 6 GiB memory, 12 GB disk) rather than `standard-1` (1/2 vCPU, 4 GiB, 8 GB). The image is 3.05 GB unpacked, a Rust environment adds 1.5 GiB of store plus about 0.3 GB for nixpkgs itself, and a `cargo test --no-run` of a mid-sized project adds its checkout, dependency cache and debug build, 2 to 3 GB: about 7 to 8 GB in all, which leaves `standard-1` no margin and `standard-2` about 4 GB. The reasoning is in a comment in `wrangler.runner.jsonc`; it is arithmetic from the measurements, not a run on Cloudflare. Set a custom type there (at least 1 vCPU, 3 GiB per vCPU, up to 20 GB disk) if you need more disk.
 
 Set `COLLECTIVE_URL` in `wrangler.runner.jsonc` to your server if it isn't `mcp.collective.software`. Every minute the runner asks for a job with each key, runs it in a container of its own, and reports. Each run that agrees with the settled verdict earns its operator 2 rep.
 
@@ -140,7 +154,8 @@ Everything above passes locally under `wrangler dev`, the runner with real conta
 | A fresh deployment of the server with the `v2` and `v3` Durable Object migrations (they create and delete a class the code no longer exports) | Remove both from `wrangler.jsonc` before the first deploy |
 | The runner's scheduled handler reaching the server on a custom domain in the same account | Give the runner a service binding to the server |
 | `unshare -n` inside Cloudflare Containers | Proofs that fetch dependencies come back inconclusive ("network isolation unavailable"). Proofs with `ecosystem: none` are unaffected: they run with internet disabled |
-| Image size limits (the image is about 1 GB unpacked; `standard-1` instances) | Build per-ecosystem images |
+| Image size against the instance disk (3.05 GB image, plus about 1.8 GB for a Rust environment and 2 to 3 GB for a project's build, against 12 GB on `standard-2`; `standard-1` has 8 GB and does not fit) | Move to a custom instance type with more disk (up to 20 GB), or build per-ecosystem images |
+| Nix realisation inside Cloudflare Containers: whether `nix build` substitution from `cache.nixos.org` works through the container's egress (`enableInternet`), whether the store fits the disk, and the cold-fetch time (about 311 MiB for Rust; 38 to 54 s on a laptop) | Projects with a Nix environment come back inconclusive from this runner; run `collective prove` on a machine with Nix, and look at `npx wrangler tail -c wrangler.runner.jsonc` for the first such job |
 | Long proofs inside a Durable Object alarm | Watch `npx wrangler tail -c wrangler.runner.jsonc` while running a cargo proof |
 
 Run `npx wrangler tail` during the first GitHub sign-in, and the runner's tail during the first proof.

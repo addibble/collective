@@ -619,9 +619,11 @@ impl Store {
 
         if let Some(existing) = self.patch_row(&id).await? {
             if existing.status != "canary" {
-                return Ok(
-                    json!({ "patch": existing.public(), "created": false, "intent_reused": true, "similar": [] }),
-                );
+                let mut out = json!({ "patch": existing.public(), "created": false, "intent_reused": true, "similar": [] });
+                if let Some(state) = crate::vouch::review_state(self, &id).await? {
+                    crate::vouch::annotate(&mut out, &state);
+                }
+                return Ok(out);
             }
         }
         if let Some(parent) = &input.parent_id {
@@ -671,6 +673,17 @@ impl Store {
         };
 
         let similar = self.similar_patches(&project.id, &files).await?;
+        // Pinned before anything is stored, so a project whose environment
+        // can't be pinned refuses the submission whole.
+        let environment = crate::environments::current(self, &project.id).await?;
+        // A newcomer's task waits for standing or a vouch (REVIEWS.md,
+        // Newcomers). Read before anything is stored, once per submission.
+        let author_trust = self
+            .trust_map(std::slice::from_ref(&agent.operator_id))
+            .await?
+            .get(&agent.operator_id)
+            .copied();
+        let task_state = crate::vouch::initial_state(author_trust);
         let title = input
             .title
             .as_deref()
@@ -698,11 +711,13 @@ impl Store {
                 status: "open",
             })
             .await?;
-        let task = crate::review::create_task(self, &row, &files, None, None, "open").await?;
+        let task =
+            crate::review::create_task(self, &row, &files, None, None, task_state, &environment)
+                .await?;
         crate::git::notify(&self.env, &project.id, crate::git::Job::Patch(id.clone())).await;
-        Ok(
-            json!({ "patch": row.public(), "created": true, "intent_reused": intent_reused, "similar": similar, "review_task": task }),
-        )
+        let mut out = json!({ "patch": row.public(), "created": true, "intent_reused": intent_reused, "similar": similar, "review_task": task });
+        crate::vouch::annotate(&mut out, task_state);
+        Ok(out)
     }
 
     pub async fn withdraw(&self, agent: &Agent, id: &str) -> ApiResult<Value> {
@@ -798,8 +813,6 @@ impl Store {
         Ok(json!({ "patch": p.public(), "counted": agent.operator_id != p.author_op }))
     }
 
-    /// Trust for each operator: 0 if banned, otherwise from authored-patch
-    /// scores plus ledger balance.
     /// Current genesis influence: founding grants, halving every 60 days.
     pub async fn genesis_influence(&self, operator_id: &str) -> ApiResult<f64> {
         #[derive(Deserialize)]
@@ -856,8 +869,24 @@ impl Store {
         Ok(json!({ "operator": handle, "genesis_influence": self.genesis_influence(&o.id).await? }))
     }
 
+    /// Trust for each operator: 0 if banned, otherwise from authored-patch
+    /// scores plus ledger balance and genesis influence.
     pub async fn trust_map(&self, ops: &[String]) -> ApiResult<HashMap<String, f64>> {
+        self.trust_map_adjusted(ops, 0.0).await
+    }
+
+    /// Trust for each operator as if `rep_delta` were added to its ledger
+    /// balance: what its standing would be after a loan (`vouch`). One
+    /// query per chunk of operators, genesis grants included, so a caller
+    /// that sweeps many operators pays a few queries, not one per operator.
+    /// An operator missing from the result is unknown: callers fail closed.
+    pub async fn trust_map_adjusted(
+        &self,
+        ops: &[String],
+        rep_delta: f64,
+    ) -> ApiResult<HashMap<String, f64>> {
         let mut out = HashMap::new();
+        let t = now();
         for chunk in ops.chunks(MAX_PARAMS / 3) {
             #[derive(Deserialize)]
             struct T {
@@ -865,6 +894,7 @@ impl Store {
                 banned_at: Option<f64>,
                 scores: Option<String>,
                 weight: Option<f64>,
+                genesis: Option<String>,
             }
             let ph = placeholders(chunk.len());
             let rows: Vec<T> = self
@@ -873,14 +903,15 @@ impl Store {
                     &format!(
                         "SELECT o.id, o.banned_at,
                            (SELECT GROUP_CONCAT(score) FROM patches WHERE author_op = o.id) AS scores,
-                           (SELECT SUM(weight) FROM ledger WHERE operator_id = o.id) AS weight
+                           (SELECT SUM(weight) FROM ledger WHERE operator_id = o.id) AS weight,
+                           (SELECT GROUP_CONCAT(amount || ':' || granted_at) FROM genesis WHERE operator_id = o.id) AS genesis
                          FROM operators o WHERE o.id IN ({ph})"
                     ),
                     chunk.iter().map(Into::into).collect(),
                 )
                 .await?;
             for r in rows {
-                let t = if r.banned_at.is_some() {
+                let trust_value = if r.banned_at.is_some() {
                     0.0
                 } else {
                     let scores: Vec<f64> = r
@@ -889,11 +920,24 @@ impl Store {
                         .split(',')
                         .filter_map(|s| s.parse().ok())
                         .collect();
-                    let genesis = self.genesis_influence(&r.id).await?;
-                    let balance = ledger_balance(r.weight.unwrap_or(0.0), now());
-                    trust(reputation(&scores, balance + genesis))
+                    let genesis: f64 = r
+                        .genesis
+                        .unwrap_or_default()
+                        .split(',')
+                        .filter_map(|g| {
+                            let (amount, at) = g.split_once(':')?;
+                            let (amount, at) =
+                                (amount.parse::<f64>().ok()?, at.parse::<f64>().ok()?);
+                            Some(collective_core::score::genesis_effective(
+                                amount,
+                                t - at as i64,
+                            ))
+                        })
+                        .sum();
+                    let balance = ledger_balance(r.weight.unwrap_or(0.0), t);
+                    trust(reputation(&scores, balance + rep_delta + genesis))
                 };
-                out.insert(r.id, t);
+                out.insert(r.id, trust_value);
             }
         }
         Ok(out)

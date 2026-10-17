@@ -19,14 +19,15 @@
 use std::io::Read;
 use std::time::Duration;
 
+use collective_core::environment::Environment;
 use collective_core::hash::sha256_hex;
 use collective_core::proof::{assess, suite_outcome, ProofSpec, RunOutcome, Verdict};
-use collective_prover::{prove, Options};
+use collective_prover::{nix_available, prove, Options};
 use serde_json::{json, Value};
 
 use crate::die;
 
-fn agent_key() -> String {
+pub(crate) fn agent_key() -> String {
     let key = std::env::var("COLLECTIVE_TOKEN")
         .unwrap_or_else(|_| die("set COLLECTIVE_TOKEN to this agent's key"));
     if key.starts_with("clv_human_") {
@@ -57,6 +58,32 @@ fn json_call(server: &str, key: &str, method: &str, path: &str, body: Option<Val
             ))
         }
         Err(e) => die(format!("{server}{path}: {e}")),
+    }
+}
+
+/// The query a claim sends: `?capabilities=nix` when this machine can
+/// realise Nix environments, so the server offers it work in projects that
+/// declare one; otherwise nothing, and only stock-image work is offered.
+fn capabilities_query(opts: &Options) -> &'static str {
+    if nix_available(opts) {
+        eprintln!("Claiming with the nix capability (`nix --version` works): work in Nix environments may be offered.");
+        "?capabilities=nix"
+    } else {
+        eprintln!("Claiming without the nix capability (no working `nix` found): only stock-environment work is offered. Install Nix to take the rest (docs/ENVIRONMENTS.md).");
+        ""
+    }
+}
+
+/// Names the Nix environment a job runs in before it is realised.
+fn announce_environment(spec: &ProofSpec) {
+    if let Environment::Nix(n) = &spec.environment {
+        eprintln!(
+            "Realising environment {}: nixpkgs {}, {} package{}…",
+            spec.environment.id(),
+            n.nixpkgs,
+            n.packages.len(),
+            if n.packages.len() == 1 { "" } else { "s" }
+        );
     }
 }
 
@@ -91,10 +118,23 @@ fn fetch_source(server: &str, key: &str, task: &Value, path: &str) -> Vec<u8> {
 /// once enough independent runners agree, and agreeing runners earn rep.
 pub fn prove_job(server: &str, submit_inconclusive: bool) {
     let key = agent_key();
-    let v = json_call(server, &key, "POST", "/v1/proofs/next", None);
+    let mut opts = Options::from_env();
+    let caps = capabilities_query(&opts);
+    let v = json_call(
+        server,
+        &key,
+        "POST",
+        &format!("/v1/proofs/next{caps}"),
+        None,
+    );
     let job = &v["job"];
     if job.is_null() {
-        eprintln!("No proofs need running right now.");
+        eprintln!(
+            "{}",
+            v["message"]
+                .as_str()
+                .unwrap_or("No proofs need running right now.")
+        );
         return;
     }
     let id = job["run_id"].as_str().unwrap_or_default();
@@ -108,7 +148,7 @@ pub fn prove_job(server: &str, submit_inconclusive: bool) {
         job["source"].as_str().unwrap_or_default(),
     );
 
-    let mut opts = Options::from_env();
+    announce_environment(&spec);
     opts.budget = Duration::from_secs(spec.budget_secs() as u64);
     eprintln!(
         "Running {:?} on base and patched trees (up to {} min)…",
@@ -137,10 +177,21 @@ pub fn prove_job(server: &str, submit_inconclusive: bool) {
 
 pub fn run(server: &str, submit_inconclusive: bool) {
     let key = agent_key();
-    let v = json_call(server, &key, "POST", "/v1/reviews/next", None);
+    let mut opts = Options::from_env();
+    let caps = capabilities_query(&opts);
+    let v = json_call(
+        server,
+        &key,
+        "POST",
+        &format!("/v1/reviews/next{caps}"),
+        None,
+    );
     let task = &v["task"];
     if task.is_null() {
-        die("this agent holds no review task");
+        die(format!(
+            "this agent holds no review task ({})",
+            v["message"].as_str().unwrap_or("none available")
+        ));
     }
     let id = task["task_id"].as_str().unwrap_or_default();
     if task["phase"] != "run" {
@@ -156,7 +207,7 @@ pub fn run(server: &str, submit_inconclusive: bool) {
 
     let source = fetch_source(server, &key, task, source_path);
 
-    let mut opts = Options::from_env();
+    announce_environment(&spec);
     opts.budget = Duration::from_secs(spec.budget_secs() as u64);
     eprintln!(
         "Running {:?} on base and patched trees (up to {} min)…",

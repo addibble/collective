@@ -1,4 +1,5 @@
 target/
+target-*/
 build/
 crates/worker/build/
 crates/runner/build/

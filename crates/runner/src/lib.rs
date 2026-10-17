@@ -13,7 +13,7 @@
 
 use std::time::Duration;
 
-use collective_core::proof::{encode_prove_request, Ecosystem, ProofSpec, ProveRequest};
+use collective_core::proof::{encode_prove_request, ProofSpec, ProveRequest};
 use serde_json::{json, Value};
 use worker::wasm_bindgen::JsValue;
 use worker::*;
@@ -81,10 +81,18 @@ pub async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) 
 }
 
 async fn claim(env: &Env, index: usize, key: &str) -> Result<()> {
-    let v: Value = api(env, key, Method::Post, "/v1/proofs/next", None)
-        .await?
-        .json()
-        .await?;
+    // The prover image has Nix, so this runner takes jobs in Nix
+    // environments as well as stock ones.
+    let v: Value = api(
+        env,
+        key,
+        Method::Post,
+        "/v1/proofs/next?capabilities=nix",
+        None,
+    )
+    .await?
+    .json()
+    .await?;
     let Some(run) = v["job"]["run_id"].as_str() else {
         return Ok(());
     };
@@ -167,8 +175,9 @@ async fn run(state: &State, env: &Env, run_id: &str, key: &str) -> Result<()> {
         .container()
         .ok_or_else(|| Error::RustError("no container bound to ProofRunner".into()))?;
     if !container.running() {
-        // Proofs without a dependency fetch never get internet at all.
-        let offline = spec.ecosystem == Ecosystem::None;
+        // Proofs with no dependency fetch and no environment to realise
+        // never get internet at all.
+        let offline = !spec.needs_network();
         let mut vars = vec![("PROVER_BUDGET_SECS", spec.budget_secs().to_string())];
         if offline {
             vars.push(("PROVER_NO_INTERNET", "1".into()));

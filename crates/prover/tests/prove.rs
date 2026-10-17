@@ -7,6 +7,7 @@ mod common;
 use std::process::Command;
 use std::time::Instant;
 
+use collective_core::environment::{Environment, NixEnvironment};
 use collective_core::proof::*;
 use collective_prover::{decode_request, encode_request, prove, Options, ProveRequest};
 use common::Repo;
@@ -36,6 +37,7 @@ fn opts() -> Options {
         allow_unisolated: false,
         budget: std::time::Duration::from_secs(120),
         setup_env: vec![],
+        nix_binary: None,
     }
 }
 
@@ -59,6 +61,7 @@ fn spec(kind: ProofKind, command: &str, files: &[(&str, &str)]) -> ProofSpec {
             .collect(),
         repeats: 2,
         timeout_secs: 20,
+        environment: Default::default(),
     }
 }
 
@@ -257,6 +260,7 @@ fn suite_runs_show_what_a_patch_does_to_the_projects_tests() {
         files: vec![],
         repeats: 1,
         timeout_secs: 20,
+        environment: Default::default(),
     };
     let broken = r.diff(&[("add.sh", Some("#!/bin/sh\necho $(($1 + $2 + 1))\n".into()))]);
     let report = prove(&suite, &tarball(&r), &broken, &opts());
@@ -281,4 +285,212 @@ fn suite_runs_show_what_a_patch_does_to_the_projects_tests() {
     };
     let report = prove(&missing, &tarball(&r), &harmless, &opts());
     assert_eq!(suite_outcome(&missing, &report), RunOutcome::Inconclusive);
+}
+
+/// An environment proposal's job is the suite on the base with no patch at
+/// all (docs/ENVIRONMENTS.md): both trees are the base, and `git apply`,
+/// which refuses empty input, is never asked.
+#[test]
+fn an_empty_patch_runs_the_suite_on_the_base_twice() {
+    let r = project();
+    let suite = ProofSpec {
+        kind: ProofKind::Suite,
+        ecosystem: Ecosystem::None,
+        tests: vec!["test.sh".into()],
+        command: None,
+        files: vec![],
+        repeats: 1,
+        timeout_secs: 20,
+        environment: Default::default(),
+    };
+    for empty in ["", "\n", "  \n"] {
+        let report = prove(&suite, &tarball(&r), empty, &opts());
+        assert_eq!(
+            suite_outcome(&suite, &report),
+            RunOutcome::Passed,
+            "{empty:?}: {report:#?}"
+        );
+    }
+}
+
+/// nixpkgs `nixos-25.05` on 2026-10-17 and its NAR hash (docs/ENVIRONMENTS.md).
+const NIXPKGS: &str = "ac62194c3917d5f474c1a844b6fd6da2db95077d";
+const NIXPKGS_HASH: &str = "sha256-16KkgfdYqjaeRGBaYsNrhPRRENs0qzkQVUooNHtoy2w=";
+
+fn nix(packages: &[&str]) -> Environment {
+    Environment::Nix(NixEnvironment {
+        nixpkgs: NIXPKGS.into(),
+        nixpkgs_hash: Some(NIXPKGS_HASH.into()),
+        packages: packages.iter().map(|p| p.to_string()).collect(),
+    })
+}
+
+/// A directory of its own for a test's fake `nix`, removed afterwards.
+struct Scratch(std::path::PathBuf);
+
+impl Scratch {
+    fn new(name: &str) -> Scratch {
+        let d = std::env::temp_dir().join(format!("prover-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        Scratch(d)
+    }
+
+    /// A `nix` that records its arguments and `HOME`, prints `stdout`, and
+    /// exits with `code`.
+    fn fake_nix(&self, stdout: &str, code: i32) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = self.0.join("nix");
+        let calls = self.0.join("calls");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\necho \"$@\" > {calls}\necho \"$HOME\" >> {calls}\n\
+                 echo 'fake nix: some progress' >&2\nprintf '%s' '{stdout}'\nexit {code}\n",
+                calls = calls.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        bin
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn harmless(r: &Repo) -> String {
+    r.diff(&[("add.sh", Some(format!("{ADD}# comment\n")))])
+}
+
+#[test]
+fn a_nix_environment_without_nix_is_inconclusive() {
+    let r = project();
+    let scratch = Scratch::new("no-nix");
+    let mut s = spec(ProofKind::Regression, "test.sh", &[]);
+    s.environment = nix(&["hello"]);
+    let o = Options {
+        nix_binary: Some(scratch.0.join("nix")),
+        ..opts()
+    };
+    let t0 = Instant::now();
+    let report = prove(&s, &tarball(&r), &harmless(&r), &o);
+    assert!(t0.elapsed().as_secs() < 30, "took {:?}", t0.elapsed());
+    let err = report.setup.error.clone().unwrap_or_default();
+    assert!(err.starts_with("environment:"), "{err}");
+    assert!(err.contains("nix is not installed"), "{err}");
+    assert!(report.runs.is_empty());
+    assert_eq!(assess(&s, &report).verdict, Verdict::Inconclusive);
+}
+
+#[test]
+fn a_realisation_that_does_not_add_up_is_refused() {
+    let r = project();
+    let source = tarball(&r);
+    let patch = harmless(&r);
+    let cases: &[(&[&str], &str, i32, &str)] = &[
+        // Fewer paths than packages.
+        (
+            &["hello", "jq"],
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.1\n",
+            0,
+            "printed 1 store paths for 2 packages",
+        ),
+        // A path outside the store.
+        (&["hello"], "/tmp/evil\n", 0, "outside /nix/store/"),
+        (
+            &["hello"],
+            "/nix/store/../../tmp/evil\n",
+            0,
+            "outside /nix/store/",
+        ),
+        // Nix itself failed (an uncached derivation, a bad hash, no network).
+        (&["hello"], "", 1, "fake nix: some progress"),
+    ];
+    for (i, (packages, stdout, code, want)) in cases.iter().enumerate() {
+        let scratch = Scratch::new(&format!("fake-nix-{i}"));
+        let mut s = spec(ProofKind::Regression, "test.sh", &[]);
+        s.environment = nix(packages);
+        let o = Options {
+            nix_binary: Some(scratch.fake_nix(stdout, *code)),
+            ..opts()
+        };
+        let report = prove(&s, &source, &patch, &o);
+        let err = report.setup.error.clone().unwrap_or_default();
+        assert!(err.starts_with("environment: "), "case {i}: {err}");
+        assert!(err.contains(want), "case {i}: {err}");
+        assert!(report.runs.is_empty(), "case {i}");
+        // It was asked for exactly the core's realisation, with a HOME of its own.
+        let calls = std::fs::read_to_string(scratch.0.join("calls")).unwrap();
+        let mut lines = calls.lines();
+        let args = lines.next().unwrap();
+        assert!(
+            args.starts_with("build --max-jobs 0 --no-link --print-out-paths"),
+            "{args}"
+        );
+        assert!(args.contains(&format!("github:NixOS/nixpkgs/{NIXPKGS}?narHash=")));
+        let home = lines.next().unwrap();
+        assert!(home.ends_with("/home-nix"), "{home}");
+        assert!(
+            !std::path::Path::new(home).exists(),
+            "{home} outlived the proof"
+        );
+    }
+}
+
+/// Realises `hello` (and `openssl`, which prints two paths: `bin` and
+/// `man`) from the pinned nixpkgs and proves a regression with a test that
+/// calls `hello`. Needs Nix, network and cache.nixos.org, so it runs only
+/// with `PROVER_TEST_NIX=1`, e.g. inside the prover image as root:
+///
+/// ```text
+/// docker run --rm --platform linux/amd64 --cap-add SYS_ADMIN \
+///   --security-opt seccomp=unconfined -e PROVER_TEST_NIX=1 \
+///   -e CARGO_TARGET_DIR=/src/target-linux-amd64 -v "$PWD":/src -w /src \
+///   --entrypoint cargo <prover image> test -p collective-prover nix
+/// ```
+#[test]
+fn realises_a_nix_environment_and_runs_in_it() {
+    if std::env::var("PROVER_TEST_NIX").as_deref() != Ok("1") {
+        eprintln!("skipped: set PROVER_TEST_NIX=1 to realise a Nix environment");
+        return;
+    }
+    let test = "#!/bin/sh\necho \"PATH=$PATH\"\nopenssl version || exit 1\n\
+                [ \"$(sh greet.sh)\" = 'Hello, world!' ] || { echo 'greeting is broken'; exit 1; }\n\
+                echo ok\n";
+    let r = Repo::new(&[("greet.sh", "#!/bin/sh\nhello\n"), ("test.sh", test)]);
+    let patch = r.diff(&[("greet.sh", Some("#!/bin/sh\nhello -g 'Goodbye'\n".into()))]);
+    let mut s = spec(ProofKind::Regression, "test.sh", &[]);
+    s.environment = nix(&["hello", "openssl"]);
+    let report = prove(&s, &tarball(&r), &patch, &opts());
+    assert!(report.setup.ok, "{:?}", report.setup);
+    let a = assess(&s, &report);
+    assert_eq!(a.verdict, Verdict::Proven, "{a:?} {report:#?}");
+    let base = report
+        .runs
+        .iter()
+        .find(|run| run.tree == Tree::Base)
+        .unwrap();
+    let path = base
+        .output_tail
+        .lines()
+        .find_map(|l| l.strip_prefix("PATH="))
+        .unwrap();
+    let first: Vec<&str> = path.split(':').take(2).collect();
+    assert!(
+        first[0].starts_with("/nix/store/") && first[0].ends_with("-hello-2.12.1/bin"),
+        "{path}"
+    );
+    assert!(
+        first[1].starts_with("/nix/store/") && first[1].ends_with("-openssl-3.4.3-bin/bin"),
+        "{path}"
+    );
+    assert!(path.ends_with(":/usr/sbin:/usr/bin:/sbin:/bin"), "{path}");
+    assert!(report
+        .runs
+        .iter()
+        .any(|run| run.output_tail.contains("greeting is broken")));
 }

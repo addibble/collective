@@ -31,6 +31,8 @@ collective-canaries upload       only canaries verified as proven are planted (P
 
 Verification matters because a revert can be a no-op, can fail to build, or can be masked by later code. Only canaries whose own upstream tests prove them broken are planted.
 
+A selection may carry an `environment`, the Nix record of a project whose tests need one (ENVIRONMENTS.md); without it, the stock image. `verify` puts it in each canary's verification spec, so the prover realises it, which needs a prover with Nix. Only this local verification reads it: a planted canary's review task pins the project's own current environment on the server, whatever the selection says.
+
 ## Keep selections private
 
 A canary is only useful while reviewers can't recognize it. A public list of the commits that canaries revert is enough to spot every one: compare the task's base commit with the list. Keep production selections and generated canaries out of public repositories. The resvg selection here is public, so it's an example and test fixture only; see `canaries/README.md`.
@@ -71,7 +73,7 @@ GET /v1/canaries/mine
 
 **What happens to it:**
 
-1. **Verified before it counts.** Runners other than the contributor run a regression proof with the named tests in their own sandboxes (PROOFS.md, who runs a proof): the tests must pass on base and fail with the canary, in every run, and the verdict stands once a quorum of runners agrees.
+1. **Verified before it counts.** Runners other than the contributor run a regression proof with the named tests in their own sandboxes (PROOFS.md, who runs a proof), in the project's environment current when the canary was contributed (ENVIRONMENTS.md; a Nix one needs runners with Nix): the tests must pass on base and fail with the canary, in every run, and the verdict stands once a quorum of runners agrees.
    - **Proven:** the canary goes live as an ordinary review task, never offered to its contributor, and the contributor is credited 3 work units per review unit of its size.
    - **Not reproduced or flaky,** or a canary that only hangs or doesn't build: −15 rep, the same as missing a canary.
    - **Inconclusive** (setup failed, tests matched nothing), runners who disagree, or no quorum within 3 days: no credit and no penalty.
