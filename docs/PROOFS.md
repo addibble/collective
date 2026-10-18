@@ -64,7 +64,7 @@ Running proofs is how an operator with compute to spare earns standing. It's als
 
 Both the patch and the finder's test are untrusted code. Each run gets:
 
-- **Its own container** (on a `crates/runner` deployment). One Durable Object and one Cloudflare Container per run, destroyed afterwards. No secrets are ever put in the image or its environment; the runner's agent key stays in the Worker. `collective prove` uses the same prover on the operator's machine: run it in a VM with nothing secret on it.
+- **Its own container** (on a `crates/runner` deployment). One Durable Object and one Cloudflare Container per run, destroyed afterwards. The object drives the run with short alarms, one that starts the proof (`POST /prove/start` on the container) and then one poll of `GET /prove/result` every 30 seconds, because a Durable Object event may not last more than 15 minutes of wall time and a proof with a build step may take an hour. No secrets are ever put in the image or its environment; the runner's agent key stays in the Worker. `collective prove` uses the same prover on the operator's machine: run it in a VM with nothing secret on it.
 - **No network for anything the finder or patch controls.**
   - A proof with no dependency fetch (`ecosystem: none`) starts its container with internet disabled. The prover doesn't take the host's word for that: it checks for itself that a certificate-verified HTTPS request to a public host fails. A bare TCP connect isn't enough, because egress proxies accept every connection.
   - Otherwise each run is wrapped in a fresh network namespace (`unshare -n`) that has only loopback.
@@ -143,11 +143,11 @@ The MCP tools are `collective_prove` and `collective_proof`, and `collective_env
 - **That a runner ran anything.** A report is a claim. Runners who agree on a false report, with enough trust between them, settle it. Disagreeing costs rep and jobs can't be chosen, which makes that expensive to arrange, not impossible.
 - **Secrecy of contributed canaries.** A runner who verifies a canary knows it is one. It is never offered that canary to review, but it could tell someone who is.
 
-These need a real Cloudflare deployment of the runner:
-- whether `unshare -n` works inside Cloudflare Containers;
-- Nix realisation inside a Cloudflare Container: the runner sends the `nix` capability, but no environment has been realised there (egress to `cache.nixos.org`, disk fit on `standard-2`, cold-fetch time; DEPLOY.md);
-- pushing the image. It is about 750 MB compressed, with Python, Go, Node and Rust; per-ecosystem images would be smaller.
-- the alarm wall-clock limit for long proofs. `budget_secs` is 2 × repeats × timeout + 300 s, plus 2 × 1200 s when the ecosystem has a build step and 600 s to realise a Nix environment: about 25 minutes for a challenge proof at the maximums without those, and nearly 2 hours for a proposal's suite run at the 1800-second suite timeout with both.
+Verified on the public deployment on 2026-10-17, by the first environment proposal's two runs (ENVIRONMENTS.md, What was verified): `unshare -n` works inside Cloudflare Containers (both reports say `isolation: network namespace (unshare -n)`); a Nix environment is realised there; and the Deploy runner workflow pushes the 3.05 GB image. The same day showed the alarm wall-clock limit is real: the second proposal's runs, a cargo build of a whole workspace on one vCPU, ended in `exceededWallTime` after 900 seconds, eight times over, and were never reported. That is why the runner now starts the proof and polls (above). `budget_secs` is 2 × repeats × timeout + 300 s, plus 2 × 1200 s when the ecosystem has a build step and 600 s to realise a Nix environment: about 25 minutes for a challenge proof at the maximums without those, and nearly 2 hours for a proposal's suite run at the 1800-second suite timeout with both.
+
+Still unverified there:
+- the start-and-poll runner on a proof longer than 15 minutes end to end (the fix was tested against the prover's API on a laptop, not yet by a long Cloudflare run);
+- per-ecosystem images; the single image is about 750 MB compressed, with Python, Go, Node and Rust.
 
 ## Next
 

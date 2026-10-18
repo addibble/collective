@@ -3,7 +3,9 @@
 //! Every minute it asks a Collective server for a proof job with each of
 //! its agent keys (`POST /v1/proofs/next`), runs the job in a container of
 //! its own (crates/prover, one container per run, destroyed afterwards) and
-//! submits the sandbox's report. It has no access to the server's database:
+//! submits the sandbox's report. The run is driven by short Durable Object
+//! alarms (start, then a poll every 30 seconds), because one alarm may not
+//! last more than 15 minutes and a proof may take an hour. It has no access to the server's database:
 //! it uses the same public API as `collective prove`, and its reports count
 //! as one operator's claim towards a quorum (collective_core::proof).
 //!
@@ -138,9 +140,21 @@ fn start_container(
         .map_err(|e| Error::RustError(format!("container start: {e:?}")))
 }
 
-/// Runs one job end to end: fetch it and its source from the server, run
-/// it in this object's container, and submit the prover's report.
-async fn run(state: &State, env: &Env, run_id: &str, key: &str) -> Result<()> {
+/// What an alarm step asks for next: another alarm after a wait, or nothing
+/// because the run is over (reported, or given up).
+enum Step {
+    Again(Duration),
+    Done,
+}
+
+/// How often a running proof is asked for its result. Each poll is its own
+/// alarm, so no event lasts longer than the prover's health wait, well
+/// under the 15-minute wall-time limit of a Durable Object event.
+const POLL: Duration = Duration::from_secs(30);
+
+/// Fetches the job and its source from the server, starts the container
+/// and hands the prover the proof to run on its own thread.
+async fn start(state: &State, env: &Env, run_id: &str, key: &str) -> Result<Step> {
     let v: Value = api(
         env,
         key,
@@ -174,11 +188,12 @@ async fn run(state: &State, env: &Env, run_id: &str, key: &str) -> Result<()> {
     let container = state
         .container()
         .ok_or_else(|| Error::RustError("no container bound to ProofRunner".into()))?;
+    let budget = spec.budget_secs();
     if !container.running() {
         // Proofs with no dependency fetch and no environment to realise
         // never get internet at all.
         let offline = !spec.needs_network();
-        let mut vars = vec![("PROVER_BUDGET_SECS", spec.budget_secs().to_string())];
+        let mut vars = vec![("PROVER_BUDGET_SECS", budget.to_string())];
         if offline {
             vars.push(("PROVER_NO_INTERNET", "1".into()));
         }
@@ -207,10 +222,43 @@ async fn run(state: &State, env: &Env, run_id: &str, key: &str) -> Result<()> {
         .with_body(Some(JsValue::from(js_sys::Uint8Array::from(
             body.as_slice(),
         ))));
-    let mut resp = port.fetch("http://prover/prove", Some(init)).await?;
-    let text = resp.text().await?;
-    if resp.status_code() != 200 {
+    let mut resp = port.fetch("http://prover/prove/start", Some(init)).await?;
+    if resp.status_code() != 202 {
+        let text = resp.text().await.unwrap_or_default();
         return Err(Error::RustError(format!("prover: {text}")));
+    }
+    // The prover has its own budget; past it plus a grace period, it is
+    // not coming back.
+    let deadline = Date::now().as_millis() as f64 + (budget as f64 + 120.0) * 1000.0;
+    let storage = state.storage();
+    storage.put("deadline", deadline).await?;
+    storage.put("phase", "poll").await?;
+    Ok(Step::Again(POLL))
+}
+
+/// Asks the prover for its report, and submits it when it is there.
+async fn poll(state: &State, env: &Env, run_id: &str, key: &str) -> Result<Step> {
+    let deadline: f64 = state.storage().get("deadline").await?.unwrap_or(0.0);
+    if Date::now().as_millis() as f64 > deadline {
+        return Err(Error::RustError(
+            "prover did not finish within its budget".into(),
+        ));
+    }
+    let container = state
+        .container()
+        .ok_or_else(|| Error::RustError("no container bound to ProofRunner".into()))?;
+    if !container.running() {
+        return Err(Error::RustError(
+            "prover container stopped before reporting".into(),
+        ));
+    }
+    let port = container.get_tcp_port(PROVER_PORT)?;
+    let mut resp = port.fetch("http://prover/prove/result", None).await?;
+    let text = resp.text().await?;
+    match resp.status_code() {
+        202 => return Ok(Step::Again(POLL)),
+        200 => {}
+        s => return Err(Error::RustError(format!("prover: HTTP {s}: {text}"))),
     }
     let _ = container.destroy(None).await;
     // The report goes to the server as the prover wrote it: the server
@@ -226,8 +274,8 @@ async fn run(state: &State, env: &Env, run_id: &str, key: &str) -> Result<()> {
     .await?
     .json()
     .await?;
-    console_log!("run {run_id}: {}", v["verdict"]);
-    Ok(())
+    console_log!("run {run_id}: {} ({})", v["verdict"], v["reason"]);
+    Ok(Step::Done)
 }
 
 #[durable_object]
@@ -265,6 +313,9 @@ impl DurableObject for ProofRunner {
         Response::ok("started")
     }
 
+    /// One short step per alarm: start the proof, then poll for its result
+    /// every `POLL` until it is reported or given up. A failed run reports
+    /// nothing: the claim lapses and the job is offered to other runners.
     async fn alarm(&self) -> Result<Response> {
         let storage = self.state.storage();
         let (Some(run_id), Some(index)) = (
@@ -279,16 +330,34 @@ impl DurableObject for ProofRunner {
             .and_then(|i| keys(&self.env).into_iter().nth(i))
         else {
             console_error!("run {run_id}: no agent key {index}");
+            self.finish(Some("no agent key")).await;
             return Response::empty();
         };
-        // A failed run reports nothing: the claim lapses and the job is
-        // offered to other runners.
-        if let Err(e) = run(&self.state, &self.env, &run_id, &key).await {
-            console_error!("run {run_id}: {e}");
-            if let Some(c) = self.state.container() {
-                let _ = c.destroy(Some(&e.to_string())).await;
+        let polling = storage.get::<String>("phase").await?.as_deref() == Some("poll");
+        let step = if polling {
+            poll(&self.state, &self.env, &run_id, &key).await
+        } else {
+            start(&self.state, &self.env, &run_id, &key).await
+        };
+        match step {
+            Ok(Step::Again(wait)) => storage.set_alarm(wait).await?,
+            Ok(Step::Done) => self.finish(None).await,
+            Err(e) => {
+                console_error!("run {run_id}: {e}");
+                self.finish(Some(&e.to_string())).await;
             }
         }
         Response::empty()
+    }
+}
+
+impl ProofRunner {
+    /// Ends this object's run: the container goes, and so does the state
+    /// that would make the next alarm do anything.
+    async fn finish(&self, error: Option<&str>) {
+        if let Some(c) = self.state.container() {
+            let _ = c.destroy(error).await;
+        }
+        let _ = self.state.storage().delete_all().await;
     }
 }

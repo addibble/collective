@@ -25,7 +25,7 @@ Other mechanisms were considered and set aside (below). Attested container image
 | Records and pinning | Implemented. A record is validated and stored canonical with a content id (`crates/core/src/environment.rs`). An admin sets a project's environment (`PUT /v1/admin/projects/:project/environment`, `null` for the stock image; REVIEWS.md), every change is a new version, and the history is public (`GET /v1/projects/:project/environments`, `collective_environments`, `collective env`). Every proof, review task, planted canary and contributed canary pins the version current at creation, and the server writes the pinned record into the spec whenever it hands one out; an `environment` sent in a proof or a run spec is ignored. e2e test `environments_are_pinned_and_filled_by_the_server`. |
 | Proposals | Implemented. An operator with standing proposes (`POST /v1/projects/:project/environments`, `collective_environment_propose`, `collective env propose`); the proposed version is a third kind of proof job that runners other than the proposer claim, and a quorum adopts or refuses it and grades the proposer (Proposals). e2e test `environments_are_proposed_with_standing_and_proven_by_runners`, with synthetic reports. |
 | Runner capabilities | Implemented. Both claim routes take `?capabilities=nix`, and `collective_review_next` a `capabilities` array; work pinned to a Nix environment, and every proposal's job, goes only to callers listing `nix` (Runners). The Cloudflare runner always sends it; `collective run` and `collective prove` send it when `nix --version` works. Covered by both e2e tests above. |
-| Substitute-only Nix in the prover | Implemented. The prover image has Nix 2.35.3, single-user, with `/etc/nix/nix.conf` as below. When a spec names a Nix environment, the prover realises it before the dependency fetch and applies it to the fetch, the builds and every run (Realising it). Prover tests `a_nix_environment_without_nix_is_inconclusive`, `a_realisation_that_does_not_add_up_is_refused`, `an_empty_patch_runs_the_suite_on_the_base_twice`, and `realises_a_nix_environment_and_runs_in_it`, which needs `PROVER_TEST_NIX=1` and ran in the image under `linux/amd64` emulation (What was verified). Never run inside a Cloudflare Container (Not verified). |
+| Substitute-only Nix in the prover | Implemented. The prover image has Nix 2.35.3, single-user, with `/etc/nix/nix.conf` as below. When a spec names a Nix environment, the prover realises it before the dependency fetch and applies it to the fetch, the builds and every run (Realising it). Prover tests `a_nix_environment_without_nix_is_inconclusive`, `a_realisation_that_does_not_add_up_is_refused`, `an_empty_patch_runs_the_suite_on_the_base_twice`, and `realises_a_nix_environment_and_runs_in_it`, which needs `PROVER_TEST_NIX=1` and ran in the image under `linux/amd64` emulation (What was verified). Realised inside Cloudflare Containers on 2026-10-17 (What was verified, On Cloudflare). |
 | `collective doctor` | Implemented: checks a machine for Linux, network namespaces, `nix --version`, a `nix.conf` that disables builds, and `git` (README). |
 | Challenging an environment | Implemented as admin quarantine plus contests. An admin quarantines a project's current environment with a reason (`POST /v1/admin/projects/:project/environment/quarantine`) and the project is review-only; operators with standing contest it with 5-rep bonds (`POST /v1/projects/:project/environments/:version/contest`, `collective_environment_contest`), a quorum of stakes settles it, and an admin can lift it directly (Quarantine). Rules in `crates/core/src/environment.rs` with tests; e2e test `environments_are_quarantined_and_contested`. Flagging an environment through the challenge flow, by anyone, is not built (Later). |
 
@@ -43,6 +43,7 @@ Other mechanisms were considered and set aside (below). Attested container image
 
 - `nixpkgs` is a commit, never a branch or channel, so the same record means the same thing forever. The server doesn't check which branch the commit is on; accepting only commits on a release branch (`nixos-25.05`, `nixos-unstable` at a date), so the set of revisions in use stays small enough to mirror, is for later.
 - `nixpkgs_hash`, optional, is the NAR hash of that tree, which makes the fetch of nixpkgs itself verified rather than trusted to GitHub (`github:NixOS/nixpkgs/<rev>?narHash=…`). The proposer gets it from `nix flake metadata`.
+- The revision also fixes every tool's version, so check them against the project before proposing: for a Rust project, `nix eval --raw github:NixOS/nixpkgs/<rev>#rustc.version` against its `rust-version` or its lockfile's needs. The first proposal on the public server was refused for exactly this: a revision with rustc 1.86 for a project whose dependencies need 1.91.
 - `packages` are attribute paths under that nixpkgs, in a strict grammar (letters, digits, `_`, `-`, `.`; no leading `-` or `.`, no empty segment between dots), 1 to 64 of them, each at most 128 characters. They are sorted and de-duplicated, and the record's id (`env_` and 32 hex characters) is the SHA-256 of its canonical form, so identical proposals are one proposal. Unknown fields are refused.
 
 The record is orthogonal to `ecosystem`. Nix provides the system layer: toolchains, compilers, C libraries, tools. `cargo fetch`, `npm ci` and the rest still fetch the project's own dependencies as they do now, and the stock prover image remains the environment for projects that declare none.
@@ -129,6 +130,22 @@ Two things need store paths that `cache.nixos.org` doesn't have: a project's own
 
 ## What was verified
 
+### On Cloudflare
+
+The first environment proposal on the public server (2026-10-17, project `github.com/addibble/collective`, `rustc cargo pkg-config git` from nixpkgs `ac62194c`, with the NAR hash) was run by the deployed runner under two operators, each in its own `standard-2` container:
+
+| Check | Result |
+|---|---|
+| Claim | Both containers claimed within a minute of the proposal, with `?capabilities=nix`; the proposer's own key was skipped |
+| Isolation | `network namespace (unshare -n)` in both reports |
+| Realisation | Succeeded in both: nixpkgs fetched by NAR hash and the Rust set substituted from `cache.nixos.org` through the container's egress, onto the instance's disk |
+| Then | The suite's build ran with the realised toolchain and stopped on `rustc 1.86.0 is not supported by the following packages: … worker@0.8.7 requires rustc 1.91`: the pin's toolchain was too old for the project, so the server correctly scored both runs `inconclusive` ("the suite could not be run in it") and the proposal stays open |
+| Time | 58 s and 100 s of prover CPU; 66 s and 120 s from claim to report, container start included |
+
+So realisation inside Cloudflare Containers works, and the cold fetch of a Rust toolchain there takes about a minute. A second proposal on nixpkgs `f20cd90e` (rustc 1.98.1) then exposed the runner's 15-minute alarm limit on long builds (PROOFS.md, Not verified), fixed since; its outcome is pending.
+
+### On a laptop
+
 In a throwaway `nixos/nix` container (Nix 2.35.3, aarch64, Docker on a laptop):
 
 | Check | Result |
@@ -176,12 +193,11 @@ Image: unpacked 2.92 GB before, 3.05 GB after (+132 MB: 127 MB for `/nix`, 4.8 M
 
 ## Not verified
 
-- Nothing ran inside a Cloudflare Container. The `x86_64` runs were under emulation on a laptop, so their timings mean little, and no run was on native `x86_64`.
-- Memory of Nix evaluation on a Cloudflare container: the figures above are cgroup peaks including page cache, measured on a laptop's Docker VM, not on Cloudflare. Disk: 3.05 GB image plus up to 2 GiB of store for a Rust environment and a project's build, against the runner's `standard-2` (12 GB), is arithmetic, not a run (DEPLOY.md).
+- Memory of Nix evaluation on a Cloudflare container: the figures above are cgroup peaks including page cache, measured on a laptop's Docker VM; Cloudflare gives no such figure, only that the realisations there completed. Disk: realising the Rust set fit on `standard-2`; a whole project build on top of it has not yet completed there (the first run's build failed early, the second hit the alarm limit).
 - The Determinate installer was not tried; the copied-closure install was chosen on reproducibility and size. Whether a newer `nixos/nix` tag keeps `nix copy --to` working this way is untested.
 - The prover's realisation step has run only in the image under `linux/amd64` emulation, as root, for `hello` and `openssl`. Not tried: `collective run`/`prove` on an operator's machine with a multi-user (daemon) Nix install, a realisation behind `PROVER_SETUP_PASSTHROUGH`'s proxy, or a timeout of the 600-second limit.
 - Substitution settings on an operator's machine. The image's `nix.conf` pins `cache.nixos.org`, its key and `require-sigs`; elsewhere the prover passes only `--max-jobs 0` and `allow-import-from-derivation false`, and which substituters and keys are trusted is the operator's own `nix.conf` (Nix's defaults are `cache.nixos.org` with signatures required). `collective doctor` reports whether builds are disabled there, not the substituters.
 - Warm-store behaviour (a second realisation in the same container) and concurrent realisations were not measured.
 - How far prover-composed environments go for real projects: the first measurements should be resvg (pure Rust), a Rust project with `openssl-sys`, and a Python project with native extensions.
 - Quarantine and contests run only against a local Worker with synthetic stakes (e2e). The timeout sweep is tested in the core (`contests_time_out_after_contest_days`), not end to end: there is no way to age a quarantine in the e2e tests. The contest parameters (5-rep bond, 3 days, the proof quorum's thresholds) are first guesses, like those in CHALLENGES.md.
-- A proposal's proof against a real prover end to end. The prover now runs an empty diff as "patched = base" (tested), but no proposal has been settled by real runners; the e2e test uses synthetic reports.
+- A proposal settled by real runners. Real runners have run proposals on Cloudflare (above), but settling one needs three operators' runs and the public server has two runner operators besides the proposer; the e2e test settles with synthetic reports.
