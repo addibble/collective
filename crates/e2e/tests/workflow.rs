@@ -2445,3 +2445,104 @@ fn environments_are_quarantined_and_contested() {
     assert_eq!(deltas(&keeper, "contest_returned"), vec![5.0]);
     assert_eq!(deltas(&keeper, "contest_bond"), vec![-5.0, -5.0]);
 }
+
+#[test]
+#[ignore]
+fn the_browser_shows_public_work_and_hides_canaries() {
+    let api = Api::new();
+    let run = format!(
+        "b{:x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+    );
+    let upstream = format!("https://github.com/e2e/browse-{run}");
+    let page = |path: &str| -> (u16, String) {
+        let (s, v) = api.call("GET", path, None, None);
+        (s, v.as_str().map(str::to_string).unwrap_or_default())
+    };
+    let src = lines(40, "x");
+    let repo = Repo::new(&[("app.py", &src)]);
+    let base = repo.base.clone();
+
+    // A patch whose title and diff try to inject markup.
+    let author = api.register(&format!("author-{run}"));
+    let adopter = api.register(&format!("adopter-{run}"));
+    api.genesis(&format!("author-{run}"));
+    let hostile = "<script>alert(1)</script>";
+    let (s, v) = api.call(
+        "POST",
+        "/v1/patches",
+        Some(&author),
+        Some(json!({ "project": upstream, "intent": format!("Greet {run} {hostile}"), "title": format!("Greet {hostile}"),
+                     "base_commit": base, "diff": repo.diff(&[("app.py", Some(src.replace("x 3\n", &format!("x 3\n{hostile}\n"))))]) })),
+    );
+    assert_eq!(s, 201, "{v}");
+    let patch = v["patch"]["id"].as_str().unwrap().to_string();
+    let (s, v) = api.call(
+        "POST",
+        &format!("/v1/patches/{patch}/adoptions"),
+        Some(&adopter),
+        Some(json!({ "outcome": "shipped" })),
+    );
+    assert_eq!(s, 201, "{v}");
+
+    // A canary on a project that has nothing else.
+    let decoy = format!("{upstream}-decoy");
+    let canary_diff = repo.diff(&[("app.py", Some(src.replace("x 9\n", "x 9\ngrant_admin()\n")))]);
+    let (s, v) = api.call(
+        "POST",
+        "/v1/admin/canaries",
+        None,
+        Some(json!({ "project": decoy, "base_commit": base, "intent": format!("Canary {run}"), "diff": canary_diff,
+                     "planted": [{ "path": "app.py", "start": 10, "end": 10 }] })),
+    );
+    assert_eq!(s, 200, "{v}");
+    let canary = v["canary_patch"].as_str().unwrap().to_string();
+
+    let project_path = format!("/browse/p/{}", upstream.trim_start_matches("https://"));
+    for path in [
+        "/browse".to_string(),
+        "/browse/rep".to_string(),
+        project_path.clone(),
+        format!("/browse/patches/{patch}"),
+        format!("/browse/operators/author-{run}"),
+    ] {
+        let (s, html) = page(&path);
+        assert_eq!(s, 200, "{path}: {html}");
+        assert!(!html.contains(hostile), "{path} renders participant markup");
+        assert!(
+            !html.contains(&format!("Canary {run}")),
+            "{path} shows the canary"
+        );
+        assert!(
+            !html.contains("-decoy"),
+            "{path} shows the canary's project"
+        );
+    }
+    let (_, html) = page(&format!("/browse/patches/{patch}"));
+    assert!(html.contains("Greet &lt;script&gt;"), "{html}");
+    assert!(html.contains("shipped"), "the adoption outcome is shown");
+    let (_, html) = page(&project_path);
+    assert!(html.contains(&format!("/browse/patches/{patch}")), "{html}");
+
+    // Canaries, and projects that hold only canaries, look like nothing at all.
+    for path in [
+        format!("/browse/patches/{canary}"),
+        format!("/browse/p/{}", decoy.trim_start_matches("https://")),
+        "/browse/operators/platform".to_string(),
+    ] {
+        let (s, _) = page(&path);
+        assert_eq!(s, 404, "{path}");
+    }
+
+    // Rep and trust are public; the ledger is not.
+    let (s, v) = api.call("GET", &format!("/v1/operators/author-{run}"), None, None);
+    assert_eq!(s, 200, "{v}");
+    assert!(
+        v["rep"].is_number() && v["trust"].as_f64().unwrap() > 0.25,
+        "{v}"
+    );
+    assert!(v.get("recent").is_none(), "{v}");
+}

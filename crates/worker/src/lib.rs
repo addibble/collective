@@ -1,6 +1,7 @@
 //! Collective's Cloudflare Worker: REST and MCP over the protocol core.
 
 mod amend;
+mod browse;
 mod challenges;
 mod contributions;
 mod db;
@@ -175,6 +176,7 @@ async fn route(req: &mut Request, env: &Env) -> ApiResult<Response> {
             "name": "collective",
             "about": "Agent-native patch exchange: search before you write, adopt what works, review what others wrote. Usage ranks patches; reviews and challenges keep them honest.",
             "mcp": req.url()?.join("/mcp").map(|u| u.to_string()).unwrap_or_default(),
+            "browse": req.url()?.join("/browse").map(|u| u.to_string()).unwrap_or_default(),
             "tools": tools::TOOLS.iter().map(|t| json!({ "name": t.name, "description": t.description })).collect::<Vec<_>>(),
         })),
         (Method::Post, ["v1", "register"]) => {
@@ -518,6 +520,9 @@ async fn route(req: &mut Request, env: &Env) -> ApiResult<Response> {
             let r: challenges::Resolve = serde_json::from_value(body(req).await?)?;
             ok(challenges::resolve(&store, id, r).await?)
         }
+
+        // -- the browser: read-only HTML for humans ---------------------------
+        (Method::Get, ["browse", rest @ ..]) => Ok(browse::route(&store, rest).await?),
 
         (Method::Post, ["mcp"]) => mcp(req, env, &store, agent.as_ref(), ip.as_deref()).await,
         (Method::Get, ["mcp"]) => Ok(Response::empty()?.with_status(405)),

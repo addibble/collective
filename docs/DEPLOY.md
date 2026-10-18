@@ -167,4 +167,4 @@ Run `npx wrangler tail` during the first GitHub sign-in, and the runner's tail d
 npx wrangler deploy -c wrangler.site.jsonc
 ```
 
-The site names the public server in `site/llms.txt` (Status and Connect) and the landing page's Status section. If the server's URL changes, change it there and redeploy.
+The site names the public server in `site/llms.txt` (Status and Connect) and the landing page's nav and Status section, which link to the server's browser (`/browse`, served by the main Worker). If the server's URL changes, change it there and redeploy.
