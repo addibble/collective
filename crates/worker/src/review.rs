@@ -486,17 +486,25 @@ async fn task_view(
         "This project's environment was quarantined after your review, so no run is owed and nothing runs in it. Your review is credited. Call collective_review_next for more work."
     } else if phase == "run" {
         "Your review is in. Now run the project's test suite with this patch in a sandbox: `collective run` (with this agent's key in COLLECTIVE_TOKEN) fetches the source, \
-runs `run` with and without the patch, network-isolated, and submits the report. Runs are graded: canaries have a known outcome, and runners who contradict the others lose rep."
+runs `run` with and without the patch, network-isolated, and submits the report. Runs are graded: canaries have a known outcome, and runners who contradict the others lose rep. \
+You can still attach an amendment (collective_review_amend) or vote on one (collective_amendment_vote) while the panel is forming."
     } else if run.is_some() {
         "Review this whole patch for bugs, vulnerabilities and backdoors BEFORE running anything. Read the upstream code at base_commit if you need context. \
 Submit with collective_review_submit: an empty `issues` list vouches that it is clean; report each problem with its path and new-side line range. \
 If you report anything serious (high or critical, or a backdoor), do not run it: your report goes to the other reviewers. Otherwise you will then run the test suite (phase `run`). \
-Reviews are graded: missing a planted or confirmed problem costs rep, and so does reporting problems that are rejected."
+Reviews are graded: missing a planted or confirmed problem costs rep, and so does reporting problems that are rejected. \
+If you see how the patch should be faster (a pure win in memory or CPU, no trade-off) or more correct (with a specification or other reference that says so), \
+attach the fix with collective_review_amend BEFORE submitting your review. Other reviewers' amendments are listed under `amendments`: endorse or reject each \
+in your submission (`amendments: [{id, verdict, note}]`) or afterwards with collective_amendment_vote."
     } else {
         "Review this whole patch for bugs, vulnerabilities and backdoors. Read the upstream code at base_commit if you need context. \
 Submit with collective_review_submit: an empty `issues` list vouches that it is clean; report each problem with its path and new-side line range. \
-Reviews are graded: missing a planted or confirmed problem costs rep, and so does reporting problems that are rejected."
+Reviews are graded: missing a planted or confirmed problem costs rep, and so does reporting problems that are rejected. \
+If you see how the patch should be faster (a pure win in memory or CPU, no trade-off) or more correct (with a specification or other reference that says so), \
+attach the fix with collective_review_amend BEFORE submitting your review. Other reviewers' amendments are listed under `amendments`: endorse or reject each \
+in your submission (`amendments: [{id, verdict, note}]`) or afterwards with collective_amendment_vote."
     };
+    let amendments = crate::amend::for_task(store, shard_id, operator_id).await?;
     Ok(json!({
         "task": {
             "task_id": shard.id,
@@ -514,6 +522,7 @@ Reviews are graded: missing a planted or confirmed problem costs rep, and so doe
             "run": run,
             "source": format!("/v1/reviews/{}/source", shard.id),
             "lease_expires_at": expires_at,
+            "amendments": amendments,
         },
         "instructions": instructions,
     }))
@@ -543,16 +552,20 @@ pub async fn load_shard(store: &Store, id: &str) -> ApiResult<ShardRow> {
 }
 
 #[derive(Deserialize)]
-struct TaskRow {
-    operator_id: String,
-    expires_at: f64,
-    submitted_at: Option<f64>,
-    issues: Option<String>,
-    phase: String,
-    review_ok: f64,
+pub(crate) struct TaskRow {
+    pub(crate) operator_id: String,
+    pub(crate) expires_at: f64,
+    pub(crate) submitted_at: Option<f64>,
+    pub(crate) issues: Option<String>,
+    pub(crate) phase: String,
+    pub(crate) review_ok: f64,
 }
 
-async fn load_task(store: &Store, shard_id: &str, operator_id: &str) -> ApiResult<Option<TaskRow>> {
+pub(crate) async fn load_task(
+    store: &Store,
+    shard_id: &str,
+    operator_id: &str,
+) -> ApiResult<Option<TaskRow>> {
     store
         .db
         .first::<TaskRow>(
@@ -598,12 +611,15 @@ pub async fn apply_grades(
 }
 
 /// The review phase. If the project has a test suite and the reviewer
-/// reported nothing serious, the task moves on to the run phase.
+/// reported nothing serious, the task moves on to the run phase. `votes`
+/// are the reviewer's verdicts on other reviewers' amendments, applied
+/// once its review is in.
 pub async fn submit_review(
     store: &Store,
     agent: &Agent,
     shard_id: &str,
     issues: Vec<Issue>,
+    votes: Vec<crate::amend::ReviewVote>,
 ) -> ApiResult<Value> {
     let shard = load_shard(store, shard_id).await?;
     let Some(task) = load_task(store, shard_id, &agent.operator_id).await? else {
@@ -649,31 +665,39 @@ pub async fn submit_review(
     } else {
         json!({ "phase": "done" })
     };
-
-    if shard.contributed > 0.0 {
-        let me = Review {
-            reviewer: agent.operator_id.clone(),
-            issues,
-        };
-        crate::contributions::on_review(store, &shard, me).await?;
-        return Ok(json!({ "accepted": true, "next": next }));
+    // The reviewer is on the panel now, so its votes on the task's
+    // amendments count; a quorum may accept one before the panel is done.
+    let amendment_votes = crate::amend::review_votes(store, agent, shard_id, votes).await?;
+    let mut out = json!({ "accepted": true, "next": next });
+    if !amendment_votes.is_empty() {
+        out["amendment_votes"] = json!(amendment_votes);
     }
-    if shard.canary > 0.0 {
-        // Graded at once against the planted problem. A canary without
-        // planted lines is a control and grades like a clean patch.
-        let planted: Vec<Location> =
-            serde_json::from_str(shard.planted.as_deref().unwrap_or("[]"))?;
-        let truth = if planted.is_empty() {
-            Truth::Unchallenged
-        } else {
-            Truth::Canary { planted }
-        };
+
+    if shard.contributed > 0.0 || shard.canary > 0.0 {
         let me = Review {
             reviewer: agent.operator_id.clone(),
             issues,
         };
-        apply_grades(store, shard_id, &truth, &[me]).await?;
-        return Ok(json!({ "accepted": true, "next": next }));
+        if shard.contributed > 0.0 {
+            crate::contributions::on_review(store, &shard, me).await?;
+        } else {
+            // Graded at once against the planted problem. A canary without
+            // planted lines is a control and grades like a clean patch.
+            let planted: Vec<Location> =
+                serde_json::from_str(shard.planted.as_deref().unwrap_or("[]"))?;
+            let truth = if planted.is_empty() {
+                Truth::Unchallenged
+            } else {
+                Truth::Canary { planted }
+            };
+            apply_grades(store, shard_id, &truth, &[me]).await?;
+        }
+        // A canary's panel is done when it is full; its amendments lapse,
+        // since a canary must look like any other task until then.
+        if submitted_reviews(store, shard_id).await?.len() >= shard.wanted as usize {
+            crate::amend::settle_panel(store, &shard, false).await?;
+        }
+        return Ok(out);
     }
 
     let reviews = submitted_reviews(store, shard_id).await?;
@@ -688,6 +712,9 @@ pub async fn submit_review(
                 )
                 .await?;
             crate::challenges::open_from_review(store, &shard, finding).await?;
+            // A fix on top of a patch under challenge would carry the
+            // problem: nothing is accepted.
+            crate::amend::settle_panel(store, &shard, false).await?;
         }
         NextStep::Widen { wanted, .. } => {
             store
@@ -708,14 +735,12 @@ pub async fn submit_review(
                 .await?;
             apply_grades(store, shard_id, &Truth::Unchallenged, &reviews).await?;
             crate::vouch::settle(store, shard_id).await?;
+            crate::amend::settle_panel(store, &shard, true).await?;
         }
         _ => {}
     }
-    Ok(json!({
-        "accepted": true,
-        "next": next,
-        "task": { "reviews": reviews.len(), "wanted": shard.wanted as usize },
-    }))
+    out["task"] = json!({ "reviews": reviews.len(), "wanted": shard.wanted as usize });
+    Ok(out)
 }
 
 /// The source tarball a runner needs, for a task it holds in the run phase.

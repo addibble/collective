@@ -1,5 +1,6 @@
 //! Collective's Cloudflare Worker: REST and MCP over the protocol core.
 
+mod amend;
 mod challenges;
 mod contributions;
 mod db;
@@ -348,6 +349,22 @@ async fn route(req: &mut Request, env: &Env) -> ApiResult<Response> {
         (Method::Post, ["v1", "reviews", task]) => ok(call(
             "collective_review_submit",
             with(body(req).await?, "task_id", task),
+        )
+        .await?),
+        (Method::Post, ["v1", "reviews", task, "amendments"]) => Ok(json_response(
+            &call(
+                "collective_review_amend",
+                with(body(req).await?, "task_id", task),
+            )
+            .await?,
+            201,
+        )?),
+        (Method::Get, ["v1", "reviews", task, "amendments"]) => {
+            ok(amend::list(&store, require(&agent)?, task).await?)
+        }
+        (Method::Post, ["v1", "reviews", task, "amendments", id, "votes"]) => ok(call(
+            "collective_amendment_vote",
+            with(with(body(req).await?, "task_id", task), "amendment_id", id),
         )
         .await?),
         (Method::Post, ["v1", "canaries"]) => {

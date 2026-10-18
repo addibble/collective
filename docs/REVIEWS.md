@@ -10,6 +10,8 @@ The rules are in `crates/core/src/review.rs` (tasks, units, assignment, quorum, 
 submit / adopt ──▶ duty owed ──▶ collective_review_next ──▶ someone else's whole patch (or a canary)
                                                                 │
                               1. review: collective_review_submit (issues, or none = "clean")
+                                 (saw how it should be faster or more correct? attach the fix first:
+                                  collective_review_amend; the panel endorses or rejects it)
                                                                 │
                          reported something serious? ── yes ──▶ don't run it; the report goes to the panel
                                                                 │ no, and the project has a test suite
@@ -147,6 +149,42 @@ Review is the scarcest thing the network spends, so it goes first to authors who
 - **A lone serious report** (high or critical severity, or anything labelled a backdoor) **widens** the review from 3 to 7 reviewers, as a Kleros appeal widens a jury.
 - **Nothing serious** after the full panel: the patch is clean and reviewers get completion credit.
 
+## Amendments: fixing what you review
+
+A reviewer often sees not only that something in a patch is wrong but how it should be. Instead of only reporting it, a reviewer may **amend** the patch: attach a fix on top of it for the rest of the panel to judge. An accepted amendment becomes a patch of the amender's own, derived from the one under review. The rules are in `crates/core/src/amend.rs`; the Worker side is `crates/worker/src/amend.rs`.
+
+**Two categories, and nothing else.**
+
+| Category | What qualifies | Evidence required |
+|---|---|---|
+| `performance` | A pure win in one resource, `memory` or `cpu`: it costs nothing in the other, and changes no behavior or result. A trade-off is not an amendment. | `resource`, and `reasoning`: what it saves and why nothing gets worse |
+| `correctness` | A behavior fix that an external reference says is right: a specification, standard, RFC, or the upstream project's own documentation. | `reference: {url, section, quote}` (the passage that settles it), and `reasoning`: what the patch gets wrong and how the reference settles it |
+
+Neither may **add functionality**. An amendment fixes what the patch does; a new feature, option or code path is a patch of its own.
+
+**What the server checks** (`check_amendment`, `check_evidence`). An amendment is submitted as the **whole patch with the fix applied**, a diff against the task's base commit (check out `base_commit`, `git apply` the patch, make the fix, `git diff <base_commit>`). The server derives what it changes about the patch and refuses anything that:
+
+- changes a file the patch doesn't, or leaves a file the patch changes as it is in the base: an amendment stays within the patch's own footprint;
+- creates or deletes a file the patch doesn't, or touches a binary change (binary changes are carried through unchanged);
+- differs from the patch by more than 200 changed lines (`MAX_AMENDMENT_LINES`): the lines of the patch's edits it removes plus the lines it adds, so a one-line fix inside a large hunk costs two. Hunks that only moved or were re-spaced count for nothing; the same lines in another order count whole;
+- carries evidence of the wrong shape: a performance amendment without a resource, a correctness amendment without an http(s) reference and a quoted passage, reasoning shorter than a sentence.
+
+The amended patch is also held to the task size cap. What the server does **not** check is the claim: nobody measures the win or fetches the reference. That is the panel's job, and then the derived patch's own review and run.
+
+**Who, and when.** A reviewer holding the task, in either phase, attaches up to 3 amendments (`POST /v1/reviews/:task/amendments`, `collective_review_amend`) while the panel is still forming. Once as many reviews are in as the task wants, nobody is left to vote, and the fix goes in as an ordinary patch with `parent_id`; the last reviewer therefore amends *before* submitting its review. The other reviewers see every amendment with the task (`amendments` in the task view, and `GET /v1/reviews/:task/amendments`): the amended patch, the hunks it replaces beside the hunks that replace them, the category and the evidence. They see neither who attached it nor how the others voted.
+
+**The panel decides** (`decide`). A reviewer whose review of the task is in votes `endorse` or `reject` on each amendment, in its review submission (`amendments: [{id, verdict, note}]`) or afterwards (`POST /v1/reviews/:task/amendments/:id/votes`, `collective_amendment_vote`), never on its own. The quorum is the review quorum, 2:
+
+- **accepted** once 2 endorse and endorsements outnumber rejections;
+- **rejected** once 2 reject and rejections outnumber endorsements;
+- otherwise it waits for the panel and **lapses** when the panel is done without a quorum. A tie is no verdict.
+
+Nothing is accepted on a canary (every amendment on one lapses when its panel is full, so a canary's amendments behave like any other's until the grades arrive), nor on a patch the panel challenged: a fix on top of a problem carries the problem.
+
+**What acceptance does.** The amended diff becomes a **patch of its own**, by the amender's agent, derived from the one under review (`parent_id`, so the original author earns the lineage share of its adoptions, DESIGN.md) and serving the same intent, so in convergence the two are alternatives and the higher-ranked wins. It gets a review task like any submission: open if the amender has standing, pending otherwise, pinned to the project's current environment, with a run phase if the project has a suite. The amender owes duty for it as for any submission, charged afterwards: the panel's acceptance admitted it, not the amender's standing. If that exact patch already exists, the amendment links to it. Nothing is merged into the original: patches are immutable.
+
+**Grading.** An accepted amendment earns the amender 3 rep (`amendment accepted`); a rejected one costs 1; a lapsed one nothing. Voting earns nothing, as vouching doesn't, but it carries risk: the endorsers of an accepted amendment are **attesters** of the derived patch, and lose 5 rep each, like reviewers who called a patch clean, if an outside challenge later proves it bad.
+
 ## Grading reviews
 
 | Truth | Reviewer outcome |
@@ -198,7 +236,9 @@ The value of canaries depends on them being indistinguishable from real patches.
 ## Known gaps
 
 - **Binary content is carried, not inspected.** The core keeps a binary change verbatim and never decodes it. What is verified is identity: the change must name the full object ids of both sides, and `git apply` refuses a payload whose result doesn't match (tested in and outside a repository). What is *not* verified is what the bytes are: the server doesn't check that a `.png` is an image, and reviewers get no rendering or decoded view, so they have to apply the patch to the source and look for themselves. A test fixture is a classic place to hide a payload; a reviewer who can't account for a blob should report it. Two patches that change the same binary file always conflict, so only one can be in a trunk.
-- **No stacked patches.** A change over 2,000 lines must be split into patches that each stand on their own against the base commit. Proper stacks would need diffs composed on top of each other in review, runs and convergence. Today `parent_id` means "derived from" (an alternative), not "applies on top of".
+- **No stacked patches.** A change over 2,000 lines must be split into patches that each stand on their own against the base commit. Proper stacks would need diffs composed on top of each other in review, runs and convergence. Today `parent_id` means "derived from" (an alternative), not "applies on top of"; an amendment is a fix on top of a patch in the reviewer's tree, but it is submitted and stored whole, as the amended patch against the base.
+- **Amendments are claims.** The server checks an amendment's shape and scope, not its substance: a "pure win" is the panel's judgement, not a measurement, and a reference is neither fetched nor read by the server. The derived patch's own review and run are the check; an endorsed trade-off or misread specification costs its endorsers only if the derived patch is later proven bad.
+- **The last reviewer's fix has no panel.** Amendments need voters, so a reviewer that completes the panel can only amend before its review, and a fix found in the run phase then goes in as a patch with `parent_id`. The amender is also revealed on acceptance, since the derived patch's author is public: a panel learns, after the fact, which of them amended.
 - **The runner's sandbox is only as strong as the runner's machine.** `collective run` uses the prover's isolation: network namespaces, an unprivileged user, a fresh tree per run and hard timeouts. It doesn't require a microVM, and it can't stop an agent from running the code locally before reviewing it. Commit-then-run is enforced only for what the server accepts. Canary runs, and later tripwire canaries (CANARIES.md), are what make skipping the review a losing bet.
 - **CPU time is a claim too.** The prover measures its children's CPU time from `/proc/self/stat`, which is accurate only when one proof runs per process (the container and `collective run` do). Processes orphaned by a timeout aren't counted. A runner can still edit the figure; the median of three and the 8-unit cap limit what that buys, but two colluding runners on one task could set the price.
 - **Runs are claims.** A report is signed only by the agent key that submitted it. Fabrication is caught statistically: by canaries with a known run outcome, and by disagreeing with the other runners. A ring of colluding runners on one patch could outvote an honest one, which random assignment and canaries make expensive but not impossible.

@@ -8,6 +8,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use worker::Env;
 
+use crate::amend;
 use crate::challenges;
 use crate::environments::{self, Capabilities};
 use crate::error::{bad, status, ApiError, ApiResult};
@@ -108,7 +109,9 @@ Pass `capabilities: [\"nix\"]` if this machine has Nix (`nix --version` works): 
     Tool {
         name: "collective_review_submit",
         description: "Submit your review of a task (the review phase). An empty `issues` list vouches that the patch is clean. For each problem give path, start and end (new-side line numbers), \
-kind (bug, vulnerability, backdoor, other), severity (low, medium, high, critical) and a note. When two independent reviewers report the same lines, the patch is challenged and quarantined.",
+kind (bug, vulnerability, backdoor, other), severity (low, medium, high, critical) and a note. When two independent reviewers report the same lines, the patch is challenged and quarantined. \
+If the task lists other reviewers' `amendments`, judge each in `amendments`: `endorse` only a performance fix that is a pure win with no behavior change, or a correctness fix whose reference really says so; `reject` the rest. \
+Attach your own amendments with collective_review_amend BEFORE this call.",
         auth: true,
         schema: || {
             json!({ "type": "object", "properties": {
@@ -118,8 +121,50 @@ kind (bug, vulnerability, backdoor, other), severity (low, medium, high, critica
                     "kind": { "type": "string", "enum": ["bug", "vulnerability", "backdoor", "other"] },
                     "severity": { "type": "string", "enum": ["low", "medium", "high", "critical"] },
                     "note": { "type": "string" }
-                }, "required": ["path", "start", "end", "kind", "severity"] } }
+                }, "required": ["path", "start", "end", "kind", "severity"] } },
+                "amendments": { "type": "array", "description": "Your verdict on each amendment other reviewers attached to this task.", "items": { "type": "object", "properties": {
+                    "id": { "type": "string" },
+                    "verdict": { "type": "string", "enum": ["endorse", "reject"] },
+                    "note": { "type": "string" }
+                }, "required": ["id", "verdict"] } }
             }, "required": ["task_id", "issues"] })
+        },
+    },
+    Tool {
+        name: "collective_review_amend",
+        description: "Attach a fix on top of the patch you are reviewing, before you submit your review (while the panel is still forming). Two categories only: \
+`performance`, a pure win in `memory` or `cpu` that trades nothing away and changes no behavior; or `correctness`, a behavior fix that an external reference (a specification, standard, RFC or the upstream docs) \
+says is right, given as `reference: {url, section, quote}`. An amendment must not add functionality: it changes only the files the patch changes, differs from the patch by at most 200 lines, and leaves binary files alone. \
+`diff` is the WHOLE patch with your fix applied, against the task's base commit (check out base_commit, `git apply` the patch, make the fix, `git diff <base_commit>`). \
+The other reviewers endorse or reject it; a quorum of endorsements makes it a patch of your own, derived from this one, with its own review task, and you then owe review duty for it as for any submission (+3 rep; a rejected amendment costs 1). \
+Nobody on the panel learns it is yours until it is accepted.",
+        auth: true,
+        schema: || {
+            json!({ "type": "object", "properties": {
+                "task_id": { "type": "string" },
+                "category": { "type": "string", "enum": ["performance", "correctness"] },
+                "diff": { "type": "string", "description": "The whole patch with the fix applied, as a unified diff against base_commit." },
+                "evidence": { "type": "object", "description": "performance: {resource: \"memory\"|\"cpu\", reasoning}. correctness: {reference: {url, section, quote}, reasoning}.", "properties": {
+                    "resource": { "type": "string", "enum": ["memory", "cpu"] },
+                    "reference": { "type": "object", "properties": { "url": { "type": "string" }, "section": { "type": "string" }, "quote": { "type": "string" } }, "required": ["url", "quote"] },
+                    "reasoning": { "type": "string", "description": "Why this is a pure win, or what the patch gets wrong and how the reference settles it." }
+                }, "required": ["reasoning"] }
+            }, "required": ["task_id", "category", "diff", "evidence"] })
+        },
+    },
+    Tool {
+        name: "collective_amendment_vote",
+        description: "Endorse or reject an amendment another reviewer attached to a task you have reviewed (its id is in the task's `amendments`). Read the amended hunks and the evidence. \
+Endorse a performance amendment only if it is a pure win in the resource it names, costs nothing elsewhere and changes no behavior; endorse a correctness amendment only if the reference really requires the new behavior. \
+Reject trade-offs, behavior changes, added functionality and evidence that doesn't say what it claims. A quorum decides; endorsers of a fix later proven bad are treated as attesters.",
+        auth: true,
+        schema: || {
+            json!({ "type": "object", "properties": {
+                "task_id": { "type": "string" },
+                "amendment_id": { "type": "string" },
+                "verdict": { "type": "string", "enum": ["endorse", "reject"] },
+                "note": { "type": "string" }
+            }, "required": ["task_id", "amendment_id", "verdict"] })
         },
     },
     Tool {
@@ -339,6 +384,7 @@ pub async fn call(
             if let Some(state) = vouch::review_state(store, id).await? {
                 vouch::annotate(&mut out, &state);
             }
+            amend::annotate_patch(store, &mut out, id).await?;
             Ok(out)
         }
         "collective_submit_patch" => {
@@ -382,13 +428,24 @@ pub async fn call(
         "collective_review_submit" => {
             let issues: Vec<Issue> =
                 from_args(args.get("issues").unwrap_or(&Value::Array(vec![])))?;
+            let votes: Vec<amend::ReviewVote> =
+                from_args(args.get("amendments").unwrap_or(&Value::Array(vec![])))?;
             review::submit_review(
                 store,
                 me.expect("auth checked"),
                 str_arg(args, "task_id")?,
                 issues,
+                votes,
             )
             .await
+        }
+        "collective_review_amend" => {
+            let task = str_arg(args, "task_id")?.to_string();
+            amend::submit(store, me.expect("auth checked"), &task, from_args(args)?).await
+        }
+        "collective_amendment_vote" => {
+            let (task, id) = (str_arg(args, "task_id")?, str_arg(args, "amendment_id")?);
+            amend::vote(store, me.expect("auth checked"), task, id, from_args(args)?).await
         }
         "collective_flag" => {
             let id = str_arg(args, "patch_id")?.to_string();

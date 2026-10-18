@@ -430,7 +430,15 @@ async fn finalize(store: &Store, c: &Challenge, row: &Row) -> ApiResult<Value> {
                 .await?;
         }
         _ if res.verdict == Verdict::Problem => {
-            for op in clean_reviewers(store, &c.patch_id).await? {
+            // Reviewers who called it clean, and reviewers who endorsed the
+            // amendment it came from, vouched for it alike.
+            let mut ops = clean_reviewers(store, &c.patch_id).await?;
+            for op in crate::amend::endorsers(store, &c.patch_id).await? {
+                if !ops.contains(&op) {
+                    ops.push(op);
+                }
+            }
+            for op in ops {
                 attestations.push(Exposure {
                     operator_id: op,
                     amount: ATTESTATION_STAKE,

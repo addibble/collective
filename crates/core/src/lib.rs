@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod amend;
 pub mod challenge;
 pub mod converge;
 pub mod diff;
