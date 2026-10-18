@@ -5,7 +5,9 @@
 //! its own (crates/prover, one container per run, destroyed afterwards) and
 //! submits the sandbox's report. The run is driven by short Durable Object
 //! alarms (start, then a poll every 30 seconds), because one alarm may not
-//! last more than 15 minutes and a proof may take an hour. It has no access to the server's database:
+//! last more than 15 minutes and a proof may take an hour; the container's
+//! inactivity timeout is set at every step, or Cloudflare would stop it
+//! between two alarms. It has no access to the server's database:
 //! it uses the same public API as `collective prove`, and its reports count
 //! as one operator's claim towards a quorum (collective_core::proof).
 //!
@@ -152,6 +154,29 @@ enum Step {
 /// under the 15-minute wall-time limit of a Durable Object event.
 const POLL: Duration = Duration::from_secs(30);
 
+/// Keeps the container running between alarms. Cloudflare stops a container
+/// shortly after its Durable Object goes idle, which it does between two
+/// polls, unless an inactivity timeout is set; and the timeout does not
+/// survive a Durable Object restart, so every step sets it again.
+async fn keep_alive(container: &Container, secs: f64) -> Result<()> {
+    use worker::wasm_bindgen::JsCast;
+    let raw: &worker::worker_sys::Container = container.as_ref().unchecked_ref();
+    let this: &JsValue = raw.as_ref();
+    let err = |e: JsValue| Error::RustError(format!("setInactivityTimeout: {e:?}"));
+    let f: js_sys::Function =
+        js_sys::Reflect::get(this, &JsValue::from_str("setInactivityTimeout"))
+            .map_err(err)?
+            .dyn_into()
+            .map_err(|_| Error::RustError("setInactivityTimeout is not a function".into()))?;
+    // At most 6 hours, the platform's limit.
+    let ms = secs.clamp(60.0, 6.0 * 3600.0) * 1000.0;
+    let promise = f.call1(this, &JsValue::from_f64(ms)).map_err(err)?;
+    worker::wasm_bindgen_futures::JsFuture::from(js_sys::Promise::from(promise))
+        .await
+        .map_err(err)?;
+    Ok(())
+}
+
 /// Fetches the job and its source from the server, starts the container
 /// and hands the prover the proof to run on its own thread.
 async fn start(state: &State, env: &Env, run_id: &str, key: &str) -> Result<Step> {
@@ -199,6 +224,7 @@ async fn start(state: &State, env: &Env, run_id: &str, key: &str) -> Result<Step
         }
         start_container(&container, !offline, &vars)?;
     }
+    keep_alive(&container, budget as f64 + 120.0).await?;
     let port = container.get_tcp_port(PROVER_PORT)?;
     let mut ready = false;
     for _ in 0..90 {
@@ -252,6 +278,11 @@ async fn poll(state: &State, env: &Env, run_id: &str, key: &str) -> Result<Step>
             "prover container stopped before reporting".into(),
         ));
     }
+    keep_alive(
+        &container,
+        (deadline - Date::now().as_millis() as f64) / 1000.0,
+    )
+    .await?;
     let port = container.get_tcp_port(PROVER_PORT)?;
     let mut resp = port.fetch("http://prover/prove/result", None).await?;
     let text = resp.text().await?;
