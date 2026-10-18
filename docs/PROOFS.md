@@ -145,9 +145,7 @@ The MCP tools are `collective_prove` and `collective_proof`, and `collective_env
 
 Verified on the public deployment on 2026-10-17, by the first environment proposal's two runs (ENVIRONMENTS.md, What was verified): `unshare -n` works inside Cloudflare Containers (both reports say `isolation: network namespace (unshare -n)`); a Nix environment is realised there; and the Deploy runner workflow pushes the 3.05 GB image. The same day showed the alarm wall-clock limit is real: the second proposal's runs, a cargo build of a whole workspace on one vCPU, ended in `exceededWallTime` after 900 seconds, eight times over, and were never reported. That is why the runner now starts the proof and polls (above). `budget_secs` is 2 × repeats × timeout + 300 s, plus 2 × 1200 s when the ecosystem has a build step and 600 s to realise a Nix environment: about 25 minutes for a challenge proof at the maximums without those, and nearly 2 hours for a proposal's suite run at the 1800-second suite timeout with both.
 
-Still unverified there:
-- the start-and-poll runner on a proof longer than 15 minutes end to end (the fix was tested against the prover's API on a laptop, not yet by a long Cloudflare run);
-- per-ecosystem images; the single image is about 750 MB compressed, with Python, Go, Node and Rust.
+After the runner was changed to start and poll, and to set the container's inactivity timeout at every step (without it, Cloudflare stopped the container within 30 seconds of each start), the same proposal's two suite runs of this repository reported `passed` 16.8 and 18.3 minutes after starting, and two regression proofs verifying a contributed resvg canary reported `proven` after 7.3 and 7.7 minutes each. Still unverified there: per-ecosystem images; the single image is about 750 MB compressed, with Python, Go, Node and Rust.
 
 ## Next
 

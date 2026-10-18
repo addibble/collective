@@ -154,6 +154,12 @@ enum Step {
 /// under the 15-minute wall-time limit of a Durable Object event.
 const POLL: Duration = Duration::from_secs(30);
 
+/// Consecutive failed steps tolerated before a run is given up. The
+/// platform has transient moments ("no container instance that can be
+/// provided to this Durable Object, try again later", `running` briefly
+/// false) in which giving up throws away a proof that is still running.
+const MAX_STRIKES: u32 = 5;
+
 /// Keeps the container running between alarms. Cloudflare stops a container
 /// shortly after its Durable Object goes idle, which it does between two
 /// polls, unless an inactivity timeout is set; and the timeout does not
@@ -249,7 +255,9 @@ async fn start(state: &State, env: &Env, run_id: &str, key: &str) -> Result<Step
             body.as_slice(),
         ))));
     let mut resp = port.fetch("http://prover/prove/start", Some(init)).await?;
-    if resp.status_code() != 202 {
+    // 409: the container already has this proof, from a start whose object
+    // state was lost; poll it rather than start over.
+    if !matches!(resp.status_code(), 202 | 409) {
         let text = resp.text().await.unwrap_or_default();
         return Err(Error::RustError(format!("prover: {text}")));
     }
@@ -345,8 +353,9 @@ impl DurableObject for ProofRunner {
     }
 
     /// One short step per alarm: start the proof, then poll for its result
-    /// every `POLL` until it is reported or given up. A failed run reports
-    /// nothing: the claim lapses and the job is offered to other runners.
+    /// every `POLL` until it is reported or given up. A step that fails is
+    /// retried up to `MAX_STRIKES` times; a run given up reports nothing:
+    /// the claim lapses and the job is offered to other runners.
     async fn alarm(&self) -> Result<Response> {
         let storage = self.state.storage();
         let (Some(run_id), Some(index)) = (
@@ -371,15 +380,32 @@ impl DurableObject for ProofRunner {
             start(&self.state, &self.env, &run_id, &key).await
         };
         match step {
-            Ok(Step::Again(wait)) => storage.set_alarm(wait).await?,
+            Ok(Step::Again(wait)) => {
+                storage.delete("strikes").await?;
+                storage.set_alarm(wait).await?;
+            }
             Ok(Step::Done) => self.finish(None).await,
             Err(e) => {
-                console_error!("run {run_id}: {e}");
-                self.finish(Some(&e.to_string())).await;
+                let strikes = storage.get::<u32>("strikes").await?.unwrap_or(0) + 1;
+                if strikes < MAX_STRIKES && !polling_is_over(&e) {
+                    console_warn!("run {run_id}: {e} (attempt {strikes} of {MAX_STRIKES})");
+                    storage.put("strikes", strikes).await?;
+                    storage.set_alarm(POLL).await?;
+                } else {
+                    console_error!("run {run_id}: {e}");
+                    self.finish(Some(&e.to_string())).await;
+                }
             }
         }
         Response::empty()
     }
+}
+
+/// Errors that no retry mends: the server refused the run or the report,
+/// or the prover's budget is past.
+fn polling_is_over(e: &Error) -> bool {
+    let s = e.to_string();
+    s.contains("/v1/proof-runs/") || s.contains("within its budget")
 }
 
 impl ProofRunner {
