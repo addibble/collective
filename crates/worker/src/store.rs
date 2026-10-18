@@ -31,7 +31,7 @@ pub const POOL: &str = collective_core::challenge::PLATFORM_POOL;
 
 /// Platform accounts (the bounty pool, the canary author) hold funds, not
 /// standing, so their balances do not decay.
-pub fn is_platform(operator_id: &str) -> bool {
+fn is_platform(operator_id: &str) -> bool {
     operator_id == "platform" || operator_id.starts_with("platform:")
 }
 
@@ -60,13 +60,6 @@ pub struct Agent {
 pub struct Project {
     pub id: String,
     pub upstream_url: String,
-}
-
-/// What anyone may see of an operator's standing (the ledger behind it stays private).
-#[derive(Debug, Clone, Copy)]
-pub struct Standing {
-    pub rep: f64,
-    pub trust: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -113,7 +106,7 @@ impl PatchRow {
 }
 
 /// Statuses hidden from search, leaderboards and convergence.
-pub const HIDDEN: &str = "('withdrawn','canary')";
+const HIDDEN: &str = "('withdrawn','canary')";
 
 pub fn normalize_upstream(url: &str) -> ApiResult<String> {
     let mut u = url.trim().trim_start_matches("git+").to_string();
@@ -898,26 +891,6 @@ impl Store {
         ops: &[String],
         rep_delta: f64,
     ) -> ApiResult<HashMap<String, f64>> {
-        Ok(self
-            .standings_adjusted(ops, rep_delta)
-            .await?
-            .into_iter()
-            .map(|(op, s)| (op, s.trust))
-            .collect())
-    }
-
-    /// Each operator's public standing: its decayed ledger balance (rep)
-    /// and the trust that balance, its patches' scores and its genesis
-    /// grants give it. An operator missing from the result is unknown.
-    pub async fn standings(&self, ops: &[String]) -> ApiResult<HashMap<String, Standing>> {
-        self.standings_adjusted(ops, 0.0).await
-    }
-
-    async fn standings_adjusted(
-        &self,
-        ops: &[String],
-        rep_delta: f64,
-    ) -> ApiResult<HashMap<String, Standing>> {
         let mut out = HashMap::new();
         let t = now();
         for chunk in ops.chunks(MAX_PARAMS / 3) {
@@ -944,7 +917,6 @@ impl Store {
                 )
                 .await?;
             for r in rows {
-                let balance = ledger_balance(r.weight.unwrap_or(0.0), t);
                 let trust_value = if r.banned_at.is_some() {
                     0.0
                 } else {
@@ -968,15 +940,10 @@ impl Store {
                             ))
                         })
                         .sum();
+                    let balance = ledger_balance(r.weight.unwrap_or(0.0), t);
                     trust(reputation(&scores, balance + rep_delta + genesis))
                 };
-                out.insert(
-                    r.id,
-                    Standing {
-                        rep: balance,
-                        trust: trust_value,
-                    },
-                );
+                out.insert(r.id, trust_value);
             }
         }
         Ok(out)

@@ -229,15 +229,10 @@ pub async fn profile(store: &Store, handle: &str) -> ApiResult<Value> {
             args![&o.id],
         )
         .await?;
-    // Rep and trust are public; the ledger entries behind them are not.
-    let standing = store.standings(std::slice::from_ref(&o.id)).await?;
-    let standing = standing.get(&o.id);
     Ok(json!({
         "operator": o.handle,
         "since": o.created_at as i64,
         "banned": o.banned_at.is_some(),
-        "rep": standing.map(|s| s.rep),
-        "trust": standing.map(|s| s.trust),
         "verified_identities": identities_of(store, &o.id).await?,
         // Public, so everyone can see who started with a head start, and how much is left.
         "genesis_influence": store.genesis_influence(&o.id).await?,
